@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>liquid glass test playground</title>
+    </head>
+    <body>
+        <div id="scene" class="scene">
+            <div class="scene-backdrop" aria-hidden="true">
+                <div class="orb orb-a"></div>
+                <div class="orb orb-b"></div>
+                <div class="orb orb-c"></div>
+                <div class="stripe-band"></div>
+            </div>
+
+            <section class="scene-content">
+                <header class="scene-header">
+                    <p class="eyebrow">@tahoangphuc/liquid-glass</p>
+                    <h1>optical refraction &amp; dual-rim specular test</h1>
+                    <p class="subtitle">
+                        drag the floating glass over typography and color bands to inspect refraction, blur, and top/bottom hairline highlights across engines
+                    </p>
+                </header>
+
+                <div class="specimen-grid">
+                    <div class="specimen-tile">
+                        <span>01 / refraction</span>
+                        <strong>sub-pixel sdf normals</strong>
+                    </div>
+                    <div class="specimen-tile">
+                        <span>02 / highlight</span>
+                        <strong>top + bottom hairline</strong>
+                    </div>
+                    <div class="specimen-tile">
+                        <span>03 / fallback</span>
+                        <strong>webgl dom capture</strong>
+                    </div>
+                    <div class="specimen-tile">
+                        <span>04 / telemetry</span>
+                        <strong>loaf adaptive tiers</strong>
+                    </div>
+                </div>
+
+                <canvas id="scene-art" class="scene-art" width="760" height="220"></canvas>
+            </section>
+        </div>
+
+        <div id="glass-dock" class="glass-dock">
+            <span>liquid glass capsule</span>
+        </div>
+
+        <div id="glass-panel" class="glass-panel">
+            <div class="panel-head">
+                <strong>draggable glass surface</strong>
+                <span id="engine-badge" class="badge">css</span>
+            </div>
+            <p>drag anywhere on this panel to test edge refraction and top/bottom highlights</p>
+        </div>
+
+        <div class="slider-demo">
+            <input id="glass-slider" type="range" min="0" max="100" value="58" aria-label="liquid glass slider" />
+        </div>
+
+        <button id="glass-pill" type="button" class="glass-pill">interactive pill</button>
+
+        <aside class="controls" aria-label="glass controls">
+            <div class="controls-header">
+                <strong>controls</strong>
+                <button id="toggle-theme" type="button">dark wallpaper</button>
+            </div>
+
+            <label>
+                engine
+                <select id="ctrl-engine">
+                    <option value="auto" selected>auto</option>
+                    <option value="wasm-svg">wasm-svg (desktop chromium)</option>
+                    <option value="webgl">webgl (mobile/safari fallback)</option>
+                    <option value="css">css fallback</option>
+                </select>
+            </label>
+
+            <label>
+                surface
+                <select id="ctrl-surface">
+                    <option value="convex_squircle" selected>convex_squircle</option>
+                    <option value="convex_circle">convex_circle</option>
+                    <option value="linear">linear</option>
+                    <option value="lip">lip</option>
+                </select>
+            </label>
+
+            <label>
+                thickness <span id="val-thickness">52</span>
+                <input id="ctrl-thickness" type="range" min="12" max="120" value="52" />
+            </label>
+
+            <label>
+                bezel <span id="val-bezel">16</span>
+                <input id="ctrl-bezel" type="range" min="4" max="36" value="16" />
+            </label>
+
+            <label>
+                ior <span id="val-ior">2.15</span>
+                <input id="ctrl-ior" type="range" min="1.1" max="2.5" step="0.05" value="2.15" />
+            </label>
+
+            <label>
+                blur <span id="val-blur">0.6</span>
+                <input id="ctrl-blur" type="range" min="0" max="6" step="0.2" value="0.6" />
+            </label>
+
+            <label>
+                radius <span id="val-radius">22</span>
+                <input id="ctrl-radius" type="range" min="0" max="44" value="22" />
+            </label>
+
+            <label>
+                highlight <span id="val-highlight">0.65</span>
+                <input id="ctrl-highlight" type="range" min="0" max="1" step="0.05" value="0.65" />
+            </label>
+
+            <div class="toggles">
+                <label><input id="ctrl-pill" type="checkbox" /> pill</label>
+                <label><input id="ctrl-hollow" type="checkbox" /> hollow</label>
+                <label><input id="ctrl-chroma" type="checkbox" /> chroma</label>
+            </div>
+
+            <pre id="stats-output" class="stats-output"></pre>
+        </aside>
+
+        <script type="module" src="./main.ts"></script>
+    </body>
+</html>
