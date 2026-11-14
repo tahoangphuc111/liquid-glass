@@ -15,12 +15,20 @@ function applyLetterSpacing(ctx: CanvasRenderingContext2D, letterSpacing: string
     target.letterSpacing = letterSpacing === "normal" ? "0px" : letterSpacing;
 }
 
+const blurCache = new Map<string, number>();
 function parseCssBlurPx(filterStr: string): number {
     if (!filterStr || filterStr === "none") return 0;
+    const cached = blurCache.get(filterStr);
+    if (cached !== undefined) return cached;
     const match = filterStr.match(/blur\(\s*([\d.]+)px\s*\)/i);
-    if (!match) return 0;
-    const value = Number.parseFloat(match[1]);
-    return Number.isFinite(value) && value > 0 ? Math.min(80, value) : 0;
+    let value = 0;
+    if (match) {
+        const parsed = Number.parseFloat(match[1]);
+        value = Number.isFinite(parsed) && parsed > 0 ? Math.min(80, parsed) : 0;
+    }
+    if (blurCache.size > 200) blurCache.clear();
+    blurCache.set(filterStr, value);
+    return value;
 }
 
 function splitTopLevelArgs(inner: string): string[] {
@@ -216,17 +224,27 @@ function drawRadialGradientBox(
     return true;
 }
 
+const gradientColorsCache = new Map<string, string[]>();
 function parseLinearGradientColors(backgroundImage: string): string[] {
+    const cached = gradientColorsCache.get(backgroundImage);
+    if (cached !== undefined) return cached;
     const startIdx = backgroundImage.indexOf("linear-gradient(");
-    if (startIdx < 0) return [];
+    if (startIdx < 0) {
+        if (gradientColorsCache.size > 200) gradientColorsCache.clear();
+        gradientColorsCache.set(backgroundImage, []);
+        return [];
+    }
     const inner = backgroundImage.slice(startIdx + 16);
     const tokens = inner.match(COLOR_TOKEN_PATTERN) ?? [];
-    return tokens.filter(
+    const result = tokens.filter(
         (token) =>
             !["to", "top", "bottom", "left", "right", "deg", "rad", "turn", "from", "at"].includes(
                 token.toLowerCase(),
             ),
     );
+    if (gradientColorsCache.size > 200) gradientColorsCache.clear();
+    gradientColorsCache.set(backgroundImage, result);
+    return result;
 }
 
 function resolveTextFill(

@@ -26,22 +26,24 @@ function computeCornerRadiusPx(
     width: number,
     height: number,
     config: GlassConfig,
-): number {
+    cachedRadiusStr?: string | null,
+): { radius: number; rawRadiusStr: string } {
     const halfMin = Math.min(width, height) * 0.5;
-    if (config.pill) return halfMin;
+    if (config.pill) return { radius: halfMin, rawRadiusStr: "" };
 
     const rawRadius =
-        typeof window !== "undefined" && typeof window.getComputedStyle === "function"
+        cachedRadiusStr ??
+        (typeof window !== "undefined" && typeof window.getComputedStyle === "function"
             ? window.getComputedStyle(el).borderTopLeftRadius.trim()
-            : "";
+            : "");
     const parsed = rawRadius.endsWith("%")
         ? (parseFloat(rawRadius) / 100) * Math.min(width, height)
         : parseFloat(rawRadius);
     if (Number.isFinite(parsed)) {
-        return Math.min(Math.max(parsed, 0), halfMin);
+        return { radius: Math.min(Math.max(parsed, 0), halfMin), rawRadiusStr: rawRadius };
     }
     const fallback = config.radius ?? Math.min(Math.round(height * 0.5), 24);
-    return Math.min(Math.max(fallback, 0), halfMin);
+    return { radius: Math.min(Math.max(fallback, 0), halfMin), rawRadiusStr: rawRadius };
 }
 
 export function createLiquidGlass(
@@ -54,6 +56,7 @@ export function createLiquidGlass(
     let hasInitializedEngine = false;
     let destroyed = false;
 
+    let cachedRadiusStr: string | null = null;
     let webglCanvas: HTMLCanvasElement | null = null;
     let webglRenderer: GlassWebglRenderer | null = null;
     let webglResizeObserver: ResizeObserver | null = null;
@@ -113,6 +116,7 @@ export function createLiquidGlass(
         } else {
             element.style.removeProperty("--lg-rim-opacity");
         }
+        cachedRadiusStr = null;
         const existingState = elementStateMap.get(element);
         if (existingState) {
             existingState.cachedRadiusStr = null;
@@ -141,7 +145,9 @@ export function createLiquidGlass(
         const height = element.offsetHeight || Math.round(element.getBoundingClientRect().height);
         if (width < 2 || height < 2) return;
 
-        const radius = computeCornerRadiusPx(element, width, height, config);
+        const radiusResult = computeCornerRadiusPx(element, width, height, config, cachedRadiusStr);
+        cachedRadiusStr = radiusResult.rawRadiusStr;
+        const radius = radiusResult.radius;
         const halfMin = Math.min(width, height) * 0.5;
         const bezel = Math.max(1, Math.min(config.bezel, halfMin - 1));
         const tintColor = parseCssColorToRgb(options.tintColor);
@@ -285,12 +291,14 @@ export function createLiquidGlass(
                             element.offsetWidth || Math.round(element.getBoundingClientRect().width);
                         const height =
                             element.offsetHeight || Math.round(element.getBoundingClientRect().height);
-                        const radius =
-                            width >= 2 && height >= 2
-                                ? computeCornerRadiusPx(element, width, height, config)
-                                : config.pill
-                                  ? 9999
-                                  : config.radius;
+                        let radius: number;
+                        if (width >= 2 && height >= 2) {
+                            const res = computeCornerRadiusPx(element, width, height, config, cachedRadiusStr);
+                            cachedRadiusStr = res.rawRadiusStr;
+                            radius = res.radius;
+                        } else {
+                            radius = config.pill ? 9999 : config.radius;
+                        }
                         return {
                             pixelRatio: options.pixelRatio,
                             radius,
@@ -526,6 +534,7 @@ export function createLiquidGlass(
                 }
                 scheduleWebglRender();
             } else if (activeEngine === "wasm-svg") {
+                cachedRadiusStr = null;
                 const existingState = elementStateMap.get(element);
                 if (existingState) existingState.cachedRadiusStr = null;
                 registerManagedElement(element, config);
