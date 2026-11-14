@@ -5,7 +5,11 @@
     "type": "module",
     "license": "MIT",
     "sideEffects": [
-        "*.css"
+        "*.css",
+        "./src/index.ts",
+        "./src/core/glassEffect.ts",
+        "./dist/index.js",
+        "./dist/index.cjs"
     ],
     "main": "./dist/index.cjs",
     "module": "./dist/index.js",
