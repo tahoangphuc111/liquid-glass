@@ -92,7 +92,6 @@ export function initLoafTelemetry(): void {
             loafObserver.observe({ type: "long-animation-frame", buffered: false });
         }
     } catch {
-        // ignore browsers that reject long-animation-frame in PerformanceObserver
     }
 }
 

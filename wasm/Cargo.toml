@@ -1,0 +1,16 @@
+[package]
+name = "liquid-glass-wasm"
+version = "0.1.1"
+edition = "2021"
+license = "MIT"
+description = "WASM SIMD displacement map kernel for @tahoangphuc111/liquid-glass"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

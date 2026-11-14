@@ -31,7 +31,6 @@ describe("WASM displacement generator", () => {
             expect(result!.blob.size).toBe(64 + 64 * 32 * 4);
 
             const header = await readBlobHeader(result!.blob);
-            // bmp header starts with 'BM'
             expect(header[0]).toBe(0x42);
             expect(header[1]).toBe(0x4d);
         }

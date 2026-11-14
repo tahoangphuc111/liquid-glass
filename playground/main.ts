@@ -187,7 +187,6 @@ panelEl.addEventListener("pointerup", stopDragging);
 panelEl.addEventListener("pointercancel", stopDragging);
 panelEl.addEventListener("lostpointercapture", stopDragging);
 
-// allow dragging the top capsule over any artwork or text to inspect refraction
 const makeCapsuleDraggable = (targetEl: HTMLElement) => {
     let dragging = false;
     let startX = 0;

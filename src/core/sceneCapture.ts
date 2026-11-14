@@ -561,7 +561,6 @@ export function captureDomToCanvas(
     const stack: HTMLElement[] = [source];
     while (stack.length > 0) {
         const element = stack.pop()!;
-        // skip glass elements so surfaces never capture themselves
         if (element !== source && element.hasAttribute("data-lg-surface")) {
             continue;
         }

@@ -139,7 +139,6 @@ export function createInteractiveSpring(
             pressed = false;
             target = 0;
             if (!reducedMotion && bounce && wasPressed) {
-                // fast taps still get enough initial impulse for visible damped oscillation
                 if (displacement > -0.012) {
                     displacement = Math.min(displacement, -0.018);
                 }

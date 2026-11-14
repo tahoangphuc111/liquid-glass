@@ -84,7 +84,6 @@ function attachBatteryListener(): void {
             battery.addEventListener("chargingchange", updateBattery);
         })
         .catch(() => {
-            // battery api can be blocked by permissions-policy
         });
 }
 
@@ -99,7 +98,6 @@ export function isConstrainedDevice(): boolean {
 export function canUseSvgGlass(): boolean {
     initWasmSimdModule();
     if (!isWasmReady() || isGlassDowngraded || isConstrainedDevice()) return false;
-    // svg backdrop-filter displacement only renders reliably on desktop chromium
     if (!checkIsChromium()) return false;
 
     const { reducedMotionQuery: rm, mobileOrTouchQuery: mobile } = getMediaQueries();

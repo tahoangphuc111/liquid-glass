@@ -11,7 +11,6 @@
     border-radius: 9999px;
 }
 
-/* ultra-tight top and bottom rim highlight stopping before corner curves */
 :where(.lg-surface.lg-on:not([data-lg-engine="webgl"]))::before {
     content: "";
     position: absolute;

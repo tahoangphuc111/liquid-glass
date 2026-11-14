@@ -197,7 +197,6 @@ function scheduleSvgBackdropRefresh(
     if (state.compositorRefreshId != null && typeof cancelAnimationFrame === "function") {
         cancelAnimationFrame(state.compositorRefreshId);
     }
-    // nudge blink's backdrop-filter cache after svg feimage finishes decoding in chromium
     state.compositorRefreshId = requestAnimationFrame(() => {
         state.compositorRefreshId = null;
         if (!element.isConnected || state.appliedFilterVal !== filterVal) return;
@@ -500,7 +499,6 @@ export function rebuildLiquidGlassFilterForElement(
 
     const state = registerTargetElement(element, config);
 
-    // nested backdrop-filters double-displace in chromium's compositor
     if (element.parentElement?.closest(".lg-on")) {
         state.rejectionReason = "nested";
         detachElementFilter(element, state);

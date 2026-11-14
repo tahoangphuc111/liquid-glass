@@ -48,6 +48,7 @@
     "scripts": {
         "dev": "vite playground",
         "build": "tsup",
+        "build:wasm": "node scripts/build-wasm.mjs",
         "typecheck": "tsc --noEmit",
         "test": "vitest run",
         "test:watch": "vitest"
