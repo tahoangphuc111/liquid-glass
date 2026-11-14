@@ -1,4 +1,5 @@
 import type { GlassSurface } from "./types.js";
+import { buildOpticalLut, OPTICAL_LUT_SIZE } from "./optics.js";
 
 export interface GlassFrameParams {
     width: number;
@@ -46,30 +47,11 @@ uniform vec4 uSceneRect;
 uniform sampler2D uSceneTex;
 uniform float uHasSceneTex;
 uniform float uDpr;
+uniform sampler2D uOpticalLut;
+uniform vec2 uLutScale;
 
 const vec3 HALF_PRIMARY = vec3(-0.199003, 0.479950, 0.854427);
 const vec3 HALF_SECONDARY = vec3(0.188434, -0.494640, 0.848425);
-
-float evalSurfaceSlope(float x, float surfaceId) {
-    float cx = clamp(x, 0.001, 0.999);
-    float u = 1.0 - cx;
-    if (surfaceId < 0.5) {
-        float u2 = u * u;
-        float u4 = u2 * u2;
-        float invC = inversesqrt(max(1e-6, 1.0 - u2));
-        float invS2 = inversesqrt(max(1e-6, 1.0 - u4));
-        float invS3 = invS2 * sqrt(invS2);
-        return u * (0.30 * invC + 0.70 * u2 * invS3);
-    }
-    if (surfaceId < 1.5) {
-        return u * inversesqrt(max(1e-6, 1.0 - u * u));
-    }
-    if (surfaceId < 2.5) {
-        return 1.0;
-    }
-    float xu = cx * u;
-    return 6.0 * xu + (1.0 - 2.0 * cx) * 1.2;
-}
 
 vec3 sampleChromaticFrostedScene(vec2 uvG, vec2 chromaDelta, vec2 blurUv, float hasChroma) {
     vec3 centerG = texture2D(uSceneTex, uvG).rgb;
@@ -118,38 +100,47 @@ void main() {
     float outLen = length(qPlus);
     float sd = outLen + min(max(q.x, q.y), 0.0) - radius;
 
-    float aa = 0.42 / max(1.0, uDpr);
+    float aa = 0.707107 / uDpr;
     if (sd > aa) {
         gl_FragColor = vec4(0.0);
         return;
     }
 
-    float edgeAA = 1.0 - smoothstep(-aa, aa, sd);
+    vec2 edgeNormal = quadrantSign * (outLen > 1e-8 ? qPlus / outLen : step(q.yx, q.xy));
+    float edgeAA = 1.0;
+    if (sd > -aa) {
+        vec2 pixelNormal = abs(edgeNormal);
+        float majorAxis = max(pixelNormal.x, pixelNormal.y);
+        float minorAxis = min(pixelNormal.x, pixelNormal.y);
+        float pixelDistance = -sd * uDpr;
+        float support = (majorAxis + minorAxis) * 0.5;
+        float tail = max(support - abs(pixelDistance), 0.0);
+        float coverage = abs(pixelDistance) <= (majorAxis - minorAxis) * 0.5
+            ? 0.5 - abs(pixelDistance) / max(majorAxis, 1e-6)
+            : tail * tail / max(2.0 * majorAxis * minorAxis, 1e-6);
+        edgeAA = pixelDistance >= 0.0 ? 1.0 - coverage : coverage;
+    }
     float depthInBezel = clamp(-sd / bezel, 0.0, 1.0);
     float inBezelMask = 1.0 - smoothstep(0.90, 1.0, depthInBezel);
 
-    vec2 edgeVec = max(q + 0.16, 0.0);
-    float edgeLenSq = dot(edgeVec, edgeVec);
-    vec2 edgeNormal = quadrantSign * (edgeLenSq > 1e-8 ? edgeVec * inversesqrt(edgeLenSq) : step(q.yx, q.xy));
-
-    float interiorShift = bezel * (0.08 + 0.38 * depthInBezel * depthInBezel);
-    vec2 bezelVec = max(q + interiorShift, 1e-4);
-    vec2 bezelNormal = quadrantSign * (bezelVec * inversesqrt(dot(bezelVec, bezelVec)));
-
-    float slope = evalSurfaceSlope(depthInBezel, uOptical.w);
-
-    float eta = 1.0 / max(1.01, uOptical.x);
-    float slope2 = slope * slope;
-    float refractedFactor = (1.0 - eta * eta) / max(0.35, 1.0 + eta * sqrt(1.0 + slope2));
-    float tiltDenom = 1.0 + depthInBezel * (0.725 + 0.21 * depthInBezel);
-    float meniscusTilt = inBezelMask / (tiltDenom * tiltDenom);
-    float xyMag = clamp(meniscusTilt * (0.50 + 0.50 * min(2.0, slope)), 0.0, 0.98);
-    vec3 domeNormal = vec3(bezelNormal * xyMag, sqrt(max(0.0, 1.0 - xyMag * xyMag)));
-
-    float ndotv = clamp(domeNormal.z, 0.0, 1.0);
-    float fresnelBase = 1.0 - ndotv;
-    float fresnelSq = fresnelBase * fresnelBase;
-    float fresnel = 0.04 + 0.96 * fresnelSq * fresnelSq;
+    float refractedTilt = 0.0;
+    float meniscusTilt = 0.0;
+    vec3 domeNormal = vec3(0.0, 0.0, 1.0);
+    float fresnel = 0.04;
+    if (depthInBezel < 1.0) {
+        float interiorShift = bezel * (0.08 + 0.38 * depthInBezel * depthInBezel);
+        vec2 bezelVec = max(q + interiorShift, 1e-4);
+        vec2 bezelNormal = quadrantSign * (bezelVec * inversesqrt(dot(bezelVec, bezelVec)));
+        vec4 optical = texture2D(uOpticalLut, vec2(depthInBezel * uLutScale.x + uLutScale.y, 0.5));
+        float xyMag = dot(optical.rg, vec2(65280.0, 255.0)) / 65535.0;
+        refractedTilt = dot(optical.ba, vec2(65280.0, 255.0)) / 65535.0;
+        float tiltDenom = 1.0 + depthInBezel * (0.725 + 0.21 * depthInBezel);
+        meniscusTilt = inBezelMask / (tiltDenom * tiltDenom);
+        domeNormal = vec3(bezelNormal * xyMag, sqrt(max(0.0, 1.0 - xyMag * xyMag)));
+        float fresnelBase = 1.0 - domeNormal.z;
+        float fresnelSq = fresnelBase * fresnelBase;
+        fresnel += 0.96 * fresnelSq * fresnelSq;
+    }
 
     float ndoth1 = clamp(dot(domeNormal, HALF_PRIMARY), 0.0, 1.0);
     float ndoth1Sq = ndoth1 * ndoth1;
@@ -173,7 +164,7 @@ void main() {
     float rimInset = 0.46 / dprScale;
     float hairlineDist = abs(sd + rimInset);
     float hairlineDistSq = hairlineDist * hairlineDist;
-    float hairlineInv = 1.0 / (1.0 + hairlineDistSq * (7.25 * dprScale));
+    float hairlineInv = 1.0 / (1.0 + hairlineDistSq * (7.25 * dprScale * dprScale));
     float hairline = hairlineInv * hairlineInv;
 
     float innerDepth = max(0.0, -sd);
@@ -208,7 +199,7 @@ void main() {
             1.0 - (uSceneRect.y + (1.0 - vUv.y) * uSceneRect.w)
         );
         float thicknessBoost = clamp(0.95 + uOptical.y * 0.015625, 1.0, 2.25);
-        float dispPixels = bezel * uOptical.z * refractedFactor * meniscusTilt * thicknessBoost * (1.35 + 0.14 * cornerArc);
+        float dispPixels = bezel * uOptical.z * refractedTilt * thicknessBoost * (1.35 + 0.14 * cornerArc);
         vec2 dispUv = -domeNormal.xy * dispPixels * uvPerCssPx;
         vec2 blurUv = uvPerCssPx * uHighlight.w;
         vec2 uvG = clamp(sceneUv + dispUv, 0.002, 0.998);
@@ -326,6 +317,10 @@ export class GlassWebglRenderer {
     private readonly maxViewportWidth: number;
     private readonly maxViewportHeight: number;
     private readonly maxTextureSize: number;
+    private readonly opticalTexture: WebGLTexture;
+    private readonly opticalLutSize: number;
+    private opticalSurface: GlassSurface | null = null;
+    private opticalIor = -1;
     private uploadCanvas: HTMLCanvasElement | null = null;
     private readonly uSizeLoc: WebGLUniformLocation | null;
     private readonly uGeomLoc: WebGLUniformLocation | null;
@@ -368,6 +363,7 @@ export class GlassWebglRenderer {
         gl: WebGLRenderingContext,
         program: WebGLProgram,
         vertexBuffer: WebGLBuffer,
+        opticalTexture: WebGLTexture,
     ) {
         this.canvas = canvas;
         this.gl = gl;
@@ -376,6 +372,17 @@ export class GlassWebglRenderer {
         const viewportDims = gl.getParameter(gl.MAX_VIEWPORT_DIMS) as ArrayLike<number> | null;
         const maxTextureSize = Math.max(256, Number(gl.getParameter(gl.MAX_TEXTURE_SIZE)) || 4096);
         this.maxTextureSize = maxTextureSize;
+        this.opticalLutSize = Math.min(OPTICAL_LUT_SIZE, maxTextureSize);
+        this.opticalTexture = opticalTexture;
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, this.opticalTexture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.uniform1i(gl.getUniformLocation(program, "uOpticalLut"), 1);
+        gl.uniform2f(gl.getUniformLocation(program, "uLutScale"),
+            (this.opticalLutSize - 1) / this.opticalLutSize, 0.5 / this.opticalLutSize);
         this.maxViewportWidth =
             viewportDims && Number(viewportDims[0]) > 0 ? Number(viewportDims[0]) : maxTextureSize;
         this.maxViewportHeight =
@@ -442,6 +449,13 @@ export class GlassWebglRenderer {
             return null;
         }
 
+        const opticalTexture = gl.createTexture();
+        if (!opticalTexture) {
+            gl.deleteBuffer(vertexBuffer);
+            gl.deleteProgram(program);
+            return null;
+        }
+
         gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
         gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
 
@@ -450,7 +464,7 @@ export class GlassWebglRenderer {
         gl.enableVertexAttribArray(posLocation);
         gl.vertexAttribPointer(posLocation, 2, gl.FLOAT, false, 0, 0);
 
-        return new GlassWebglRenderer(canvas, gl, program, vertexBuffer);
+        return new GlassWebglRenderer(canvas, gl, program, vertexBuffer, opticalTexture);
     }
 
     setSceneCanvas(sourceCanvas: HTMLCanvasElement | null): void {
@@ -546,6 +560,16 @@ export class GlassWebglRenderer {
         const { gl } = this;
         gl.clearColor(0, 0, 0, 0);
         gl.clear(gl.COLOR_BUFFER_BIT);
+        if (frame.surface !== this.opticalSurface || frame.ior !== this.opticalIor) {
+            gl.activeTexture(gl.TEXTURE1);
+            gl.bindTexture(gl.TEXTURE_2D, this.opticalTexture);
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
+            gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 0);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, this.opticalLutSize, 1, 0,
+                gl.RGBA, gl.UNSIGNED_BYTE, buildOpticalLut(frame.surface, frame.ior, this.opticalLutSize));
+            this.opticalSurface = frame.surface;
+            this.opticalIor = frame.ior;
+        }
 
         let surfaceId = 0;
         if (frame.surface === "convex_circle") surfaceId = 1;
@@ -670,6 +694,7 @@ export class GlassWebglRenderer {
             this.sceneTexture = null;
         }
         this.uploadCanvas = null;
+        this.gl.deleteTexture(this.opticalTexture);
         this.gl.deleteBuffer(this.vertexBuffer);
         this.gl.deleteProgram(this.program);
     }

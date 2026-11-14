@@ -16,7 +16,9 @@ const SURFACE_LIP: i32 = 3;
 const FLAG_PILL: i32 = 1;
 const FLAG_AXIS_X: i32 = 2;
 
+#[cfg(not(test))]
 struct SyncCell<T>(UnsafeCell<T>);
+#[cfg(not(test))]
 unsafe impl<T> Sync for SyncCell<T> {}
 
 struct SurfaceLut {
@@ -26,12 +28,15 @@ struct SurfaceLut {
     cos_i: [[f32; LUT_LEN]; SURFACE_COUNT],
 }
 
-static SURFACE_LUT: SyncCell<SurfaceLut> = SyncCell(UnsafeCell::new(SurfaceLut {
+const EMPTY_SURFACE_LUT: SurfaceLut = SurfaceLut {
     initialized: false,
     height: [[0.0; LUT_LEN]; SURFACE_COUNT],
     sin_i: [[0.0; LUT_LEN]; SURFACE_COUNT],
     cos_i: [[1.0; LUT_LEN]; SURFACE_COUNT],
-}));
+};
+
+#[cfg(not(test))]
+static SURFACE_LUT: SyncCell<SurfaceLut> = SyncCell(UnsafeCell::new(EMPTY_SURFACE_LUT));
 
 #[cfg(not(test))]
 static MAX_DISPLACEMENT: SyncCell<f32> = SyncCell(UnsafeCell::new(0.0));
@@ -41,9 +46,22 @@ static BMP_BUFFER: SyncCell<[u8; MAX_BMP_BYTES]> = SyncCell(UnsafeCell::new([0u8
 
 #[cfg(test)]
 std::thread_local! {
+    static TEST_SURFACE_LUT: UnsafeCell<SurfaceLut> = const { UnsafeCell::new(EMPTY_SURFACE_LUT) };
     static TEST_MAX_DISPLACEMENT: UnsafeCell<f32> = const { UnsafeCell::new(0.0) };
     static TEST_BMP_BUFFER: UnsafeCell<[u8; MAX_BMP_BYTES]> =
         const { UnsafeCell::new([0u8; MAX_BMP_BYTES]) };
+}
+
+#[inline(always)]
+fn surface_lut_ptr() -> *mut SurfaceLut {
+    #[cfg(test)]
+    {
+        TEST_SURFACE_LUT.with(|cell| cell.get())
+    }
+    #[cfg(not(test))]
+    {
+        SURFACE_LUT.0.get()
+    }
 }
 
 #[cfg(not(test))]
@@ -166,7 +184,7 @@ fn eval_surface_height_and_slope(surface_id: i32, x: f32) -> (f32, f32) {
 
 #[no_mangle]
 pub extern "C" fn initTables() {
-    let lut = unsafe { &mut *SURFACE_LUT.0.get() };
+    let lut = unsafe { &mut *surface_lut_ptr() };
     let inv_steps = 1.0 / ((LUT_LEN - 1) as f32);
 
     let mut surface_id = 0i32;
@@ -195,10 +213,10 @@ fn build_refraction_lut(
     ior: f32,
     out_disp: &mut [f32; LUT_LEN],
 ) -> f32 {
-    let lut = unsafe { &*SURFACE_LUT.0.get() };
-    if !lut.initialized {
+    if !unsafe { (*surface_lut_ptr()).initialized } {
         initTables();
     }
+    let lut = unsafe { &*surface_lut_ptr() };
 
     let safe_surface = if (0..SURFACE_COUNT as i32).contains(&surface_id) {
         surface_id as usize
@@ -310,23 +328,66 @@ unsafe fn write_axis_x_strip(
     let half_w = width_f * 0.5;
     let inv_bezel = 1.0 / scaled_bezel.max(1e-4);
 
+    fill_pixels(pixel_base, target_w, 0xff80_8080);
     let mut x = 0usize;
-    while x < target_w {
+    while x < (target_w + 1) / 2 {
         let px = x as f32 + 0.5;
-        let dist_edge = if px < half_w { px } else { width_f - px };
-        let norm_x = if dist_edge < scaled_bezel {
-            let t = dist_edge * inv_bezel;
-            let disp = sample_disp_lut(disp_lut, t);
-            let sign = if px < half_w { 1.0 } else { -1.0 };
-            sign * disp * inv_max_disp
-        } else {
-            0.0
-        };
-        write_bgra_pixel(pixel_base.add(x * 4), norm_x, 0.0);
+        if px >= scaled_bezel {
+            break;
+        }
+        let disp = sample_disp_lut(disp_lut, px * inv_bezel);
+        let sign = if px < half_w { 1.0 } else { -1.0 };
+        write_reflected_pixel(pixel_base, target_w, x, sign * disp * inv_max_disp, 0.0);
         x += 1;
     }
 }
 
+#[inline(always)]
+fn eval_distance_pixel(
+    qx: f32,
+    qy: f32,
+    sign_x: f32,
+    sign_y: f32,
+    radius: f32,
+    scaled_bezel: f32,
+    inv_bezel: f32,
+    disp_lut: &[f32; LUT_LEN],
+    inv_max_disp: f32,
+) -> (f32, f32) {
+    let q_plus_x = qx.max(0.0);
+    let q_plus_y = qy.max(0.0);
+    let out_len = sqrt_f32(q_plus_x * q_plus_x + q_plus_y * q_plus_y);
+    let sd = out_len + qx.max(qy).min(0.0) - radius;
+    let depth = -sd;
+    if sd >= 0.0 || depth >= scaled_bezel {
+        return (0.0, 0.0);
+    }
+    let disp = sample_disp_lut(disp_lut, depth * inv_bezel) * inv_max_disp;
+    let (nx, ny) = if out_len > 1e-5 {
+        let inv_len = 1.0 / out_len;
+        (-sign_x * q_plus_x * inv_len, -sign_y * q_plus_y * inv_len)
+    } else if qx > qy {
+        (-sign_x, 0.0)
+    } else {
+        (0.0, -sign_y)
+    };
+    (nx * disp, ny * disp)
+}
+
+#[inline(always)]
+fn column_q(x: usize, half_w: f32, radius: f32) -> f32 {
+    let abs_x = (x as f32 + 0.5 - half_w).abs();
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        abs_x - (half_w - radius)
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+    {
+        abs_x - half_w + radius
+    }
+}
+
+#[cfg(any(test, all(target_arch = "wasm32", target_feature = "simd128")))]
 #[inline(always)]
 fn eval_scalar_pixel(
     px: f32,
@@ -349,22 +410,24 @@ fn eval_scalar_pixel(
     let q_max = if qx > qy { qx } else { qy };
     let in_dist = if q_max < 0.0 { q_max } else { 0.0 };
     let sd = out_len + in_dist - radius;
-
-    if sd >= 0.0 {
+    if sd >= 0.0 || -sd >= scaled_bezel {
         return (0.0, 0.0);
     }
-
-    let depth = -sd;
-    if depth >= scaled_bezel {
-        return (0.0, 0.0);
-    }
-
-    let t = depth * inv_bezel;
-    let disp = sample_disp_lut(disp_lut, t) * inv_max_disp;
-
-    let sign_x = if px < 0.0 { -1.0 } else if px > 0.0 { 1.0 } else { 0.0 };
-    let sign_y = if py < 0.0 { -1.0 } else if py > 0.0 { 1.0 } else { 0.0 };
-
+    let disp = sample_disp_lut(disp_lut, -sd * inv_bezel) * inv_max_disp;
+    let sign_x = if px < 0.0 {
+        -1.0
+    } else if px > 0.0 {
+        1.0
+    } else {
+        0.0
+    };
+    let sign_y = if py < 0.0 {
+        -1.0
+    } else if py > 0.0 {
+        1.0
+    } else {
+        0.0
+    };
     let (nx, ny) = if out_len > 1e-5 {
         let inv_len = 1.0 / out_len;
         (-sign_x * q_plus_x * inv_len, -sign_y * q_plus_y * inv_len)
@@ -373,15 +436,71 @@ fn eval_scalar_pixel(
     } else {
         (0.0, -sign_y)
     };
-
     (nx * disp, ny * disp)
+}
+
+#[inline]
+unsafe fn fill_pixels(row_ptr: *mut u8, count: usize, pixel: u32) {
+    let mut x = 0;
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        use core::arch::wasm32::*;
+        let packed = u32x4_splat(pixel);
+        while x + 4 <= count {
+            v128_store(row_ptr.add(x * 4) as *mut v128, packed);
+            x += 4;
+        }
+    }
+    while x < count {
+        (row_ptr.add(x * 4) as *mut u32).write_unaligned(pixel.to_le());
+        x += 1;
+    }
+}
+
+#[inline(always)]
+unsafe fn write_reflected_pixel(row_ptr: *mut u8, width: usize, x: usize, nx: f32, ny: f32) {
+    write_bgra_pixel(row_ptr.add(x * 4), nx, ny);
+    let reflected = width - 1 - x;
+    if reflected != x {
+        write_bgra_pixel(row_ptr.add(reflected * 4), -nx, ny);
+    }
+}
+
+#[inline]
+unsafe fn reflect_row(source: *const u8, target: *mut u8, width: usize) {
+    let mut x = 0;
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        use core::arch::wasm32::*;
+        let green = u32x4_splat(0x0000_ff00);
+        let neutral = u32x4_splat(0x0000_8000);
+        while x + 4 <= width {
+            let pixels = v128_load(source.add(x * 4) as *const v128);
+            let mask = i32x4_ne(v128_and(pixels, green), neutral);
+            v128_store(
+                target.add(x * 4) as *mut v128,
+                v128_xor(pixels, v128_and(mask, green)),
+            );
+            x += 4;
+        }
+    }
+    while x < width {
+        let mut pixel = u32::from_le((source.add(x * 4) as *const u32).read_unaligned());
+        if pixel & 0xff00 != 0x8000 {
+            pixel ^= 0xff00;
+        }
+        (target.add(x * 4) as *mut u32).write_unaligned(pixel.to_le());
+        x += 1;
+    }
 }
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[inline]
-unsafe fn write_row_simd(
+unsafe fn write_corner_span(
     row_ptr: *mut u8,
     target_w: usize,
+    start: usize,
+    end: usize,
     py: f32,
     half_w: f32,
     half_h: f32,
@@ -407,12 +526,21 @@ unsafe fn write_row_simd(
     let qy_v = f32x4_splat(qy);
     let q_plus_y_v = f32x4_splat(if qy > 0.0 { qy } else { 0.0 });
     let q_plus_y_sq_v = f32x4_mul(q_plus_y_v, q_plus_y_v);
-    let sign_y = if py < 0.0 { -1.0 } else if py > 0.0 { 1.0 } else { 0.0 };
+    let sign_y = if py < 0.0 {
+        -1.0
+    } else if py > 0.0 {
+        1.0
+    } else {
+        0.0
+    };
     let neg_sign_y_v = f32x4_splat(-sign_y);
 
-    let mut x = 0usize;
-    while x + 4 <= target_w {
-        let px_v = f32x4_sub(f32x4_add(f32x4_splat(x as f32), step_x), f32x4_splat(half_w));
+    let mut x = start;
+    while x + 4 <= end {
+        let px_v = f32x4_sub(
+            f32x4_add(f32x4_splat(x as f32), step_x),
+            f32x4_splat(half_w),
+        );
         let qx_v = f32x4_sub(f32x4_abs(px_v), inner_x_v);
         let q_plus_x_v = f32x4_max(qx_v, zero);
         let out_len_v = f32x4_sqrt(f32x4_add(f32x4_mul(q_plus_x_v, q_plus_x_v), q_plus_y_sq_v));
@@ -420,21 +548,36 @@ unsafe fn write_row_simd(
         let sd_v = f32x4_sub(f32x4_add(out_len_v, in_dist_v), radius_v);
         let depth_v = f32x4_neg(sd_v);
 
-        let inside_mask = i32x4_bitmask(f32x4_lt(sd_v, zero))
-            & i32x4_bitmask(f32x4_lt(depth_v, bezel_v));
+        let inside_mask =
+            i32x4_bitmask(f32x4_lt(sd_v, zero)) & i32x4_bitmask(f32x4_lt(depth_v, bezel_v));
 
         if inside_mask == 0 {
-            v128_store(row_ptr.add(x * 4) as *mut v128, u32x4_splat(0xff80_8080));
             x += 4;
             continue;
         }
 
         let t_v = f32x4_mul(depth_v, inv_bezel_v);
         let disp_v = f32x4(
-            if (inside_mask & 1) != 0 { sample_disp_lut(disp_lut, f32x4_extract_lane::<0>(t_v)) * inv_max_disp } else { 0.0 },
-            if (inside_mask & 2) != 0 { sample_disp_lut(disp_lut, f32x4_extract_lane::<1>(t_v)) * inv_max_disp } else { 0.0 },
-            if (inside_mask & 4) != 0 { sample_disp_lut(disp_lut, f32x4_extract_lane::<2>(t_v)) * inv_max_disp } else { 0.0 },
-            if (inside_mask & 8) != 0 { sample_disp_lut(disp_lut, f32x4_extract_lane::<3>(t_v)) * inv_max_disp } else { 0.0 },
+            if (inside_mask & 1) != 0 {
+                sample_disp_lut(disp_lut, f32x4_extract_lane::<0>(t_v)) * inv_max_disp
+            } else {
+                0.0
+            },
+            if (inside_mask & 2) != 0 {
+                sample_disp_lut(disp_lut, f32x4_extract_lane::<1>(t_v)) * inv_max_disp
+            } else {
+                0.0
+            },
+            if (inside_mask & 4) != 0 {
+                sample_disp_lut(disp_lut, f32x4_extract_lane::<2>(t_v)) * inv_max_disp
+            } else {
+                0.0
+            },
+            if (inside_mask & 8) != 0 {
+                sample_disp_lut(disp_lut, f32x4_extract_lane::<3>(t_v)) * inv_max_disp
+            } else {
+                0.0
+            },
         );
 
         let neg_mask = f32x4_lt(px_v, zero);
@@ -457,29 +600,221 @@ unsafe fn write_row_simd(
         let off_x_v = f32x4_mul(nx_v, disp_v);
         let off_y_v = f32x4_mul(ny_v, disp_v);
 
-        write_bgra_pixel(row_ptr.add(x * 4), f32x4_extract_lane::<0>(off_x_v), f32x4_extract_lane::<0>(off_y_v));
-        write_bgra_pixel(row_ptr.add((x + 1) * 4), f32x4_extract_lane::<1>(off_x_v), f32x4_extract_lane::<1>(off_y_v));
-        write_bgra_pixel(row_ptr.add((x + 2) * 4), f32x4_extract_lane::<2>(off_x_v), f32x4_extract_lane::<2>(off_y_v));
-        write_bgra_pixel(row_ptr.add((x + 3) * 4), f32x4_extract_lane::<3>(off_x_v), f32x4_extract_lane::<3>(off_y_v));
+        write_reflected_pixel(
+            row_ptr,
+            target_w,
+            x,
+            f32x4_extract_lane::<0>(off_x_v),
+            f32x4_extract_lane::<0>(off_y_v),
+        );
+        write_reflected_pixel(
+            row_ptr,
+            target_w,
+            x + 1,
+            f32x4_extract_lane::<1>(off_x_v),
+            f32x4_extract_lane::<1>(off_y_v),
+        );
+        write_reflected_pixel(
+            row_ptr,
+            target_w,
+            x + 2,
+            f32x4_extract_lane::<2>(off_x_v),
+            f32x4_extract_lane::<2>(off_y_v),
+        );
+        write_reflected_pixel(
+            row_ptr,
+            target_w,
+            x + 3,
+            f32x4_extract_lane::<3>(off_x_v),
+            f32x4_extract_lane::<3>(off_y_v),
+        );
 
         x += 4;
     }
 
-    while x < target_w {
+    while x < end {
         let px = x as f32 + 0.5 - half_w;
-        let (off_x, off_y) = eval_scalar_pixel(
-            px,
-            py,
-            half_w,
-            half_h,
+        let (off_x, off_y) = eval_distance_pixel(
+            column_q(x, half_w, radius),
+            qy,
+            if px < 0.0 { -1.0 } else { 0.0 },
+            sign_y,
             radius,
             scaled_bezel,
             inv_bezel,
             disp_lut,
             inv_max_disp,
         );
-        write_bgra_pixel(row_ptr.add(x * 4), off_x, off_y);
+        write_reflected_pixel(row_ptr, target_w, x, off_x, off_y);
         x += 1;
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+#[inline]
+unsafe fn write_corner_span(
+    row_ptr: *mut u8,
+    target_w: usize,
+    start: usize,
+    end: usize,
+    py: f32,
+    half_w: f32,
+    half_h: f32,
+    radius: f32,
+    scaled_bezel: f32,
+    inv_bezel: f32,
+    disp_lut: &[f32; LUT_LEN],
+    inv_max_disp: f32,
+) {
+    for x in start..end {
+        let px = x as f32 + 0.5 - half_w;
+        let (nx, ny) = eval_distance_pixel(
+            column_q(x, half_w, radius),
+            py.abs() - half_h + radius,
+            if px < 0.0 { -1.0 } else { 0.0 },
+            if py < 0.0 { -1.0 } else { 0.0 },
+            radius,
+            scaled_bezel,
+            inv_bezel,
+            disp_lut,
+            inv_max_disp,
+        );
+        write_reflected_pixel(row_ptr, target_w, x, nx, ny);
+    }
+}
+
+#[inline]
+fn first_column_at_most(width: usize, half_w: f32, radius: f32, q: f32) -> usize {
+    let limit = (width + 1) / 2;
+    let mut x = ((radius - q).max(0.0) as usize).min(limit);
+    while x > 0 && column_q(x - 1, half_w, radius) <= q {
+        x -= 1;
+    }
+    while x < limit && column_q(x, half_w, radius) > q {
+        x += 1;
+    }
+    x
+}
+
+unsafe fn write_symmetric_map(
+    pixel_base: *mut u8,
+    width: usize,
+    height: usize,
+    radius: f32,
+    bezel: f32,
+    disp_lut: &[f32; LUT_LEN],
+    inv_max_disp: f32,
+) {
+    let half_w = width as f32 * 0.5;
+    let half_h = height as f32 * 0.5;
+    let inv_bezel = 1.0 / bezel.max(1e-4);
+    let stride = width * 4;
+    let template = pixel_base.add((height / 2) * stride);
+    fill_pixels(template, width, 0xff80_8080);
+    for x in 0..((bezel as usize + 2).min((width + 1) / 2)) {
+        let (nx, _) = eval_distance_pixel(
+            column_q(x, half_w, radius),
+            -half_w - radius - 1.0,
+            if x as f32 + 0.5 < half_w { -1.0 } else { 0.0 },
+            0.0,
+            radius,
+            bezel,
+            inv_bezel,
+            disp_lut,
+            inv_max_disp,
+        );
+        write_reflected_pixel(template, width, x, nx, 0.0);
+    }
+    let straight_start = first_column_at_most(width, half_w, radius, 0.0);
+    for y in 0..(height + 1) / 2 {
+        let py = y as f32 + 0.5 - half_h;
+        let qy = py.abs() - half_h + radius;
+        let row = pixel_base.add(y * stride);
+        if qy <= 0.0 {
+            if row != template {
+                core::ptr::copy_nonoverlapping(template, row, stride);
+            }
+            let depth = radius - qy;
+            if depth < bezel {
+                let start = first_column_at_most(width, half_w, radius, qy);
+                let ny = if py < 0.0 {
+                    sample_disp_lut(disp_lut, depth * inv_bezel) * inv_max_disp
+                } else {
+                    0.0
+                };
+                if start < width - start {
+                    let pixel = 0xff80_0080 | ((encode_channel(ny) as u32) << 8);
+                    fill_pixels(row.add(start * 4), width - 2 * start, pixel);
+                }
+            }
+        } else {
+            fill_pixels(row, width, 0xff80_8080);
+            if straight_start < width - straight_start {
+                let (_, ny) = eval_distance_pixel(
+                    0.0,
+                    qy,
+                    0.0,
+                    -1.0,
+                    radius,
+                    bezel,
+                    inv_bezel,
+                    disp_lut,
+                    inv_max_disp,
+                );
+                let pixel = 0xff80_0080 | ((encode_channel(ny) as u32) << 8);
+                fill_pixels(
+                    row.add(straight_start * 4),
+                    width - 2 * straight_start,
+                    pixel,
+                );
+            }
+            let outer_x = sqrt_f32((radius * radius - qy * qy).max(0.0));
+            let start = ((radius - outer_x).max(0.0) as usize).saturating_sub(2);
+            let inner = (radius - bezel).max(0.0);
+            let inner_x = sqrt_f32((inner * inner - qy * qy).max(0.0));
+            let end = ((radius - inner_x).max(0.0) as usize + 3).min(straight_start);
+            write_corner_span(
+                row,
+                width,
+                start.min(end),
+                end,
+                py,
+                half_w,
+                half_h,
+                radius,
+                bezel,
+                inv_bezel,
+                disp_lut,
+                inv_max_disp,
+            );
+        }
+        let reflected_y = height - 1 - y;
+        if reflected_y != y {
+            let reflected_row = pixel_base.add(reflected_y * stride);
+            if width >= 32 && qy <= 0.0 && radius - qy >= bezel {
+                core::ptr::copy_nonoverlapping(row, reflected_row, stride);
+            } else {
+                reflect_row(row, reflected_row, width);
+            }
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        for output_y in [y, reflected_y] {
+            let output = pixel_base.add(output_y * stride);
+            for x in width - width % 4..width {
+                let (nx, ny) = eval_scalar_pixel(
+                    x as f32 + 0.5 - half_w,
+                    output_y as f32 + 0.5 - half_h,
+                    half_w,
+                    half_h,
+                    radius,
+                    bezel,
+                    inv_bezel,
+                    disp_lut,
+                    inv_max_disp,
+                );
+                write_bgra_pixel(output.add(x * 4), nx, ny);
+            }
+        }
     }
 }
 
@@ -551,50 +886,15 @@ pub extern "C" fn generateDisplacementBmp(
             return total_bytes as i32;
         }
 
-        let inv_bezel = 1.0 / scaled_bezel.max(1e-4);
-        let row_stride = w * 4;
-        let mut y = 0usize;
-        while y < h {
-            let py = y as f32 + 0.5 - half_h;
-            let row_ptr = pixel_base.add(y * row_stride);
-
-            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-            write_row_simd(
-                row_ptr,
-                w,
-                py,
-                half_w,
-                half_h,
-                scaled_radius,
-                scaled_bezel,
-                inv_bezel,
-                &disp_lut,
-                inv_max_disp,
-            );
-
-            #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
-            {
-                let mut x = 0usize;
-                while x < w {
-                    let px = x as f32 + 0.5 - half_w;
-                    let (off_x, off_y) = eval_scalar_pixel(
-                        px,
-                        py,
-                        half_w,
-                        half_h,
-                        scaled_radius,
-                        scaled_bezel,
-                        inv_bezel,
-                        &disp_lut,
-                        inv_max_disp,
-                    );
-                    write_bgra_pixel(row_ptr.add(x * 4), off_x, off_y);
-                    x += 1;
-                }
-            }
-
-            y += 1;
-        }
+        write_symmetric_map(
+            pixel_base,
+            w,
+            h,
+            scaled_radius,
+            scaled_bezel,
+            &disp_lut,
+            inv_max_disp,
+        );
     }
 
     total_bytes as i32
@@ -612,6 +912,161 @@ mod tests {
         unsafe { core::slice::from_raw_parts(bmp_buffer_ptr(), len) }
     }
 
+    fn assert_matches_scalar(
+        width: i32,
+        height: i32,
+        radius: f32,
+        bezel: f32,
+        thickness: f32,
+        scale: f32,
+        ior: f32,
+        surface: i32,
+        flags: i32,
+    ) {
+        let half_w = width as f32 * 0.5;
+        let half_h = height as f32 * 0.5;
+        let safe_scale = scale.max(1e-4);
+        let axis = flags & FLAG_AXIS_X != 0;
+        let scaled_bezel = clamp_f32(
+            bezel * safe_scale,
+            1.0,
+            if axis {
+                half_w
+            } else {
+                half_w.min(half_h).max(1.0)
+            },
+        );
+        let scaled_radius = if flags & FLAG_PILL != 0 {
+            half_w.min(half_h)
+        } else {
+            clamp_f32(radius * safe_scale, 0.0, half_w.min(half_h))
+        };
+        let mut lut = [0.0; LUT_LEN];
+        let max_disp = build_refraction_lut(surface, scaled_bezel, thickness, ior, &mut lut);
+        let inv_max = 1.0 / max_disp;
+        let inv_bezel = 1.0 / scaled_bezel.max(1e-4);
+        let len = generateDisplacementBmp(
+            width, height, radius, bezel, thickness, scale, ior, surface, flags,
+        );
+        assert_eq!(len, 64 + width * height * 4);
+        assert_eq!(
+            read_max_displacement().to_bits(),
+            (max_disp / safe_scale).to_bits()
+        );
+        let bmp = read_bmp_slice(len as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let (nx, ny) = if axis && height == 1 {
+                    let px = x as f32 + 0.5;
+                    let depth = px.min(width as f32 - px);
+                    let nx = if depth < scaled_bezel {
+                        let sign = if px < half_w { 1.0 } else { -1.0 };
+                        sign * sample_disp_lut(&lut, depth * inv_bezel) * inv_max
+                    } else {
+                        0.0
+                    };
+                    (nx, 0.0)
+                } else {
+                    eval_scalar_pixel(
+                        x as f32 + 0.5 - half_w,
+                        y as f32 + 0.5 - half_h,
+                        half_w,
+                        half_h,
+                        scaled_radius,
+                        scaled_bezel,
+                        inv_bezel,
+                        &lut,
+                        inv_max,
+                    )
+                };
+                let offset = 64 + (y * width + x) as usize * 4;
+                let expected = [128, encode_channel(ny), encode_channel(nx), 255];
+                for channel in 0..4 {
+                    assert!(
+                        bmp[offset + channel].abs_diff(expected[channel]) <= 1,
+                        "{width}x{height}, radius {radius}, bezel {bezel}, scale {scale}, \
+                         surface {surface}, flags {flags}, pixel ({x}, {y}), \
+                         actual {:?}, expected {expected:?}",
+                        &bmp[offset..offset + 4],
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matches_scalar_for_all_surfaces_flags_and_degenerate_shapes() {
+        for (width, height) in [
+            (1, 1),
+            (1, 9),
+            (9, 1),
+            (2, 2),
+            (3, 5),
+            (5, 3),
+            (7, 9),
+            (16, 17),
+            (31, 19),
+            (64, 32),
+            (65, 33),
+            (81, 81),
+            (301, 93),
+        ] {
+            for radius in [0.0, 0.000001, 0.5, 1.0, 3.14159, 12.75, 999.0] {
+                for bezel in [0.0, 1.0, 3.125, 999.0] {
+                    for surface in 0..4 {
+                        for flags in 0..4 {
+                            assert_matches_scalar(
+                                width, height, radius, bezel, 42.0, 1.0, 2.05, surface, flags,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matches_scalar_for_fractional_scaling_and_signed_refraction() {
+        let mut seed = 81281u32;
+        let mut random = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed as f32 / u32::MAX as f32
+        };
+        for _ in 0..500 {
+            assert_matches_scalar(
+                1 + (random() * 100.0) as i32,
+                1 + (random() * 100.0) as i32,
+                random() * 100.0,
+                random() * 100.0,
+                random() * 200.0 - 25.0,
+                random() * 3.0,
+                random() * 4.0,
+                (random() * 6.0) as i32 - 1,
+                (random() * 8.0) as i32,
+            );
+        }
+    }
+
+    #[test]
+    fn handles_capacity_limits_and_rejects_invalid_dimensions() {
+        assert_matches_scalar(136_000, 1, 0.0, 18.0, 42.0, 1.0, 2.05, 0, FLAG_AXIS_X);
+        assert_matches_scalar(1, 136_000, 0.5, 18.0, 42.0, 1.0, 2.05, 3, FLAG_PILL);
+        for (width, height) in [
+            (0, 1),
+            (1, 0),
+            (-1, 1),
+            (1, -1),
+            (136_001, 1),
+            (i32::MAX, i32::MAX),
+        ] {
+            assert_eq!(
+                generateDisplacementBmp(width, height, 0.0, 1.0, 42.0, 1.0, 2.05, 0, 0),
+                0
+            );
+            assert_eq!(read_max_displacement(), 0.0);
+        }
+    }
+
     #[test]
     fn generates_valid_bmp_and_symmetric_displacement_for_all_surfaces() {
         initTables();
@@ -625,7 +1080,10 @@ mod tests {
             assert_eq!(bmp[1], b'M');
             assert_eq!(u32::from_le_bytes([bmp[10], bmp[11], bmp[12], bmp[13]]), 64);
             assert_eq!(i32::from_le_bytes([bmp[18], bmp[19], bmp[20], bmp[21]]), 64);
-            assert_eq!(i32::from_le_bytes([bmp[22], bmp[23], bmp[24], bmp[25]]), -32);
+            assert_eq!(
+                i32::from_le_bytes([bmp[22], bmp[23], bmp[24], bmp[25]]),
+                -32
+            );
 
             let center = 64 + (16 * 64 + 32) * 4;
             assert_eq!(&bmp[center..center + 4], &[128, 128, 128, 255]);
@@ -640,7 +1098,17 @@ mod tests {
     #[test]
     fn generates_1d_horizontal_strip_for_axis_x_mode() {
         initTables();
-        let len = generateDisplacementBmp(128, 1, 20.0, 18.0, 60.0, 1.0, 2.05, 0, FLAG_PILL | FLAG_AXIS_X);
+        let len = generateDisplacementBmp(
+            128,
+            1,
+            20.0,
+            18.0,
+            60.0,
+            1.0,
+            2.05,
+            0,
+            FLAG_PILL | FLAG_AXIS_X,
+        );
         assert_eq!(len, 64 + 128 * 4);
         assert!(read_max_displacement() > 0.0);
 
