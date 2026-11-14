@@ -1,5 +1,5 @@
 {
-    "name": "@tahoangphuc/liquid-glass",
+    "name": "@tahoangphuc111/liquid-glass",
     "version": "0.1.0",
     "description": "liquid glass refraction for vanilla js, react, and vue 3 using wasm svg displacement on desktop chromium and webgl/css scene capture on mobile and safari",
     "type": "module",
