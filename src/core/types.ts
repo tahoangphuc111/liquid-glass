@@ -21,6 +21,7 @@ export interface GlassConfig {
     alwaysOn: boolean;
     hollow: boolean;
     axis?: "x" | null;
+    chromaticAberration?: boolean | number;
 }
 
 export interface LiquidGlassOptions {
@@ -43,6 +44,8 @@ export interface LiquidGlassOptions {
     pixelRatio?: number;
     chromaticAberration?: boolean | number;
     interactive?: boolean;
+    draggable?: boolean | "elastic";
+    coalesce?: boolean;
     sceneElement?: HTMLElement | null;
     sceneCanvas?: HTMLCanvasElement | null;
     onEngineChange?: (engine: GlassEngine) => void;
@@ -55,6 +58,21 @@ export interface LiquidGlassInstance {
     refresh(): void;
     setSceneCanvas(canvas: HTMLCanvasElement | null, sceneElement?: HTMLElement | null): void;
     destroy(): void;
+}
+
+export interface LiquidGlassSwitchOptions extends LiquidGlassOptions {
+    value?: string;
+    defaultValue?: string;
+    itemSelector?: string;
+    gliderElement?: HTMLElement | null;
+    onChange?: (value: string, index: number, itemElement: HTMLElement) => void;
+}
+
+export interface LiquidGlassSwitchInstance extends LiquidGlassInstance {
+    readonly value: string;
+    readonly activeIndex: number;
+    setValue(value: string, animate?: boolean): void;
+    setActiveIndex(index: number, animate?: boolean): void;
 }
 
 export interface LiquidGlassStats {
@@ -74,5 +92,6 @@ export interface SceneCaptureController {
     readonly source: HTMLElement | null;
     subscribe(listener: (canvas: HTMLCanvasElement, source: HTMLElement) => void): () => void;
     scheduleCapture(): void;
+    setActive?(active: boolean): void;
     destroy(): void;
 }

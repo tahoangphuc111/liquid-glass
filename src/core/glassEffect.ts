@@ -1,6 +1,11 @@
 import { createLiquidGlass } from "./controller.js";
 import { createGlassSlider } from "./slider.js";
-import type { LiquidGlassInstance, LiquidGlassOptions } from "./types.js";
+import { createGlassSwitch } from "./switch.js";
+import type {
+    LiquidGlassInstance,
+    LiquidGlassOptions,
+    LiquidGlassSwitchOptions,
+} from "./types.js";
 
 export interface LiquidGlassGroup {
     readonly instances: LiquidGlassInstance[];
@@ -46,9 +51,22 @@ function inferMinimalOptions(
     return resolved;
 }
 
+function isSwitchContainer(
+    element: HTMLElement,
+    options: LiquidGlassOptions | LiquidGlassSwitchOptions,
+): boolean {
+    const switchOptions = options as LiquidGlassSwitchOptions;
+    return (
+        element.classList.contains("lg-switch") ||
+        element.getAttribute("role") === "tablist" ||
+        element.hasAttribute("data-lg-switch") ||
+        Boolean(switchOptions.itemSelector || switchOptions.gliderElement)
+    );
+}
+
 function applyGlassToElement(
     element: HTMLElement,
-    options: LiquidGlassOptions = {},
+    options: LiquidGlassOptions | LiquidGlassSwitchOptions = {},
 ): LiquidGlassInstance {
     const existing = activeGlassInstances.get(element);
     if (existing) {
@@ -63,7 +81,9 @@ function applyGlassToElement(
 
     const baseInstance = isRangeInput
         ? createGlassSlider(element, options)
-        : createLiquidGlass(element, inferMinimalOptions(element, options));
+        : isSwitchContainer(element, options)
+          ? createGlassSwitch(element, options as LiquidGlassSwitchOptions)
+          : createLiquidGlass(element, inferMinimalOptions(element, options));
     const wrappedInstance: LiquidGlassInstance = {
         get element() {
             return baseInstance.element;
@@ -92,15 +112,15 @@ function applyGlassToElement(
 
 export function glassEffect(
     target: HTMLElement,
-    options?: LiquidGlassOptions,
+    options?: LiquidGlassOptions | LiquidGlassSwitchOptions,
 ): LiquidGlassInstance;
 export function glassEffect(
     target: string | Iterable<HTMLElement>,
-    options?: LiquidGlassOptions,
+    options?: LiquidGlassOptions | LiquidGlassSwitchOptions,
 ): LiquidGlassGroup;
 export function glassEffect(
     target: HTMLElement | string | Iterable<HTMLElement>,
-    options: LiquidGlassOptions = {},
+    options: LiquidGlassOptions | LiquidGlassSwitchOptions = {},
 ): LiquidGlassInstance | LiquidGlassGroup {
     if (typeof HTMLElement !== "undefined" && target instanceof HTMLElement) {
         return applyGlassToElement(target, options);
@@ -135,13 +155,16 @@ export function glassEffect(
 
 declare global {
     interface HTMLElement {
-        glassEffect(options?: LiquidGlassOptions): LiquidGlassInstance;
+        glassEffect(options?: LiquidGlassOptions | LiquidGlassSwitchOptions): LiquidGlassInstance;
     }
 }
 
 if (typeof HTMLElement !== "undefined" && !HTMLElement.prototype.glassEffect) {
     Object.defineProperty(HTMLElement.prototype, "glassEffect", {
-        value(this: HTMLElement, options: LiquidGlassOptions = {}): LiquidGlassInstance {
+        value(
+            this: HTMLElement,
+            options: LiquidGlassOptions | LiquidGlassSwitchOptions = {},
+        ): LiquidGlassInstance {
             return applyGlassToElement(this, options);
         },
         configurable: true,

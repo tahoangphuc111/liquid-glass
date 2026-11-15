@@ -1,5 +1,10 @@
 import { CSS_FALLBACK_BACKDROP, resolveGlassConfig } from "./config.js";
 import {
+    collectCoalescenceSnapshot,
+    registerCoalescenceParticipant,
+    syncCoalescenceGeometry,
+} from "./coalescence.js";
+import {
     elementStateMap,
     registerManagedElement,
     unregisterManagedElement,
@@ -19,7 +24,57 @@ import type {
     SceneCaptureController,
 } from "./types.js";
 import { isWasmReady, onWasmReady } from "./wasm.js";
+import {
+    acquireWebglSlot,
+    isWebglSlotOnStandby,
+    releaseWebglSlot,
+    updateWebglSlotVisibility,
+    type WebglPoolEntry,
+} from "./webglPool.js";
 import { GlassWebglRenderer, parseCssColorToRgb } from "./webglRenderer.js";
+
+const visibilityHandlers = new WeakMap<Element, (isVisible: boolean) => void>();
+let sharedVisibilityObserver: IntersectionObserver | null = null;
+let sharedVisibilityCount = 0;
+
+function observeElementVisibility(
+    targetElement: Element,
+    onVisibilityChange: (isVisible: boolean) => void,
+): () => void {
+    if (typeof IntersectionObserver !== "function") {
+        return () => {};
+    }
+    if (!sharedVisibilityObserver) {
+        sharedVisibilityObserver = new IntersectionObserver(
+            (entries) => {
+                for (let index = 0; index < entries.length; index++) {
+                    const entry = entries[index];
+                    const handler = visibilityHandlers.get(entry.target);
+                    if (handler) {
+                        handler(entry.isIntersecting);
+                    }
+                }
+            },
+            { rootMargin: "120px" },
+        );
+    }
+    visibilityHandlers.set(targetElement, onVisibilityChange);
+    sharedVisibilityObserver.observe(targetElement);
+    sharedVisibilityCount += 1;
+
+    let active = true;
+    return () => {
+        if (!active) return;
+        active = false;
+        visibilityHandlers.delete(targetElement);
+        sharedVisibilityObserver?.unobserve(targetElement);
+        sharedVisibilityCount = Math.max(0, sharedVisibilityCount - 1);
+        if (sharedVisibilityCount === 0) {
+            sharedVisibilityObserver?.disconnect();
+            sharedVisibilityObserver = null;
+        }
+    };
+}
 
 function computeCornerRadiusPx(
     el: HTMLElement,
@@ -69,6 +124,9 @@ export function createLiquidGlass(
     let renderFrameId: number | null = null;
     let lastSceneBackdropKey = "";
     let listenersAttached = false;
+    let isViewportVisible = true;
+    let pendingVisibleRender = false;
+    let unobserveVisibility: (() => void) | null = null;
 
     const getSceneBackdropKey = (): string => {
         if (typeof document === "undefined" || typeof window === "undefined") return "";
@@ -82,6 +140,22 @@ export function createLiquidGlass(
     let springController: SpringController | null = null;
     let interactiveListenersAttached = false;
     let pressGlow = 0;
+    let lightTiltHorizontal = 0;
+    let lightTiltVertical = 0;
+    let dragMotionSpeed = 0;
+    let lastSpringDragX = 0;
+    let lastSpringDragY = 0;
+    let isPointerDragging = false;
+    let activeDragPointerId: number | null = null;
+    let dragStartClientX = 0;
+    let dragStartClientY = 0;
+    let lastDragClientX = 0;
+    let lastDragClientY = 0;
+    let lastDragTimestamp = 0;
+    let dragVelocityX = 0;
+    let dragVelocityY = 0;
+    let hasDraggedBeyondThreshold = false;
+    let unregisterCoalescence: (() => void) | null = null;
 
     element.setAttribute("data-lg-surface", "");
     element.classList.add("lg-surface");
@@ -129,30 +203,90 @@ export function createLiquidGlass(
         const sourceRect = source.getBoundingClientRect();
         const elRect = element.getBoundingClientRect();
         if (sourceRect.width < 2 || sourceRect.height < 2) return undefined;
+        const width = element.offsetWidth || elRect.width;
+        const height = element.offsetHeight || elRect.height;
+        const elCenterX = (elRect.left + elRect.right) * 0.5;
+        const elCenterY = (elRect.top + elRect.bottom) * 0.5;
+        const unstretchedLeft = elCenterX - width * 0.5;
+        const unstretchedTop = elCenterY - height * 0.5;
         return {
-            relX: (elRect.left - sourceRect.left) / sourceRect.width,
-            relY: (elRect.top - sourceRect.top) / sourceRect.height,
-            relW: elRect.width / sourceRect.width,
-            relH: elRect.height / sourceRect.height,
+            relX: (unstretchedLeft - sourceRect.left) / sourceRect.width,
+            relY: (unstretchedTop - sourceRect.top) / sourceRect.height,
+            relW: width / sourceRect.width,
+            relH: height / sourceRect.height,
         };
     };
 
-    const drawWebglFrame = () => {
-        renderFrameId = null;
-        if (destroyed || activeEngine !== "webgl" || !webglRenderer) return;
-
-        const width = element.offsetWidth || Math.round(element.getBoundingClientRect().width);
-        const height = element.offsetHeight || Math.round(element.getBoundingClientRect().height);
-        if (width < 2 || height < 2) return;
-
+    const readCoalescenceBounds = () => {
+        if (destroyed || !element.isConnected) return null;
+        const rect = element.getBoundingClientRect();
+        const width = element.offsetWidth || Math.round(rect.width);
+        const height = element.offsetHeight || Math.round(rect.height);
+        if (width < 2 || height < 2) return null;
         const radiusResult = computeCornerRadiusPx(element, width, height, config, cachedRadiusStr);
         cachedRadiusStr = radiusResult.rawRadiusStr;
         const radius = radiusResult.radius;
         const halfMin = Math.min(width, height) * 0.5;
         const bezel = Math.max(1, Math.min(config.bezel, halfMin - 1));
+        const unstretchedLeft = (rect.left + rect.right) * 0.5 - width * 0.5;
+        const unstretchedTop = (rect.top + rect.bottom) * 0.5 - height * 0.5;
+        return { left: unstretchedLeft, top: unstretchedTop, width, height, radius, bezel };
+    };
+
+    const syncCoalescenceState = (motionImpulse = 0, notifyPeers = true) => {
+        if (options.coalesce === false) return;
+        const bounds = readCoalescenceBounds();
+        if (!bounds) return;
+        syncCoalescenceGeometry(
+            element,
+            bounds.left,
+            bounds.top,
+            bounds.width,
+            bounds.height,
+            bounds.radius,
+            bounds.bezel,
+            motionImpulse,
+            notifyPeers,
+        );
+    };
+
+    const applyCoalescenceVisuals = () => {
+        if (options.coalesce === false) {
+            element.removeAttribute("data-lg-coalescing");
+            element.style.removeProperty("--lg-bleed");
+            element.style.removeProperty("--lg-interference");
+            return { peers: [], interferenceIntensity: 0, requiredBleedPx: 0 };
+        }
+        const snapshot = collectCoalescenceSnapshot(element);
+        if (snapshot.peers.length > 0) {
+            element.setAttribute("data-lg-coalescing", "1");
+            element.style.setProperty("--lg-bleed", `${snapshot.requiredBleedPx}px`);
+            element.style.setProperty("--lg-interference", snapshot.interferenceIntensity.toFixed(3));
+        } else {
+            element.removeAttribute("data-lg-coalescing");
+            element.style.removeProperty("--lg-bleed");
+            element.style.removeProperty("--lg-interference");
+        }
+        return snapshot;
+    };
+
+    const drawWebglFrame = () => {
+        renderFrameId = null;
+        if (destroyed || activeEngine !== "webgl" || !webglRenderer) return;
+        if (!isViewportVisible) {
+            pendingVisibleRender = true;
+            return;
+        }
+
+        const bounds = readCoalescenceBounds();
+        if (!bounds) return;
+        const { left, top, width, height, radius, bezel } = bounds;
+        syncCoalescenceGeometry(element, left, top, width, height, radius, bezel, dragMotionSpeed, false);
+        const coalescenceSnapshot = applyCoalescenceVisuals();
+
         const tintColor = parseCssColorToRgb(options.tintColor);
         const tintOpacity = options.tintOpacity ?? 0.12;
-        const highlight = Math.min(1, (options.highlight ?? 0.72) + pressGlow);
+        const highlight = Math.min(1, (options.highlight ?? 0.44) + pressGlow);
         const activeSceneCanvas = externalSceneCanvas ?? capturedSceneCanvas;
         const sceneRect = computeSceneRect();
         const hasSceneTex = Boolean(activeSceneCanvas && activeSceneCanvas.width > 0 && sceneRect);
@@ -177,18 +311,53 @@ export function createLiquidGlass(
             highlight,
             pixelRatio: options.pixelRatio,
             chromaticAberration: options.chromaticAberration,
+            lightTilt:
+                lightTiltHorizontal !== 0 || lightTiltVertical !== 0
+                    ? { horizontal: lightTiltHorizontal, vertical: lightTiltVertical }
+                    : undefined,
             sceneRect: hasSceneTex ? sceneRect : undefined,
+            coalescePeers: coalescenceSnapshot.peers,
+            bleedPx: coalescenceSnapshot.requiredBleedPx,
         });
     };
 
     const scheduleWebglRender = () => {
         if (destroyed || activeEngine !== "webgl") return;
+        if (!isViewportVisible) {
+            pendingVisibleRender = true;
+            return;
+        }
         if (renderFrameId !== null || typeof requestAnimationFrame !== "function") return;
         renderFrameId = requestAnimationFrame(drawWebglFrame);
     };
 
+    const handleVisibilityChange = (nextVisible: boolean) => {
+        if (destroyed || isViewportVisible === nextVisible) return;
+        isViewportVisible = nextVisible;
+        updateWebglSlotVisibility(webglPoolEntry, nextVisible);
+        if (activeEngine !== "webgl") return;
+        localSceneCapture?.setActive?.(nextVisible);
+        if (!nextVisible) {
+            if (renderFrameId !== null && typeof cancelAnimationFrame === "function") {
+                cancelAnimationFrame(renderFrameId);
+                renderFrameId = null;
+                pendingVisibleRender = true;
+            }
+            if (scrollFrameId !== null && typeof cancelAnimationFrame === "function") {
+                cancelAnimationFrame(scrollFrameId);
+                scrollFrameId = null;
+                pendingVisibleRender = true;
+            }
+            return;
+        }
+        if (pendingVisibleRender) {
+            pendingVisibleRender = false;
+            scheduleWebglRender();
+        }
+    };
+
     const onViewportScrollOrResize = () => {
-        if (destroyed || activeEngine !== "webgl") return;
+        if (destroyed || activeEngine !== "webgl" || !isViewportVisible) return;
         if (scrollFrameId !== null || typeof requestAnimationFrame !== "function") return;
         scrollFrameId = requestAnimationFrame(() => {
             scrollFrameId = null;
@@ -207,7 +376,7 @@ export function createLiquidGlass(
         mountWebgl();
     };
 
-    const teardownWebgl = () => {
+    const teardownWebgl = (preserveVisibilityObserver = false) => {
         if (renderFrameId !== null && typeof cancelAnimationFrame === "function") {
             cancelAnimationFrame(renderFrameId);
             renderFrameId = null;
@@ -220,6 +389,12 @@ export function createLiquidGlass(
             window.removeEventListener("scroll", onViewportScrollOrResize);
             window.removeEventListener("resize", onViewportScrollOrResize);
         }
+        if (!preserveVisibilityObserver) {
+            unobserveVisibility?.();
+            unobserveVisibility = null;
+            isViewportVisible = true;
+        }
+        pendingVisibleRender = false;
         webglResizeObserver?.disconnect();
         webglResizeObserver = null;
         unsubscribeCapture?.();
@@ -240,14 +415,17 @@ export function createLiquidGlass(
         element.removeAttribute("data-lg-webgl-scene");
     };
 
-    const mountCss = () => {
-        teardownWebgl();
+    const mountCss = (preservePoolStandby = false) => {
+        teardownWebgl(preservePoolStandby);
+        if (!preservePoolStandby) {
+            releaseWebglSlot(webglPoolEntry, true);
+        }
         unregisterManagedElement(element);
         element.classList.add("lg-on");
         const cssFilter =
             options.coreFilter ??
             (options.blur !== undefined
-                ? `blur(${Math.max(0, config.blur * 3.5).toFixed(1)}px) saturate(165%)`
+                ? `blur(${Math.max(0, config.blur * 3.5).toFixed(1)}px) saturate(220%)`
                 : CSS_FALLBACK_BACKDROP);
         element.style.setProperty("--lg-filter", cssFilter);
         if (options.tintColor) {
@@ -256,10 +434,36 @@ export function createLiquidGlass(
             element.style.removeProperty("--lg-tint");
         }
         setEngine("css");
+        syncCoalescenceState(0, true);
+        applyCoalescenceVisuals();
+    };
+
+    const webglPoolEntry: WebglPoolEntry = {
+        token: Symbol("lg-webgl-slot"),
+        isVisible: true,
+        lastUsedOrder: 0,
+        evictToCss: () => {
+            mountCss(true);
+        },
+        restoreWebgl: () => {
+            if (destroyed) return;
+            const targetEngine = resolveGlassEngine(options.engine ?? "auto", hasSceneInput());
+            if (targetEngine === "webgl") {
+                mountWebgl();
+            }
+        },
     };
 
     const mountWebgl = () => {
         unregisterManagedElement(element);
+        if (!unobserveVisibility) {
+            unobserveVisibility = observeElementVisibility(element, handleVisibilityChange);
+        }
+        webglPoolEntry.isVisible = isViewportVisible;
+        if (!acquireWebglSlot(webglPoolEntry)) {
+            mountCss(true);
+            return;
+        }
 
         if (!webglCanvas) {
             webglCanvas = document.createElement("canvas");
@@ -273,6 +477,7 @@ export function createLiquidGlass(
         if (!webglRenderer) {
             webglRenderer = GlassWebglRenderer.create(webglCanvas);
             if (!webglRenderer) {
+                releaseWebglSlot(webglPoolEntry, true);
                 mountCss();
                 return;
             }
@@ -312,6 +517,7 @@ export function createLiquidGlass(
                     webglRenderer?.setSceneCanvas(canvas);
                     scheduleWebglRender();
                 });
+                localSceneCapture.setActive?.(isViewportVisible);
             } else if (capturedSceneCanvas && capturedSceneCanvas.width > 0) {
                 webglRenderer.setSceneCanvas(capturedSceneCanvas);
             }
@@ -335,6 +541,9 @@ export function createLiquidGlass(
             webglResizeObserver = new ResizeObserver(scheduleWebglRender);
             webglResizeObserver.observe(element);
         }
+        if (!unobserveVisibility) {
+            unobserveVisibility = observeElementVisibility(element, handleVisibilityChange);
+        }
 
         if (typeof window !== "undefined") {
             window.addEventListener("scroll", onViewportScrollOrResize, { passive: true });
@@ -343,32 +552,158 @@ export function createLiquidGlass(
 
         element.classList.add("lg-on");
         setEngine("webgl");
+        syncCoalescenceState(0, true);
         scheduleWebglRender();
     };
 
     const mountSvg = () => {
         teardownWebgl();
+        releaseWebglSlot(webglPoolEntry, true);
         setEngine("wasm-svg");
         registerManagedElement(element, config);
+        syncCoalescenceState(0, true);
+        applyCoalescenceVisuals();
+    };
+
+    const MAX_BUTTON_DRAG_PX = 9;
+
+    const isButtonElement = (): boolean =>
+        element.tagName === "BUTTON" ||
+        element.tagName === "A" ||
+        element.getAttribute("role") === "button";
+
+    const resolveDragMode = (): "elastic" | null => {
+        if (options.interactive === false || options.draggable === false) return null;
+        if (
+            isButtonElement() &&
+            (options.draggable === undefined ||
+                options.draggable === true ||
+                options.draggable === "elastic")
+        ) {
+            return "elastic";
+        }
+        return null;
     };
 
     const isInteractiveElement = (): boolean =>
-        options.interactive ??
-        (element.tagName === "BUTTON" ||
-            element.tagName === "A" ||
-            element.getAttribute("role") === "button");
+        options.interactive ?? isButtonElement();
 
     const onInteractivePointerDown = (event: PointerEvent) => {
         if (event.pointerType === "mouse" && event.button !== 0) return;
+        hasDraggedBeyondThreshold = false;
         springController?.press();
+        const dragMode = resolveDragMode();
+        if (dragMode !== null) {
+            isPointerDragging = true;
+            activeDragPointerId = event.pointerId;
+            dragStartClientX = event.clientX;
+            dragStartClientY = event.clientY;
+            lastDragClientX = event.clientX;
+            lastDragClientY = event.clientY;
+            lastDragTimestamp = event.timeStamp || (typeof performance !== "undefined" ? performance.now() : Date.now());
+            dragVelocityX = 0;
+            dragVelocityY = 0;
+            try {
+                element.setPointerCapture?.(event.pointerId);
+            } catch {
+            }
+        }
     };
 
-    const onInteractivePointerUp = () => {
+    const onInteractivePointerMove = (event: PointerEvent) => {
+        if (!springController) return;
+        const dragMode = resolveDragMode();
+        if (isPointerDragging && dragMode !== null && event.pointerId === activeDragPointerId) {
+            const rawDeltaX = event.clientX - dragStartClientX;
+            const rawDeltaY = event.clientY - dragStartClientY;
+            const dragDistance = Math.hypot(rawDeltaX, rawDeltaY);
+            if (!hasDraggedBeyondThreshold && dragDistance > 4) {
+                hasDraggedBeyondThreshold = true;
+                element.setAttribute("data-lg-dragging", "1");
+            }
+
+            let targetX = 0;
+            let targetY = 0;
+            if (dragDistance > 0.001) {
+                const clampedDistance = MAX_BUTTON_DRAG_PX * (dragDistance / (dragDistance + 72));
+                targetX = (rawDeltaX / dragDistance) * clampedDistance;
+                targetY = (rawDeltaY / dragDistance) * clampedDistance;
+            }
+
+            const now = event.timeStamp || (typeof performance !== "undefined" ? performance.now() : Date.now());
+            const dtSeconds = Math.max(0.004, Math.min(0.08, (now - lastDragTimestamp) * 0.001));
+            const instVelX = Math.max(-1600, Math.min(1600, (event.clientX - lastDragClientX) / dtSeconds));
+            const instVelY = Math.max(-1600, Math.min(1600, (event.clientY - lastDragClientY) / dtSeconds));
+            dragVelocityX = dragVelocityX * 0.5 + instVelX * 0.5;
+            dragVelocityY = dragVelocityY * 0.5 + instVelY * 0.5;
+            lastDragClientX = event.clientX;
+            lastDragClientY = event.clientY;
+            lastDragTimestamp = now;
+
+            springController.setDrag(targetX, targetY, false);
+            springController.setTilt(Math.tanh(rawDeltaX / 36), -Math.tanh(rawDeltaY / 36));
+            syncCoalescenceState(Math.hypot(dragVelocityX, dragVelocityY), true);
+            return;
+        }
+
+        const rect = element.getBoundingClientRect();
+        if (rect.width < 2 || rect.height < 2) return;
+        const horizontal = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        const vertical = -(((event.clientY - rect.top) / rect.height) * 2 - 1);
+        springController.setTilt(horizontal, vertical);
+    };
+
+    const finishDragInteraction = (event: Event, isCancel: boolean) => {
+        if (!isPointerDragging) return;
+        const pointerEvent = event as PointerEvent;
+        if (
+            typeof pointerEvent.pointerId === "number" &&
+            activeDragPointerId !== null &&
+            pointerEvent.pointerId !== activeDragPointerId &&
+            event.type !== "blur"
+        ) {
+            return;
+        }
+        isPointerDragging = false;
+        const capturedId = activeDragPointerId;
+        activeDragPointerId = null;
+        element.removeAttribute("data-lg-dragging");
+        if (capturedId !== null) {
+            try {
+                element.releasePointerCapture?.(capturedId);
+            } catch {
+            }
+        }
+
+        springController?.setDrag(0, 0, false);
+        if (!isCancel) {
+            springController?.impulseDrag(-dragVelocityX * 0.04, -dragVelocityY * 0.04);
+        }
+        dragVelocityX = 0;
+        dragVelocityY = 0;
+        if (isCancel) {
+            hasDraggedBeyondThreshold = false;
+        }
+    };
+
+    const onInteractivePointerUp = (event: PointerEvent) => {
+        finishDragInteraction(event, false);
         springController?.release(true);
     };
 
-    const onInteractivePointerCancel = () => {
+    const onInteractivePointerCancel = (event: Event) => {
+        if (isPointerDragging && event.type === "pointerleave") return;
+        finishDragInteraction(event, true);
+        springController?.setTilt(0, 0);
         springController?.release(false);
+    };
+
+    const onInteractiveClickCapture = (event: MouseEvent) => {
+        if (hasDraggedBeyondThreshold) {
+            event.preventDefault();
+            event.stopPropagation();
+            hasDraggedBeyondThreshold = false;
+        }
     };
 
     const onInteractiveKeyDown = (event: KeyboardEvent) => {
@@ -387,49 +722,116 @@ export function createLiquidGlass(
         if (interactiveListenersAttached) {
             interactiveListenersAttached = false;
             element.removeEventListener("pointerdown", onInteractivePointerDown);
+            element.removeEventListener("pointermove", onInteractivePointerMove);
             element.removeEventListener("pointerup", onInteractivePointerUp);
             element.removeEventListener("pointercancel", onInteractivePointerCancel);
             element.removeEventListener("pointerleave", onInteractivePointerCancel);
+            element.removeEventListener("click", onInteractiveClickCapture, true);
             element.removeEventListener("keydown", onInteractiveKeyDown);
             element.removeEventListener("keyup", onInteractiveKeyUp);
             element.removeEventListener("blur", onInteractivePointerCancel);
         }
         springController?.destroy();
         springController = null;
+        isPointerDragging = false;
+        activeDragPointerId = null;
+        hasDraggedBeyondThreshold = false;
+        lastSpringDragX = 0;
+        lastSpringDragY = 0;
+        dragMotionSpeed = 0;
         pressGlow = 0;
+        lightTiltHorizontal = 0;
+        lightTiltVertical = 0;
         element.classList.remove("lg-interactive");
+        element.removeAttribute("data-lg-draggable");
+        element.removeAttribute("data-lg-dragging");
         element.style.removeProperty("--lg-spring-scale-x");
         element.style.removeProperty("--lg-spring-scale-y");
+        element.style.removeProperty("--lg-stretch-matrix");
+        element.style.removeProperty("--lg-drag-x");
+        element.style.removeProperty("--lg-drag-y");
         element.style.removeProperty("--lg-press-glow");
     };
 
     const syncInteractive = () => {
-        const enabled = isInteractiveElement();
+        const dragMode = resolveDragMode();
+        const enabled = isInteractiveElement() || dragMode !== null;
         if (!enabled) {
             detachInteractive();
             return;
         }
 
+        if (dragMode !== null) {
+            element.setAttribute("data-lg-draggable", dragMode);
+        } else {
+            element.removeAttribute("data-lg-draggable");
+        }
         element.classList.add("lg-interactive");
         if (!springController) {
             springController = createInteractiveSpring(
                 (frame) => {
                     element.style.setProperty("--lg-spring-scale-x", frame.scaleX.toFixed(4));
                     element.style.setProperty("--lg-spring-scale-y", frame.scaleY.toFixed(4));
+                    const [m11, m12, m21, m22] = frame.stretchMatrix;
+                    element.style.setProperty(
+                        "--lg-stretch-matrix",
+                        `matrix(${m11.toFixed(4)}, ${m12.toFixed(4)}, ${m21.toFixed(4)}, ${m22.toFixed(4)}, 0, 0)`,
+                    );
+                    if (frame.dragX !== 0 || frame.dragY !== 0) {
+                        element.style.setProperty("--lg-drag-x", `${frame.dragX.toFixed(2)}px`);
+                        element.style.setProperty("--lg-drag-y", `${frame.dragY.toFixed(2)}px`);
+                    }
                     element.style.setProperty("--lg-press-glow", frame.glow.toFixed(3));
                     const prevGlow = pressGlow;
+                    const prevTiltH = lightTiltHorizontal;
+                    const prevTiltV = lightTiltVertical;
+                    const dragMoved =
+                        Math.abs(frame.dragX - lastSpringDragX) > 0.25 ||
+                        Math.abs(frame.dragY - lastSpringDragY) > 0.25;
                     pressGlow = frame.glow;
-                    if (activeEngine === "webgl" && Math.abs(frame.glow - prevGlow) > 0.004) {
+                    lightTiltHorizontal = frame.tiltHorizontal;
+                    lightTiltVertical = frame.tiltVertical;
+                    lastSpringDragX = frame.dragX;
+                    lastSpringDragY = frame.dragY;
+                    dragMotionSpeed = Math.hypot(frame.velocityX, frame.velocityY);
+                    if (dragMoved) {
+                        syncCoalescenceState(dragMotionSpeed, true);
+                    }
+                    if (
+                        activeEngine === "webgl" &&
+                        (dragMoved ||
+                            Math.abs(frame.glow - prevGlow) > 0.004 ||
+                            Math.abs(frame.tiltHorizontal - prevTiltH) > 0.004 ||
+                            Math.abs(frame.tiltVertical - prevTiltV) > 0.004)
+                    ) {
                         scheduleWebglRender();
                     }
                 },
                 () => {
                     const prevGlow = pressGlow;
+                    const prevTiltH = lightTiltHorizontal;
+                    const prevTiltV = lightTiltVertical;
+                    const prevDrag = Math.abs(lastSpringDragX) > 0.25 || Math.abs(lastSpringDragY) > 0.25;
                     pressGlow = 0;
+                    lightTiltHorizontal = 0;
+                    lightTiltVertical = 0;
+                    dragMotionSpeed = 0;
                     element.style.removeProperty("--lg-spring-scale-x");
                     element.style.removeProperty("--lg-spring-scale-y");
+                    element.style.removeProperty("--lg-stretch-matrix");
+                    element.style.removeProperty("--lg-drag-x");
+                    element.style.removeProperty("--lg-drag-y");
+                    lastSpringDragX = 0;
+                    lastSpringDragY = 0;
                     element.style.removeProperty("--lg-press-glow");
-                    if (activeEngine === "webgl" && prevGlow > 0.004) {
+                    syncCoalescenceState(0, true);
+                    if (
+                        activeEngine === "webgl" &&
+                        (prevDrag ||
+                            prevGlow > 0.004 ||
+                            Math.abs(prevTiltH) > 0.004 ||
+                            Math.abs(prevTiltV) > 0.004)
+                    ) {
                         scheduleWebglRender();
                     }
                 },
@@ -442,9 +844,11 @@ export function createLiquidGlass(
         if (!interactiveListenersAttached) {
             interactiveListenersAttached = true;
             element.addEventListener("pointerdown", onInteractivePointerDown, { passive: true });
+            element.addEventListener("pointermove", onInteractivePointerMove, { passive: true });
             element.addEventListener("pointerup", onInteractivePointerUp, { passive: true });
             element.addEventListener("pointercancel", onInteractivePointerCancel, { passive: true });
             element.addEventListener("pointerleave", onInteractivePointerCancel, { passive: true });
+            element.addEventListener("click", onInteractiveClickCapture, true);
             element.addEventListener("keydown", onInteractiveKeyDown);
             element.addEventListener("keyup", onInteractiveKeyUp);
             element.addEventListener("blur", onInteractivePointerCancel, { passive: true });
@@ -467,6 +871,30 @@ export function createLiquidGlass(
         }
     };
 
+    const syncCoalescenceRegistration = () => {
+        if (options.coalesce === false) {
+            unregisterCoalescence?.();
+            unregisterCoalescence = null;
+            element.removeAttribute("data-lg-coalescing");
+            element.style.removeProperty("--lg-bleed");
+            element.style.removeProperty("--lg-interference");
+            return;
+        }
+        if (unregisterCoalescence) return;
+        unregisterCoalescence = registerCoalescenceParticipant({
+            element,
+            readBounds: readCoalescenceBounds,
+            notifyPeerUpdate: () => {
+                if (destroyed) return;
+                if (activeEngine === "webgl") {
+                    scheduleWebglRender();
+                } else {
+                    applyCoalescenceVisuals();
+                }
+            },
+        });
+    };
+
     if (typeof window !== "undefined" && !listenersAttached) {
         listenersAttached = true;
         const {
@@ -482,10 +910,13 @@ export function createLiquidGlass(
         onWasmReady(() => {
             const mode = options.engine ?? "auto";
             if (!destroyed && (mode === "auto" || mode === "wasm-svg") && canUseSvgGlass()) {
+                syncCoalescenceRegistration();
                 applyEngine();
             }
         });
     }
+
+    syncCoalescenceRegistration();
 
     applyEngine();
 
@@ -500,6 +931,7 @@ export function createLiquidGlass(
             const prevRadius = config.radius;
             const prevPill = config.pill;
             options = { ...options, ...newOptions };
+            syncCoalescenceRegistration();
             if ("sceneCanvas" in newOptions) {
                 externalSceneCanvas = newOptions.sceneCanvas ?? null;
             }
@@ -523,6 +955,9 @@ export function createLiquidGlass(
             if (destroyed) return;
             const targetEngine = resolveGlassEngine(options.engine ?? "auto", hasSceneInput());
             if (targetEngine !== activeEngine) {
+                if (targetEngine === "webgl" && activeEngine === "css" && isWebglSlotOnStandby(webglPoolEntry)) {
+                    return;
+                }
                 applyEngine();
                 return;
             }
@@ -532,12 +967,15 @@ export function createLiquidGlass(
                     lastSceneBackdropKey = nextBackdropKey;
                     localSceneCapture.scheduleCapture();
                 }
+                syncCoalescenceState(0, true);
                 scheduleWebglRender();
             } else if (activeEngine === "wasm-svg") {
                 cachedRadiusStr = null;
                 const existingState = elementStateMap.get(element);
                 if (existingState) existingState.cachedRadiusStr = null;
                 registerManagedElement(element, config);
+                syncCoalescenceState(0, true);
+                applyCoalescenceVisuals();
             } else {
                 mountCss();
             }
@@ -585,18 +1023,24 @@ export function createLiquidGlass(
                 highContrastQuery?.removeEventListener?.("change", applyEngine);
             }
             detachInteractive();
+            unregisterCoalescence?.();
+            unregisterCoalescence = null;
             teardownWebgl();
+            releaseWebglSlot(webglPoolEntry, true);
             unregisterManagedElement(element);
             element.classList.remove("lg-on", "lg-hollow", "lg-interactive");
             element.removeAttribute("data-lg-surface");
             element.removeAttribute("data-lg-engine");
             element.removeAttribute("data-lg-pill");
             element.removeAttribute("data-lg-webgl-scene");
+            element.removeAttribute("data-lg-coalescing");
             element.style.removeProperty("--lg-filter");
             element.style.removeProperty("--lg-tint");
             element.style.removeProperty("--lg-bg");
             element.style.removeProperty("--lg-radius");
             element.style.removeProperty("--lg-rim-opacity");
+            element.style.removeProperty("--lg-bleed");
+            element.style.removeProperty("--lg-interference");
         },
     };
 }

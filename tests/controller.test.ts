@@ -110,12 +110,12 @@ describe("LiquidGlass controller and engine selection", () => {
         });
 
         expect(targetEl.style.getPropertyValue("--lg-radius")).toBe("20px");
-        expect(targetEl.style.getPropertyValue("--lg-filter")).toBe("blur(0.0px) saturate(165%)");
+        expect(targetEl.style.getPropertyValue("--lg-filter")).toBe("blur(0.0px) saturate(220%)");
 
         glass.update({ pill: true, blur: 2 });
         expect(targetEl.getAttribute("data-lg-pill")).toBe("true");
         expect(targetEl.style.getPropertyValue("--lg-radius")).toBe("");
-        expect(targetEl.style.getPropertyValue("--lg-filter")).toBe("blur(7.0px) saturate(165%)");
+        expect(targetEl.style.getPropertyValue("--lg-filter")).toBe("blur(7.0px) saturate(220%)");
 
         glass.update({ pill: false, radius: 0 });
         expect(targetEl.hasAttribute("data-lg-pill")).toBe(false);

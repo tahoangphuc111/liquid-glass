@@ -1,6 +1,6 @@
 {
     "name": "@tahoangphuc111/liquid-glass",
-    "version": "0.2.1",
+    "version": "0.3.0",
     "description": "liquid glass refraction for vanilla js, react, and vue 3 using wasm svg displacement on desktop chromium and webgl/css scene capture on mobile and safari",
     "type": "module",
     "license": "MIT",
@@ -24,6 +24,11 @@
             "types": "./dist/react/index.d.ts",
             "import": "./dist/react/index.js",
             "require": "./dist/react/index.cjs"
+        },
+        "./next": {
+            "types": "./dist/next/index.d.ts",
+            "import": "./dist/next/index.js",
+            "require": "./dist/next/index.cjs"
         },
         "./vue": {
             "types": "./dist/vue/index.d.ts",
@@ -58,11 +63,15 @@
         "test:watch": "vitest"
     },
     "peerDependencies": {
+        "next": ">=13.0.0",
         "react": ">=18.0.0",
         "react-dom": ">=18.0.0",
         "vue": ">=3.3.0"
     },
     "peerDependenciesMeta": {
+        "next": {
+            "optional": true
+        },
         "react": {
             "optional": true
         },

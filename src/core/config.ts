@@ -16,22 +16,24 @@ export const DEFAULT_GLASS_CONFIG: GlassConfig = {
     bezel: 14,
     scaleRatio: 2.35,
     maxScaleMultiplier: 5.5,
-    blur: 6,
+    blur: 2,
     ior: 2.15,
     colorMatrix: GLASS_COLOR_MATRIX,
-    coreFilter: "blur(9px) saturate(235%) brightness(1.03)",
+    coreFilter: "blur(6px) saturate(280%) brightness(1.03)",
     radius: 18,
     pill: false,
     alwaysOn: true,
     hollow: false,
+    chromaticAberration: false,
 };
 
 export const MAX_ELEMENT_DEVICE_AREA = 1_500_000;
 export const MAX_TOTAL_DEVICE_AREA = 4_000_000;
-export const CSS_FALLBACK_BACKDROP = "blur(10px) saturate(240%) brightness(1.04)";
+export const CSS_FALLBACK_BACKDROP = "blur(8px) saturate(285%) brightness(1.04)";
 
 export const MAP_MAX_SCALE = 1.0;
 export const MAP_MIN_SCALE = 0.5;
+export const UNROUNDED_MAP_SCALE = 0.2;
 export const MAP_MAX_PIXELS = 262_144;
 export const MAP_PRELOAD_TIMEOUT_MS = 350;
 
@@ -45,7 +47,7 @@ export function pickMapScale(
 ): number {
     if (isAxisX) return 1.0;
 
-    if (radius <= 2) return MAP_MIN_SCALE;
+    if (radius <= 2) return UNROUNDED_MAP_SCALE;
 
     const area = width * height;
     const scaleBudget =
@@ -79,10 +81,17 @@ export function formatGlassFilterStyle(
     if (PREBLUR_MODE === "css" && blur > 0 && qualityTier < 2) {
         const effectiveBlur = qualityTier === 1 ? (blur * 0.5).toFixed(2) : blur;
         return USE_CSS_SATURATION
-            ? `blur(${effectiveBlur}px) saturate(235%) url(#${filterId})`
+            ? `blur(${effectiveBlur}px) saturate(280%) url(#${filterId})`
             : `blur(${effectiveBlur}px) url(#${filterId})`;
     }
-    return USE_CSS_SATURATION ? `saturate(235%) url(#${filterId})` : `url(#${filterId})`;
+    return USE_CSS_SATURATION ? `saturate(280%) url(#${filterId})` : `url(#${filterId})`;
+}
+
+export function resolveChromaticAberration(value?: boolean | number): number {
+    if (typeof value === "number") {
+        return Number.isFinite(value) ? Math.min(0.25, Math.max(0, value)) : 0;
+    }
+    return value === true ? 0.085 : 0;
 }
 
 export function resolveGlassConfig(options: LiquidGlassOptions = {}): GlassConfig {
@@ -99,6 +108,9 @@ export function resolveGlassConfig(options: LiquidGlassOptions = {}): GlassConfi
     const hollow = options.hollow ?? DEFAULT_GLASS_CONFIG.hollow;
     const alwaysOn = options.alwaysOn ?? DEFAULT_GLASS_CONFIG.alwaysOn;
     const coreFilter = options.coreFilter ?? DEFAULT_GLASS_CONFIG.coreFilter;
+    const chromaticAberration =
+        options.chromaticAberration ?? DEFAULT_GLASS_CONFIG.chromaticAberration ?? false;
+    const chromaAmount = resolveChromaticAberration(chromaticAberration);
 
     const id = [
         "lg",
@@ -109,6 +121,7 @@ export function resolveGlassConfig(options: LiquidGlassOptions = {}): GlassConfi
         blur,
         ior.toFixed(2),
         pill ? 1 : 0,
+        chromaAmount > 0 ? `ca${chromaAmount.toFixed(3)}` : "ca0",
     ].join("_");
 
     return {
@@ -126,5 +139,6 @@ export function resolveGlassConfig(options: LiquidGlassOptions = {}): GlassConfi
         hollow,
         alwaysOn,
         coreFilter,
+        chromaticAberration,
     };
 }

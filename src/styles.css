@@ -22,16 +22,15 @@
     background:
         linear-gradient(
             180deg,
-            rgba(255, 255, 255, 0.96) 0%,
-            rgba(255, 255, 255, 0.56) 1.5%,
-            rgba(255, 255, 255, 0.18) 3%,
-            rgba(255, 255, 255, 0) 5%,
-            rgba(255, 255, 255, 0) 95%,
-            rgba(255, 255, 255, 0.18) 97%,
-            rgba(255, 255, 255, 0.56) 98.5%,
-            rgba(255, 255, 255, 0.96) 100%
+            rgba(255, 255, 255, 0.42) 0%,
+            rgba(255, 255, 255, 0.20) 1.5%,
+            rgba(255, 255, 255, 0.05) 3.5%,
+            rgba(255, 255, 255, 0) 7%,
+            rgba(255, 255, 255, 0) 93%,
+            rgba(255, 255, 255, 0.05) 96.5%,
+            rgba(255, 255, 255, 0.20) 98.5%,
+            rgba(255, 255, 255, 0.42) 100%
         );
-    filter: drop-shadow(0 0 0.75px rgba(255, 255, 255, 0.35));
     opacity: clamp(0, calc(var(--lg-rim-opacity, 1) + var(--lg-press-glow, 0)), 1);
     -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
     -webkit-mask-composite: xor;
@@ -46,7 +45,22 @@
     -webkit-tap-highlight-color: transparent;
     touch-action: manipulation;
     transform-origin: center center;
-    scale: var(--lg-spring-scale-x, 1) var(--lg-spring-scale-y, 1);
+    translate: var(--lg-drag-x, 0px) var(--lg-drag-y, 0px);
+    transform: var(--lg-stretch-matrix, scale(var(--lg-spring-scale-x, 1), var(--lg-spring-scale-y, 1)));
+}
+
+:where(.lg-surface[data-lg-draggable]) {
+    cursor: grab;
+    touch-action: none;
+}
+
+:where(.lg-surface[data-lg-dragging="1"]) {
+    cursor: grabbing;
+    z-index: 40;
+}
+
+:where(.lg-surface[data-lg-coalescing="1"]) {
+    overflow: visible;
 }
 
 :where(.lg-surface.lg-on.lg-hollow)::after {
@@ -55,8 +69,8 @@
     inset: var(--lg-bezel, 14px);
     border-radius: var(--lg-inner-radius, 0px);
     pointer-events: none;
-    backdrop-filter: var(--lg-core-filter, blur(9px) saturate(235%) brightness(1.03));
-    -webkit-backdrop-filter: var(--lg-core-filter, blur(9px) saturate(235%) brightness(1.03));
+    backdrop-filter: var(--lg-core-filter, blur(6px) saturate(280%) brightness(1.03));
+    -webkit-backdrop-filter: var(--lg-core-filter, blur(6px) saturate(280%) brightness(1.03));
     z-index: 0;
 }
 
@@ -65,28 +79,26 @@
     background-image:
         linear-gradient(
             180deg,
-            rgba(255, 255, 255, 0.24) 0%,
-            rgba(255, 255, 255, 0.06) 16%,
+            rgba(255, 255, 255, 0.12) 0%,
+            rgba(255, 255, 255, 0.03) 16%,
             rgba(255, 255, 255, 0) 44%,
             rgba(255, 255, 255, 0) 84%,
-            rgba(255, 255, 255, 0.12) 100%
+            rgba(255, 255, 255, 0.06) 100%
         ),
         linear-gradient(
             152deg,
-            rgba(255, 255, 255, 0.16) 0%,
-            rgba(255, 255, 255, 0.03) 34%,
+            rgba(255, 255, 255, 0.08) 0%,
+            rgba(255, 255, 255, 0.02) 34%,
             rgba(255, 255, 255, 0) 64%,
-            rgba(255, 255, 255, 0.10) 100%
+            rgba(255, 255, 255, 0.05) 100%
         );
     border: 0;
-    backdrop-filter: var(--lg-filter, blur(10px) saturate(240%) brightness(1.04));
-    -webkit-backdrop-filter: var(--lg-filter, blur(10px) saturate(240%) brightness(1.04));
+    backdrop-filter: var(--lg-filter, blur(6px) saturate(280%) brightness(1.04));
+    -webkit-backdrop-filter: var(--lg-filter, blur(6px) saturate(280%) brightness(1.04));
     box-shadow:
-        inset 0 0.5px 1px rgba(255, 255, 255, 0.38),
-        inset 0 -0.5px 1px rgba(255, 255, 255, 0.22),
-        0 0 0 0.5px rgba(15, 23, 42, 0.08),
-        0 -0.5px 2.5px rgba(255, 255, 255, 0.24),
-        0 0.5px 2.5px rgba(255, 255, 255, 0.18),
+        inset 0 0.5px 1px rgba(255, 255, 255, 0.22),
+        inset 0 -0.5px 1px rgba(255, 255, 255, 0.12),
+        0 0 0 0.5px rgba(0, 0, 0, 0.22),
         0 12px 32px -8px rgba(0, 0, 0, 0.15);
 }
 
@@ -96,9 +108,14 @@
     box-shadow: 0 12px 30px -8px rgba(0, 0, 0, 0.16);
 }
 
+:where(.lg-surface.lg-on[data-lg-engine="webgl"][data-lg-coalescing="1"]) {
+    box-shadow: none;
+    filter: drop-shadow(0 10px 18px rgba(0, 0, 0, 0.16));
+}
+
 :where(.lg-surface.lg-on[data-lg-engine="webgl"][data-lg-webgl-scene="0"]) {
-    backdrop-filter: var(--lg-filter, blur(9px) saturate(185%) brightness(1.03));
-    -webkit-backdrop-filter: var(--lg-filter, blur(9px) saturate(185%) brightness(1.03));
+    backdrop-filter: var(--lg-filter, blur(6px) saturate(240%) brightness(1.03));
+    -webkit-backdrop-filter: var(--lg-filter, blur(6px) saturate(240%) brightness(1.03));
 }
 
 :where(.lg-surface.lg-on[data-lg-engine="css"]) {
@@ -106,40 +123,51 @@
     background-image:
         linear-gradient(
             180deg,
-            rgba(255, 255, 255, 0.26) 0%,
-            rgba(255, 255, 255, 0.07) 16%,
+            rgba(255, 255, 255, 0.14) 0%,
+            rgba(255, 255, 255, 0.04) 16%,
             rgba(255, 255, 255, 0) 44%,
             rgba(255, 255, 255, 0) 84%,
-            rgba(255, 255, 255, 0.13) 100%
+            rgba(255, 255, 255, 0.07) 100%
         ),
         linear-gradient(
             152deg,
-            rgba(255, 255, 255, 0.18) 0%,
-            rgba(255, 255, 255, 0.04) 34%,
+            rgba(255, 255, 255, 0.09) 0%,
+            rgba(255, 255, 255, 0.02) 34%,
             rgba(255, 255, 255, 0) 64%,
-            rgba(255, 255, 255, 0.11) 100%
+            rgba(255, 255, 255, 0.05) 100%
         );
     border: 0;
-    backdrop-filter: var(--lg-filter, blur(10px) saturate(240%) brightness(1.04));
-    -webkit-backdrop-filter: var(--lg-filter, blur(10px) saturate(240%) brightness(1.04));
+    backdrop-filter: var(--lg-filter, blur(8px) saturate(285%) brightness(1.04));
+    -webkit-backdrop-filter: var(--lg-filter, blur(8px) saturate(285%) brightness(1.04));
     box-shadow:
-        inset 0 0.5px 1px rgba(255, 255, 255, 0.38),
-        inset 0 -0.5px 1px rgba(255, 255, 255, 0.22),
-        0 0 0 0.5px rgba(15, 23, 42, 0.08),
-        0 -0.5px 2.5px rgba(255, 255, 255, 0.24),
-        0 0.5px 2.5px rgba(255, 255, 255, 0.18),
+        inset 0 0.5px 1px rgba(255, 255, 255, 0.22),
+        inset 0 -0.5px 1px rgba(255, 255, 255, 0.12),
+        0 0 0 0.5px rgba(0, 0, 0, 0.22),
         0 10px 26px -8px rgba(0, 0, 0, 0.13);
+}
+
+:where(.lg-surface.lg-on[data-lg-coalescing="1"]:not([data-lg-engine="webgl"])) {
+    box-shadow:
+        inset 0 0.5px 1px rgba(255, 255, 255, 0.42),
+        inset 0 -0.5px 1px rgba(255, 255, 255, 0.26),
+        0 0 0 0.5px rgba(0, 0, 0, 0.22),
+        0 0 14px -2px rgba(125, 211, 252, calc(0.18 + var(--lg-interference, 0) * 0.36)),
+        0 12px 32px -8px rgba(0, 0, 0, 0.16);
 }
 
 .lg-webgl-canvas {
     position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
+    inset: calc(-1 * var(--lg-bleed, 0px));
+    width: calc(100% + 2 * var(--lg-bleed, 0px));
+    height: calc(100% + 2 * var(--lg-bleed, 0px));
     display: block;
     pointer-events: none;
     border-radius: inherit;
     z-index: -1;
+}
+
+:where(.lg-surface[data-lg-coalescing="1"]) > .lg-webgl-canvas {
+    border-radius: 0;
 }
 
 :where(.lg-surface) > :not(.lg-webgl-canvas) {
@@ -181,14 +209,14 @@
 .lg-slider-fill {
     position: absolute;
     inset: 0 auto 0 0;
-    width: calc(var(--lg-slider-progress, 0.5) * 100%);
+    width: calc(var(--lg-slider-visual-progress, var(--lg-slider-progress, 0.5)) * 100%);
     border-radius: inherit;
     background: rgba(255, 255, 255, 0.72);
 }
 
 .lg-slider-thumb {
     position: absolute;
-    left: calc((100% - var(--lg-slider-thumb-w)) * var(--lg-slider-progress, 0.5));
+    left: calc((100% - var(--lg-slider-thumb-w)) * var(--lg-slider-visual-progress, var(--lg-slider-progress, 0.5)));
     top: 50%;
     transform: translateY(-50%);
     translate: var(--lg-slider-bounce-x, 0px) 0;
@@ -197,11 +225,6 @@
     height: var(--lg-slider-thumb-h);
     border-radius: 9999px;
     pointer-events: none;
-    transition: transform 0.16s cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.lg-slider.is-active .lg-slider-thumb {
-    transform: translateY(-50%) scale(1.06, 0.96);
 }
 
 .lg-slider-native {
@@ -212,5 +235,165 @@
     margin: 0;
     opacity: 0;
     cursor: pointer;
+    touch-action: none;
     z-index: 3;
+}
+
+.lg-switch {
+    --sweep: -15%;
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    padding: 4px;
+    border-radius: 9999px;
+    overflow: visible;
+    box-sizing: border-box;
+    cursor: grab;
+    touch-action: pan-y;
+    user-select: none;
+    -webkit-user-select: none;
+    transition: border-color 0.22s ease, box-shadow 0.22s ease;
+}
+
+.lg-switch:not(.lg-on) {
+    background: rgba(255, 255, 255, 0.24);
+    border: 0.5px solid rgba(255, 255, 255, 0.28);
+    backdrop-filter: blur(2px) saturate(180%);
+    -webkit-backdrop-filter: blur(2px) saturate(180%);
+    box-shadow:
+        inset 0 1px 2px rgba(255, 255, 255, 0.34),
+        0 10px 28px -8px rgba(0, 0, 0, 0.22);
+}
+
+.lg-switch > .lg-webgl-canvas {
+    border-radius: 9999px;
+}
+
+.lg-switch.is-dragging {
+    cursor: grabbing;
+}
+
+.lg-switch-item {
+    position: relative;
+    z-index: 3;
+    flex: 1 1 0;
+    border: 0;
+    background: transparent;
+    color: color-mix(
+        in srgb,
+        var(--lg-switch-active-ink, #007aff) calc(var(--lg-switch-coverage, 0) * 100%),
+        var(--lg-switch-ink, rgba(255, 255, 255, 0.72))
+    );
+    opacity: calc(0.72 + 0.28 * var(--lg-switch-coverage, 0));
+    font: inherit;
+    font-weight: 600;
+    padding: 8px 16px;
+    border-radius: 9999px;
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    cursor: inherit;
+    user-select: none;
+    -webkit-user-select: none;
+    white-space: nowrap;
+    box-sizing: border-box;
+    text-decoration: none;
+}
+
+.lg-switch-item svg {
+    transform: scale(calc(1 + 0.06 * var(--lg-switch-coverage, 0)));
+    transform-origin: center center;
+}
+
+@supports (-webkit-background-clip: text) or (background-clip: text) {
+    .lg-switch-item > span {
+        background-image: linear-gradient(
+            90deg,
+            var(--lg-switch-ink, rgba(255, 255, 255, 0.72)) 0%,
+            var(--lg-switch-ink, rgba(255, 255, 255, 0.72)) var(--lg-switch-hit-start, 0%),
+            var(--lg-switch-active-ink, #007aff) var(--lg-switch-hit-start, 0%),
+            var(--lg-switch-active-ink, #007aff) var(--lg-switch-hit-end, 0%),
+            var(--lg-switch-ink, rgba(255, 255, 255, 0.72)) var(--lg-switch-hit-end, 0%),
+            var(--lg-switch-ink, rgba(255, 255, 255, 0.72)) 100%
+        );
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+        -webkit-text-fill-color: transparent;
+    }
+}
+
+.lg-switch-glider {
+    --p: 0;
+    position: absolute;
+    top: 4px;
+    bottom: 4px;
+    left: 4px;
+    border-radius: 9999px;
+    pointer-events: none;
+    z-index: 2;
+    overflow: visible;
+    box-shadow:
+        inset 0 0.5px 1px 0 rgba(255, 255, 255, calc(0.24 + 0.12 * var(--p, 0))),
+        inset 0 -0.5px 1px 0 rgba(255, 255, 255, 0.08),
+        0 4px 14px -2px rgba(0, 0, 0, calc(0.20 + 0.12 * var(--p, 0))),
+        0 1px 3px rgba(0, 0, 0, 0.14);
+    transform: translate3d(0, 0, 0);
+    transform-origin: center center;
+    transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.lg-switch-glider:not([data-lg-engine="webgl"]) {
+    background: radial-gradient(
+        ellipse 90% 70% at 50% 25%,
+        rgba(255, 255, 255, calc(0.10 - 0.03 * var(--p, 0))) 0%,
+        rgba(255, 255, 255, calc(0.04 - 0.01 * var(--p, 0))) 100%
+    );
+}
+
+.lg-switch.is-animating .lg-switch-glider,
+.lg-switch.is-dragging .lg-switch-glider,
+.lg-switch.is-pressed .lg-switch-glider {
+    will-change: transform;
+    transition: none;
+}
+
+.lg-switch-glider[data-lg-engine="webgl"]::before,
+.lg-switch-glider::after {
+    content: "";
+    position: absolute;
+    left: 14px;
+    right: 14px;
+    height: 1px;
+    border-radius: 9999px;
+    pointer-events: none;
+    opacity: calc(0.22 + 0.14 * var(--p, 0));
+    transition: opacity 0.2s ease;
+    z-index: 3;
+}
+
+.lg-switch-glider[data-lg-engine="webgl"]::before {
+    top: 0;
+    background: linear-gradient(
+        90deg,
+        transparent 0%,
+        rgba(255, 255, 255, 0.14) 25%,
+        rgba(255, 255, 255, 0.40) 50%,
+        rgba(255, 255, 255, 0.14) 75%,
+        transparent 100%
+    );
+}
+
+.lg-switch-glider::after {
+    bottom: 0;
+    background: linear-gradient(
+        90deg,
+        transparent 0%,
+        rgba(255, 255, 255, 0.08) 30%,
+        rgba(255, 255, 255, 0.22) 50%,
+        rgba(255, 255, 255, 0.08) 70%,
+        transparent 100%
+    );
 }

@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { createRef } from "react";
-import { LiquidGlass, LiquidGlassProvider } from "../src/react/index.js";
+import {
+    LiquidGlass,
+    LiquidGlassProvider,
+    LiquidGlassSwitch,
+} from "../src/react/index.js";
 import { destroyLiquidGlass } from "../src/index.js";
 
 function setForcedChromium(value: boolean | undefined): void {
@@ -54,5 +58,35 @@ describe("React bindings", () => {
         );
 
         expect(screen.getByTestId("glass").getAttribute("data-lg-engine")).toBe("wasm-svg");
+    });
+
+    it("renders LiquidGlassSwitch with items and triggers onChange on selection", () => {
+        const handleChange = vi.fn();
+        const ref = createRef<HTMLElement>();
+
+        render(
+            <LiquidGlassSwitch
+                ref={ref}
+                engine="css"
+                defaultValue="home"
+                onChange={handleChange}
+                items={[
+                    { value: "home", label: "Home" },
+                    { value: "search", label: "Search" },
+                    { value: "profile", label: "Profile" },
+                ]}
+            />,
+        );
+
+        const nav = ref.current;
+        expect(nav).not.toBeNull();
+        expect(nav?.classList.contains("lg-switch")).toBe(true);
+        expect(nav?.querySelector(".lg-switch-glider")).not.toBeNull();
+
+        const searchTab = screen.getByRole("tab", { name: "Search" });
+        fireEvent.click(searchTab);
+        expect(handleChange).toHaveBeenCalledTimes(1);
+        expect(handleChange.mock.calls[0]?.[0]).toBe("search");
+        expect(handleChange.mock.calls[0]?.[1]).toBe(1);
     });
 });

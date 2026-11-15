@@ -1,6 +1,7 @@
 import "../src/styles.css";
 import "./playground.css";
 import {
+    createGlassSwitch,
     createLiquidGlass,
     getLiquidGlassStats,
     type GlassEngineMode,
@@ -40,7 +41,9 @@ drawSceneCanvas(sceneArt);
 const dockEl = document.getElementById("glass-dock")!;
 const panelEl = document.getElementById("glass-panel")!;
 const pillEl = document.getElementById("glass-pill")!;
+const circleEl = document.getElementById("glass-circle")!;
 const sliderEl = document.getElementById("glass-slider") as HTMLInputElement;
+const switchEl = document.getElementById("glass-switch")!;
 const engineBadge = document.getElementById("engine-badge")!;
 const statsOutput = document.getElementById("stats-output")!;
 
@@ -90,10 +93,21 @@ const pillGlass = createLiquidGlass(pillEl, {
     pill: true,
 });
 
+const circleGlass = createLiquidGlass(circleEl, {
+    ...readOptions(),
+    pill: true,
+});
+
 const sliderGlass = sliderEl.glassEffect({
     sceneElement: sceneEl,
     engine: ctrlEngine.value as GlassEngineMode,
     chromaticAberration: ctrlChroma.checked,
+});
+
+const switchGlass = createGlassSwitch(switchEl, {
+    ...readOptions(),
+    defaultValue: "home",
+    pill: true,
 });
 
 function refreshStats() {
@@ -118,11 +132,13 @@ function syncControls() {
     panelGlass.update(opts);
     dockGlass.update({ ...opts, pill: true });
     pillGlass.update({ ...opts, pill: true });
+    circleGlass.update({ ...opts, pill: true });
     sliderGlass.update({
         engine: opts.engine,
         sceneElement: sceneEl,
         chromaticAberration: opts.chromaticAberration,
     });
+    switchGlass.update({ ...opts, pill: true });
     requestAnimationFrame(refreshStats);
 }
 
@@ -149,7 +165,9 @@ toggleThemeBtn.addEventListener("click", () => {
     panelGlass.refresh();
     dockGlass.refresh();
     pillGlass.refresh();
+    circleGlass.refresh();
     sliderGlass.refresh();
+    switchGlass.refresh();
 });
 
 let dragging = false;
@@ -188,17 +206,17 @@ panelEl.addEventListener("pointercancel", stopDragging);
 panelEl.addEventListener("lostpointercapture", stopDragging);
 
 const makeCapsuleDraggable = (targetEl: HTMLElement) => {
-    let dragging = false;
-    let startX = 0;
-    let startY = 0;
+    let capsuleDragging = false;
+    let capsuleStartX = 0;
+    let capsuleStartY = 0;
     let origLeft = 0;
     let origTop = 0;
     targetEl.addEventListener("pointerdown", (event) => {
         if (event.button !== 0) return;
         const rect = targetEl.getBoundingClientRect();
-        dragging = true;
-        startX = event.clientX;
-        startY = event.clientY;
+        capsuleDragging = true;
+        capsuleStartX = event.clientX;
+        capsuleStartY = event.clientY;
         origLeft = rect.left;
         origTop = rect.top;
         targetEl.style.right = "auto";
@@ -208,13 +226,13 @@ const makeCapsuleDraggable = (targetEl: HTMLElement) => {
         targetEl.setPointerCapture(event.pointerId);
     });
     targetEl.addEventListener("pointermove", (event) => {
-        if (!dragging) return;
-        targetEl.style.left = `${Math.max(8, Math.min(window.innerWidth - targetEl.offsetWidth - 8, origLeft + event.clientX - startX))}px`;
-        targetEl.style.top = `${Math.max(8, Math.min(window.innerHeight - targetEl.offsetHeight - 8, origTop + event.clientY - startY))}px`;
+        if (!capsuleDragging) return;
+        targetEl.style.left = `${Math.max(8, Math.min(window.innerWidth - targetEl.offsetWidth - 8, origLeft + event.clientX - capsuleStartX))}px`;
+        targetEl.style.top = `${Math.max(8, Math.min(window.innerHeight - targetEl.offsetHeight - 8, origTop + event.clientY - capsuleStartY))}px`;
         dockGlass.refresh();
     });
     const finish = () => {
-        dragging = false;
+        capsuleDragging = false;
     };
     targetEl.addEventListener("pointerup", finish);
     targetEl.addEventListener("pointercancel", finish);

@@ -8,6 +8,8 @@
     --page-ink: #0f172a;
     --muted-ink: #475569;
     --tile-bg: rgba(255, 255, 255, 0.72);
+    --lg-switch-ink: rgba(15, 23, 42, 0.60);
+    --lg-switch-active-ink: #007aff;
 }
 
 html.dark {
@@ -18,6 +20,8 @@ html.dark {
     --tile-bg: rgba(30, 41, 59, 0.72);
     --lg-bg: rgba(255, 255, 255, 0.14);
     --lg-tint: rgba(255, 255, 255, 0.12);
+    --lg-switch-ink: rgba(226, 232, 240, 0.62);
+    --lg-switch-active-ink: #38bdf8;
 }
 
 body {
@@ -76,8 +80,7 @@ body {
 
 .stripe-band {
     position: absolute;
-    inset: 0 0 auto;
-    height: 760px;
+    inset: 0;
     opacity: 0.34;
     background: repeating-linear-gradient(
         -35deg,
@@ -150,6 +153,15 @@ body {
     font-size: 20px;
 }
 
+.scene-photo {
+    width: 100%;
+    height: 220px;
+    display: block;
+    object-fit: cover;
+    border-radius: 20px;
+    margin-bottom: 20px;
+}
+
 .scene-art {
     width: 100%;
     height: 220px;
@@ -220,20 +232,40 @@ html.dark .badge {
     background: rgba(255, 255, 255, 0.18);
 }
 
-.glass-pill {
+.glass-actions {
     position: fixed;
-    bottom: 28px;
+    bottom: 98px;
     left: 0;
     right: 0;
     width: fit-content;
     margin-inline: auto;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    z-index: 20;
+}
+
+.glass-pill {
     padding: 13px 28px;
     font: inherit;
     font-weight: 600;
     font-size: 15px;
     color: inherit;
-    cursor: pointer;
-    z-index: 20;
+    cursor: grab;
+}
+
+.glass-circle {
+    width: 56px;
+    height: 56px;
+    padding: 0;
+    border-radius: 9999px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
+    color: inherit;
+    cursor: grab;
+    flex-shrink: 0;
 }
 
 .controls {
@@ -308,8 +340,30 @@ html.dark .stats-output {
 .slider-demo {
     position: fixed;
     left: 50%;
-    bottom: 84px;
+    bottom: 168px;
     transform: translateX(-50%);
     width: 260px;
     z-index: 20;
+}
+
+.bottom-nav-demo {
+    position: fixed;
+    left: 50%;
+    bottom: 18px;
+    transform: translateX(-50%);
+    z-index: 22;
+}
+
+.bottom-nav-demo .lg-switch-item {
+    min-width: 74px;
+    padding: 7px 14px;
+    font-size: 11px;
+    letter-spacing: 0.01em;
+}
+
+.bottom-nav-demo .lg-switch-glider {
+    box-shadow:
+        inset 0 0.5px 1px 0 rgba(255, 255, 255, calc(0.28 + 0.14 * var(--p, 0))),
+        inset 0 -0.5px 1px 0 rgba(255, 255, 255, 0.12),
+        0 4px 14px -2px rgba(0, 0, 0, calc(0.16 + 0.12 * var(--p, 0)));
 }

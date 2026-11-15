@@ -224,9 +224,58 @@ fn build_refraction_lut(
         0
     };
     let eta = 1.0 / ior.max(1.01);
-    let mut max_abs_disp = 0.0_f32;
-
     let mut i = 0usize;
+    let mut max_abs_disp: f32;
+
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        use core::arch::wasm32::*;
+        let eta_v = f32x4_splat(eta);
+        let scaled_bezel_v = f32x4_splat(scaled_bezel);
+        let glass_thickness_v = f32x4_splat(glass_thickness);
+        let one_v = f32x4_splat(1.0);
+        let min_sin_v = f32x4_splat(-0.999);
+        let max_sin_v = f32x4_splat(0.999);
+        let min_sq_v = f32x4_splat(1e-6);
+        let min_cos_v = f32x4_splat(1e-4);
+        let mut max_v = f32x4_splat(0.0);
+
+        let h_ptr = lut.height[safe_surface].as_ptr();
+        let sin_ptr = lut.sin_i[safe_surface].as_ptr();
+        let cos_ptr = lut.cos_i[safe_surface].as_ptr();
+        let out_ptr = out_disp.as_mut_ptr();
+
+        while i + 4 <= LUT_LEN {
+            unsafe {
+                let h_v = v128_load(h_ptr.add(i) as *const v128);
+                let sin_i_v = v128_load(sin_ptr.add(i) as *const v128);
+                let cos_i_v = v128_load(cos_ptr.add(i) as *const v128);
+
+                let sin_t_v = f32x4_min(f32x4_max(f32x4_mul(eta_v, sin_i_v), min_sin_v), max_sin_v);
+                let cos_t_v = f32x4_sqrt(f32x4_max(f32x4_sub(one_v, f32x4_mul(sin_t_v, sin_t_v)), min_sq_v));
+                let sin_delta_v = f32x4_sub(f32x4_mul(sin_i_v, cos_t_v), f32x4_mul(cos_i_v, sin_t_v));
+                let cos_delta_v = f32x4_max(
+                    f32x4_add(f32x4_mul(cos_i_v, cos_t_v), f32x4_mul(sin_i_v, sin_t_v)),
+                    min_cos_v,
+                );
+                let depth_v = f32x4_add(f32x4_mul(scaled_bezel_v, h_v), glass_thickness_v);
+                let disp_v = f32x4_mul(depth_v, f32x4_div(sin_delta_v, cos_delta_v));
+
+                v128_store(out_ptr.add(i) as *mut v128, disp_v);
+                max_v = f32x4_max(max_v, f32x4_abs(disp_v));
+            }
+            i += 4;
+        }
+        max_abs_disp = f32x4_extract_lane::<0>(max_v)
+            .max(f32x4_extract_lane::<1>(max_v))
+            .max(f32x4_extract_lane::<2>(max_v))
+            .max(f32x4_extract_lane::<3>(max_v));
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+    {
+        max_abs_disp = 0.0_f32;
+    }
+
     while i < LUT_LEN {
         let h = lut.height[safe_surface][i];
         let sin_i = lut.sin_i[safe_surface][i];
@@ -535,8 +584,15 @@ unsafe fn write_corner_span(
     };
     let neg_sign_y_v = f32x4_splat(-sign_y);
 
+    let half_v = f32x4_splat(0.5);
+    let neg_half_v = f32x4_splat(-0.5);
+    let c127_5_v = f32x4_splat(127.5);
+    let c255_v = f32x4_splat(255.0);
+    let base_bgra_v = i32x4_splat(0xff00_0080_u32 as i32);
+
+    let simd_end = end.min(target_w / 2);
     let mut x = start;
-    while x + 4 <= end {
+    while x + 4 <= simd_end {
         let px_v = f32x4_sub(
             f32x4_add(f32x4_splat(x as f32), step_x),
             f32x4_splat(half_w),
@@ -600,34 +656,25 @@ unsafe fn write_corner_span(
         let off_x_v = f32x4_mul(nx_v, disp_v);
         let off_y_v = f32x4_mul(ny_v, disp_v);
 
-        write_reflected_pixel(
-            row_ptr,
-            target_w,
-            x,
-            f32x4_extract_lane::<0>(off_x_v),
-            f32x4_extract_lane::<0>(off_y_v),
-        );
-        write_reflected_pixel(
-            row_ptr,
-            target_w,
-            x + 1,
-            f32x4_extract_lane::<1>(off_x_v),
-            f32x4_extract_lane::<1>(off_y_v),
-        );
-        write_reflected_pixel(
-            row_ptr,
-            target_w,
-            x + 2,
-            f32x4_extract_lane::<2>(off_x_v),
-            f32x4_extract_lane::<2>(off_y_v),
-        );
-        write_reflected_pixel(
-            row_ptr,
-            target_w,
-            x + 3,
-            f32x4_extract_lane::<3>(off_x_v),
-            f32x4_extract_lane::<3>(off_y_v),
-        );
+        let raw_y = f32x4_add(c127_5_v, f32x4_mul(off_y_v, c127_5_v));
+        let round_y = v128_bitselect(half_v, neg_half_v, f32x4_ge(raw_y, zero));
+        let qy_i = i32x4_trunc_sat_f32x4(f32x4_min(f32x4_max(f32x4_add(raw_y, round_y), zero), c255_v));
+
+        let raw_x_pos = f32x4_add(c127_5_v, f32x4_mul(off_x_v, c127_5_v));
+        let round_x_pos = v128_bitselect(half_v, neg_half_v, f32x4_ge(raw_x_pos, zero));
+        let qx_pos_i = i32x4_trunc_sat_f32x4(f32x4_min(f32x4_max(f32x4_add(raw_x_pos, round_x_pos), zero), c255_v));
+
+        let raw_x_neg = f32x4_sub(c127_5_v, f32x4_mul(off_x_v, c127_5_v));
+        let round_x_neg = v128_bitselect(half_v, neg_half_v, f32x4_ge(raw_x_neg, zero));
+        let qx_neg_i = i32x4_trunc_sat_f32x4(f32x4_min(f32x4_max(f32x4_add(raw_x_neg, round_x_neg), zero), c255_v));
+
+        let g_shifted = i32x4_shl(qy_i, 8);
+        let left_bgra = v128_or(base_bgra_v, v128_or(g_shifted, i32x4_shl(qx_pos_i, 16)));
+        let right_bgra = v128_or(base_bgra_v, v128_or(g_shifted, i32x4_shl(qx_neg_i, 16)));
+        let right_reversed = i32x4_shuffle::<3, 2, 1, 0>(right_bgra, right_bgra);
+
+        core::ptr::write_unaligned(row_ptr.add(x * 4) as *mut v128, left_bgra);
+        core::ptr::write_unaligned(row_ptr.add((target_w - 4 - x) * 4) as *mut v128, right_reversed);
 
         x += 4;
     }

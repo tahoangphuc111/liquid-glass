@@ -38,13 +38,13 @@ describe("LiquidGlass configuration and helpers", () => {
         expect(pickMapScale(96, 48, 16, 24, 2.5, true)).toBe(1.0);
         expect(pickMapScale(800, 600, 20, 40, 1.0, false)).toBeLessThanOrEqual(0.75);
         expect(pickMapScale(1600, 1200, 24, 60, 0, false)).toBe(0.5);
-        expect(pickMapScale(340, 145, 16, 0, 0.6, false)).toBe(0.5);
+        expect(pickMapScale(340, 145, 16, 0, 0.6, false)).toBe(0.2);
     });
 
     it("formats backdrop-filter CSS strings per quality tier", () => {
-        expect(formatGlassFilterStyle("lg-1", 2.5, 0)).toBe("blur(2.5px) saturate(235%) url(#lg-1)");
-        expect(formatGlassFilterStyle("lg-1", 4, 1)).toBe("blur(2.00px) saturate(235%) url(#lg-1)");
-        expect(formatGlassFilterStyle("lg-1", 0, 2)).toBe("saturate(235%) url(#lg-1)");
+        expect(formatGlassFilterStyle("lg-1", 2.5, 0)).toBe("blur(2.5px) saturate(280%) url(#lg-1)");
+        expect(formatGlassFilterStyle("lg-1", 4, 1)).toBe("blur(2.00px) saturate(280%) url(#lg-1)");
+        expect(formatGlassFilterStyle("lg-1", 0, 2)).toBe("saturate(280%) url(#lg-1)");
     });
 
     it("parses hex and rgb() strings to normalized RGB", () => {

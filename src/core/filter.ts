@@ -7,9 +7,14 @@ import {
     SVG_NS,
     USE_CSS_SATURATION,
     pickMapScale,
+    resolveChromaticAberration,
 } from "./config.js";
 import type { GlassConfig, GlassSurface } from "./types.js";
-import { getWasmDisplacementBmp, revokeBlobUrlSafely } from "./wasm.js";
+import {
+    acquireCachedDisplacementBlobUrl,
+    getWasmDisplacementBmp,
+    releaseCachedDisplacementBlobUrl,
+} from "./wasm.js";
 
 export interface FilterArchetype {
     targetW: number;
@@ -27,6 +32,8 @@ export interface FilterArchetype {
     debugStr: string;
     decoded: boolean;
     preloadPromise: Promise<void> | null;
+    refCount: number;
+    evicted: boolean;
 }
 
 export interface PooledFilterElement extends SVGFilterElement {
@@ -162,6 +169,38 @@ export function processLruEviction(): void {
     }
 }
 
+function createDisplacementNode(
+    dispMapIn: string,
+    dispMapSource: string,
+    scaleValue: string,
+    resultId: string,
+): PooledFeDisplacementElement {
+    const feDisp = document.createElementNS(
+        SVG_NS,
+        "feDisplacementMap",
+    ) as PooledFeDisplacementElement;
+    feDisp.setAttribute("in", dispMapIn);
+    feDisp.setAttribute("in2", dispMapSource);
+    feDisp.setAttribute("scale", scaleValue);
+    feDisp.setAttribute("xChannelSelector", "R");
+    feDisp.setAttribute("yChannelSelector", "G");
+    feDisp.setAttribute("result", resultId);
+    return feDisp;
+}
+
+function createChannelMatrixNode(
+    sourceId: string,
+    matrixValues: string,
+    resultId: string,
+): SVGFEColorMatrixElement {
+    const feMatrix = document.createElementNS(SVG_NS, "feColorMatrix");
+    feMatrix.setAttribute("in", sourceId);
+    feMatrix.setAttribute("type", "matrix");
+    feMatrix.setAttribute("values", matrixValues);
+    feMatrix.setAttribute("result", resultId);
+    return feMatrix;
+}
+
 export function buildFilterElement(
     id: string,
     filterX: string,
@@ -176,9 +215,18 @@ export function buildFilterElement(
     blurAmt: number | string,
     isT1 = false,
     dispSmooth = 0,
+    chromaticAberration: boolean | number = 0,
 ): { filterNode: PooledFilterElement; feImage: PooledFeImageElement } {
     const numericBlur = typeof blurAmt === "string" ? parseFloat(blurAmt) : blurAmt;
+    const chromaAmount = resolveChromaticAberration(chromaticAberration);
+    const numericScale = parseFloat(scale) || 0;
+    const chromaShift = chromaAmount * 1.35;
+    const scaleMinus = Math.max(0, numericScale * (1 - chromaShift));
+    const scalePlus = numericScale * (1 + chromaShift);
+    const useChromatic = chromaAmount > 0 && scalePlus - scaleMinus >= 0.25;
+
     const isStandard =
+        !useChromatic &&
         !(PREBLUR_MODE === "svg" && numericBlur > 0) &&
         !isT1 &&
         dispSmooth <= 0 &&
@@ -230,18 +278,51 @@ export function buildFilterElement(
         dispMapSource = smoothResult;
     }
 
-    const feDisp = document.createElementNS(
-        SVG_NS,
-        "feDisplacementMap",
-    ) as PooledFeDisplacementElement;
-    feDisp.setAttribute("in", dispMapIn);
-    feDisp.setAttribute("in2", dispMapSource);
-    feDisp.setAttribute("scale", scale);
-    feDisp.setAttribute("xChannelSelector", "R");
-    feDisp.setAttribute("yChannelSelector", "G");
     const dispResult = isT1 ? "displaced_t1" : "displaced";
-    feDisp.setAttribute("result", dispResult);
-    filterNode.appendChild(feDisp);
+    let feDisp: PooledFeDisplacementElement | undefined;
+
+    if (useChromatic) {
+        const suffix = isT1 ? "_t1" : "";
+        const coolDispId = `disp_cool${suffix}`;
+        const warmDispId = `disp_warm${suffix}`;
+        const coolMixId = `cool_mix${suffix}`;
+        const warmMixId = `warm_mix${suffix}`;
+
+        filterNode.appendChild(
+            createDisplacementNode(dispMapIn, dispMapSource, scaleMinus.toFixed(2), coolDispId),
+        );
+        filterNode.appendChild(
+            createDisplacementNode(dispMapIn, dispMapSource, scalePlus.toFixed(2), warmDispId),
+        );
+        filterNode.appendChild(
+            createChannelMatrixNode(
+                coolDispId,
+                "0 0 0 0 0  0 0.5 0 0 0  0 0 1 0 0  0 0 0 1 0",
+                coolMixId,
+            ),
+        );
+        filterNode.appendChild(
+            createChannelMatrixNode(
+                warmDispId,
+                "1 0 0 0 0  0 0.5 0 0 0  0 0 0 0 0  0 0 0 1 0",
+                warmMixId,
+            ),
+        );
+
+        const feCombine = document.createElementNS(SVG_NS, "feComposite");
+        feCombine.setAttribute("in", warmMixId);
+        feCombine.setAttribute("in2", coolMixId);
+        feCombine.setAttribute("operator", "arithmetic");
+        feCombine.setAttribute("k1", "0");
+        feCombine.setAttribute("k2", "1");
+        feCombine.setAttribute("k3", "1");
+        feCombine.setAttribute("k4", "0");
+        feCombine.setAttribute("result", dispResult);
+        filterNode.appendChild(feCombine);
+    } else {
+        feDisp = createDisplacementNode(dispMapIn, dispMapSource, scale, dispResult);
+        filterNode.appendChild(feDisp);
+    }
 
     if (colorMatrix && !isT1 && !USE_CSS_SATURATION) {
         const feColor = document.createElementNS(SVG_NS, "feColorMatrix");
@@ -251,7 +332,7 @@ export function buildFilterElement(
         filterNode.appendChild(feColor);
     }
 
-    if (isStandard) {
+    if (isStandard && feDisp) {
         filterNode._isStd = true;
         filterNode._hasMatrix = hasMatrix;
         filterNode._lastX = filterX;
@@ -374,47 +455,75 @@ export function acquireSharedFilter(
 
     const blurAmt = config.blur;
     const ior = config.ior;
+    const chromaAmount = resolveChromaticAberration(config.chromaticAberration);
+    const effectiveArchTier = tier === 1 && chromaAmount > 0 ? 3 : tier;
     let archetype: FilterArchetype | null = null;
     if (
+        lastArchVal1 &&
+        !lastArchVal1.evicted &&
         config === lastArchCfg1 &&
         w === lastArchW1 &&
         h === lastArchH1 &&
         radius === lastArchRad1 &&
         surface === lastArchSurf1 &&
         rasterScale === lastArchScale1 &&
-        tier === lastArchTier1
+        effectiveArchTier === lastArchTier1
     ) {
         archetype = lastArchVal1;
     } else if (
+        lastArchVal2 &&
+        !lastArchVal2.evicted &&
         config === lastArchCfg2 &&
         w === lastArchW2 &&
         h === lastArchH2 &&
         radius === lastArchRad2 &&
         surface === lastArchSurf2 &&
         rasterScale === lastArchScale2 &&
-        tier === lastArchTier2
+        effectiveArchTier === lastArchTier2
     ) {
         archetype = lastArchVal2;
     } else {
-        const archetypeKey = `${config.id}|${w}_${h}_${radius}_${surface}_${ior.toFixed(2)}_${rasterScale}_${tier}`;
+        const maxBezel = config.bezel;
+        const limitBezel = halfMinDim - 1;
+        const minBezel = maxBezel < limitBezel ? maxBezel : limitBezel;
+        const clampedBezel = minBezel > 1 ? minBezel : 1;
+        const glassThickness = config.thickness;
+        const scaleRatio = config.scaleRatio;
+        const isAxisX = config.axis === "x";
+
+        const archetypeKey = [
+            w,
+            h,
+            radius,
+            clampedBezel,
+            glassThickness,
+            scaleRatio,
+            config.maxScaleMultiplier,
+            ior.toFixed(2),
+            surface,
+            config.pill ? 1 : 0,
+            isAxisX ? 1 : 0,
+            blurAmt,
+            config.colorMatrix ?? "",
+            rasterScale,
+            effectiveArchTier,
+        ].join("|");
         archetype = filterArchetypeCache.get(archetypeKey) ?? null;
+        if (archetype) {
+            filterArchetypeCache.delete(archetypeKey);
+            filterArchetypeCache.set(archetypeKey, archetype);
+        }
 
         if (!archetype) {
-            const glassThickness = config.thickness;
-            const maxBezel = config.bezel;
-            const limitBezel = halfMinDim - 1;
-            const minBezel = maxBezel < limitBezel ? maxBezel : limitBezel;
-            const clampedBezel = minBezel > 1 ? minBezel : 1;
-            const scaleRatio = config.scaleRatio;
-
-            const isAxisX = config.axis === "x";
             const baseScale = pickMapScale(w, h, clampedBezel, radius, blurAmt, isAxisX);
             const activeScale =
-                tier === 2
-                    ? baseScale * 0.5 > MAP_MIN_SCALE
-                        ? baseScale * 0.5
-                        : MAP_MIN_SCALE
-                    : baseScale;
+                radius <= 2
+                    ? baseScale
+                    : tier === 2 || (tier === 1 && chromaAmount > 0)
+                      ? baseScale * 0.5 > MAP_MIN_SCALE
+                          ? baseScale * 0.5
+                          : MAP_MIN_SCALE
+                      : baseScale;
             let targetW: number;
             let targetH: number;
             let effectiveScale: number;
@@ -461,8 +570,10 @@ export function acquireSharedFilter(
                 return null;
             }
 
-            const blobUrl = URL.createObjectURL(wasmRes.blob);
-            activeBlobUrlCount++;
+            const { blobUrl, createdNew } = acquireCachedDisplacementBlobUrl(wasmRes.blob);
+            if (createdNew) {
+                activeBlobUrlCount++;
+            }
 
             const finalMaxDisplacement = wasmRes.maxDisplacement || 1.0;
             const rawScale = finalMaxDisplacement * scaleRatio;
@@ -493,18 +604,33 @@ export function acquireSharedFilter(
                 debugStr: `${targetW}x${targetH} @${effectiveScale.toFixed(2)}x (element ${w}x${h})`,
                 decoded: false,
                 preloadPromise: null,
+                refCount: 0,
+                evicted: false,
             };
 
             if (filterArchetypeCache.size >= MAX_FILTER_ARCHETYPES) {
-                const oldestKey = filterArchetypeCache.keys().next().value;
+                let oldestKey: string | undefined;
+                for (const [candidateKey, candidateArch] of filterArchetypeCache) {
+                    if (candidateArch.refCount <= 0) {
+                        oldestKey = candidateKey;
+                        break;
+                    }
+                }
+                if (oldestKey === undefined) {
+                    oldestKey = filterArchetypeCache.keys().next().value;
+                }
                 if (oldestKey !== undefined) {
                     const evictedArch = filterArchetypeCache.get(oldestKey);
-                    if (evictedArch && evictedArch.blobUrl) {
-                        revokeBlobUrlSafely(evictedArch.blobUrl);
-                        evictedArch.blobUrl = null;
-                        if (activeBlobUrlCount > 0) activeBlobUrlCount--;
-                    }
                     filterArchetypeCache.delete(oldestKey);
+                    if (evictedArch) {
+                        evictedArch.evicted = true;
+                        if (evictedArch.refCount <= 0 && evictedArch.blobUrl) {
+                            if (releaseCachedDisplacementBlobUrl(evictedArch.blobUrl)) {
+                                if (activeBlobUrlCount > 0) activeBlobUrlCount--;
+                            }
+                            evictedArch.blobUrl = null;
+                        }
+                    }
                 }
             }
             filterArchetypeCache.set(archetypeKey, archetype);
@@ -525,7 +651,7 @@ export function acquireSharedFilter(
         lastArchRad1 = radius;
         lastArchSurf1 = surface;
         lastArchScale1 = rasterScale;
-        lastArchTier1 = tier;
+        lastArchTier1 = effectiveArchTier;
         lastArchVal1 = archetype;
     }
 
@@ -533,6 +659,7 @@ export function acquireSharedFilter(
         return null;
     }
 
+    archetype.refCount++;
     const combinedUrl = archetype.blobUrl ?? "";
     filterIdCounter++;
     const filterId = `lg-${filterIdCounter}`;
@@ -553,6 +680,7 @@ export function acquireSharedFilter(
         blurAmt,
         false,
         0,
+        chromaAmount,
     );
     svgDefs.appendChild(filterNode);
 
@@ -578,6 +706,8 @@ export function acquireSharedFilter(
             config.colorMatrix,
             blurAmtT1,
             true,
+            0,
+            chromaAmount,
         );
         filterNodeT1 = t1Result.filterNode;
         feImageT1 = t1Result.feImage;
@@ -635,10 +765,24 @@ export function disposeSharedFilter(key: string, _immediate = false): void {
     record.feImage = null;
     record.feImageT1 = null;
     record.preloadImage = null;
+    const archetype = record.archetype;
     record.archetype = null;
+    if (archetype) {
+        if (archetype.refCount > 0) archetype.refCount--;
+        if (archetype.evicted && archetype.refCount <= 0 && archetype.blobUrl) {
+            if (releaseCachedDisplacementBlobUrl(archetype.blobUrl)) {
+                decrementActiveBlobUrlCount();
+            }
+            archetype.blobUrl = null;
+        }
+    }
 
     sharedFilters.delete(key);
     lruUnusedFilterKeys.delete(key);
+}
+
+export function resetActiveBlobUrlCount(): void {
+    activeBlobUrlCount = 0;
 }
 
 export function releaseSharedFilter(

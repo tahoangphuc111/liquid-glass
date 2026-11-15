@@ -35,4 +35,9 @@ export { createSceneCaptureController, captureDomToCanvas } from "./core/sceneCa
 export { GlassWebglRenderer, parseCssColorToRgb } from "./core/webglRenderer.js";
 export { createLiquidGlass } from "./core/controller.js";
 export { createGlassSlider } from "./core/slider.js";
+export { createGlassSwitch } from "./core/switch.js";
 export { glassEffect, type LiquidGlassGroup } from "./core/glassEffect.js";
+export type {
+    LiquidGlassSwitchOptions,
+    LiquidGlassSwitchInstance,
+} from "./core/types.js";

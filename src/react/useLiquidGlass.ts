@@ -77,6 +77,8 @@ export function useLiquidGlass(
         options.pixelRatio,
         options.chromaticAberration,
         options.interactive,
+        options.draggable,
+        options.coalesce,
         sceneCanvas,
         sceneElement,
     ]);

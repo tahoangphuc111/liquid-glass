@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { mount } from "@vue/test-utils";
 import { defineComponent, h } from "vue";
-import { LiquidGlass, LiquidGlassPlugin, LiquidGlassProvider } from "../src/vue/index.js";
+import {
+    LiquidGlass,
+    LiquidGlassPlugin,
+    LiquidGlassProvider,
+    LiquidGlassSwitch,
+} from "../src/vue/index.js";
 import { destroyLiquidGlass } from "../src/index.js";
 
 function setForcedChromium(value: boolean | undefined): void {
@@ -65,6 +70,37 @@ describe("Vue 3 bindings", () => {
         });
 
         expect(wrapper.find(".lg-surface").exists()).toBe(true);
+        wrapper.unmount();
+    });
+
+    it("renders LiquidGlassSwitch with v-model support via LiquidGlassPlugin", async () => {
+        const Host = defineComponent({
+            components: { LiquidGlassSwitch },
+            data() {
+                return {
+                    selected: "home",
+                    items: [
+                        { value: "home", label: "Home" },
+                        { value: "library", label: "Library" },
+                    ],
+                };
+            },
+            template: `<LiquidGlassSwitch v-model="selected" engine="css" :items="items" />`,
+        });
+
+        const wrapper = mount(Host, {
+            global: {
+                plugins: [LiquidGlassPlugin],
+            },
+        });
+
+        expect(wrapper.find(".lg-switch").exists()).toBe(true);
+        expect(wrapper.find(".lg-switch-glider").exists()).toBe(true);
+
+        const tabs = wrapper.findAll('[role="tab"]');
+        expect(tabs).toHaveLength(2);
+        await tabs[1]!.trigger("click");
+        expect(wrapper.vm.selected).toBe("library");
         wrapper.unmount();
     });
 });

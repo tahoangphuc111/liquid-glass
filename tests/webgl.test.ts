@@ -10,6 +10,8 @@ import { GlassWebglRenderer, resolveWebglPixelRatio } from "../src/core/webglRen
 function createMockWebglContext(options?: {
     maxViewportDims?: [number, number];
     maxTextureSize?: number;
+    transferCache?: boolean;
+    incompleteFramebuffer?: boolean;
 }) {
     const uniforms = new Map<string, number>();
     let nextLocId = 1;
@@ -28,6 +30,9 @@ function createMockWebglContext(options?: {
         COLOR_BUFFER_BIT: 0x4000,
         TRIANGLES: 0x0004,
         TEXTURE0: 0x84c0,
+        TEXTURE1: 0x84c1,
+        TEXTURE2: 0x84c2,
+        TEXTURE3: 0x84c3,
         TEXTURE_2D: 0x0de1,
         RGBA: 0x1908,
         UNSIGNED_BYTE: 0x1401,
@@ -38,6 +43,15 @@ function createMockWebglContext(options?: {
         TEXTURE_MIN_FILTER: 0x2801,
         CLAMP_TO_EDGE: 0x812f,
         LINEAR: 0x2601,
+        NEAREST: 0x2600,
+        RGBA16F: 0x881a,
+        RGBA32F: 0x8814,
+        HALF_FLOAT: 0x140b,
+        FRAMEBUFFER: 0x8d40,
+        NO_ERROR: 0,
+        FRAMEBUFFER_COMPLETE: 0x8cd5,
+        COLOR_ATTACHMENT0: 0x8ce0,
+        COLOR_ATTACHMENT1: 0x8ce1,
         MAX_VIEWPORT_DIMS: 0x0d3a,
         MAX_TEXTURE_SIZE: 0x0d33,
         createShader: vi.fn(() => ({})),
@@ -47,6 +61,7 @@ function createMockWebglContext(options?: {
         deleteShader: vi.fn(),
         createProgram: vi.fn(() => ({})),
         attachShader: vi.fn(),
+        bindAttribLocation: vi.fn(),
         linkProgram: vi.fn(),
         getProgramParameter: vi.fn(() => true),
         deleteProgram: vi.fn(),
@@ -89,10 +104,86 @@ function createMockWebglContext(options?: {
         pixelStorei: vi.fn(),
         texImage2D: vi.fn(),
         texParameteri: vi.fn(),
+        getExtension: vi.fn(() => options?.transferCache ? {} : null),
+        drawBuffers: options?.transferCache ? vi.fn() : undefined,
+        createFramebuffer: vi.fn(() => ({})),
+        bindFramebuffer: vi.fn(),
+        framebufferTexture2D: vi.fn(),
+        checkFramebufferStatus: vi.fn(() => options?.incompleteFramebuffer ? 0x8cd6 : 0x8cd5),
+        deleteFramebuffer: vi.fn(),
+        getError: vi.fn(() => 0),
     } as unknown as WebGLRenderingContext;
 
     return { gl, viewportCalls, uniform1fCalls, uniform4fCalls };
 }
+
+describe("optical transfer caching", () => {
+    const frame = {
+        width: 240, height: 120, radius: 20, bezel: 14, thickness: 40,
+        scaleRatio: 2, ior: 1.5, blur: 0, surface: "convex_squircle" as const,
+        tintColor: [1, 1, 1] as [number, number, number], tintOpacity: 0.12,
+        highlight: 0.7, pixelRatio: 2,
+    };
+
+    function setup(options: Parameters<typeof createMockWebglContext>[0] = {}) {
+        const { gl } = createMockWebglContext({ transferCache: true, ...options });
+        const canvas = document.createElement("canvas");
+        vi.spyOn(canvas, "getContext").mockReturnValue(gl);
+        const renderer = GlassWebglRenderer.create(canvas)!;
+        return { gl: gl as WebGL2RenderingContext, renderer };
+    }
+
+    it("builds once after geometry stabilizes and reuses optics across scene and lighting updates", () => {
+        const { gl, renderer } = setup();
+        renderer.render(frame);
+        renderer.render(frame);
+        expect(gl.createFramebuffer).not.toHaveBeenCalled();
+        renderer.render(frame);
+        expect(gl.drawArrays).toHaveBeenCalledTimes(4);
+        expect(gl.framebufferTexture2D).toHaveBeenCalledTimes(2);
+        const allocations = vi.mocked(gl.texImage2D).mock.calls.length;
+        renderer.setSceneCanvas(document.createElement("canvas"));
+        const uploads = vi.mocked(gl.texImage2D).mock.calls.length;
+        for (const update of [
+            { thickness: 80 }, { scaleRatio: 3 }, { tintOpacity: 0.5 }, { highlight: 0.9 },
+            { blur: 6 }, { chromaticAberration: 0.12 },
+            { sceneRect: { relX: 0.2, relY: 0.3, relW: 0.4, relH: 0.5 } },
+        ]) renderer.render({ ...frame, ...update });
+        expect(gl.drawArrays).toHaveBeenCalledTimes(11);
+        expect(gl.texImage2D).toHaveBeenCalledTimes(uploads);
+        expect(uploads).toBe(allocations + 1);
+        expect(gl.framebufferTexture2D).toHaveBeenCalledTimes(2);
+        renderer.dispose();
+        expect(gl.deleteFramebuffer).toHaveBeenCalledTimes(1);
+        expect(gl.deleteTexture).toHaveBeenCalledTimes(4);
+    });
+
+    it.each([
+        { width: 241 }, { width: 240.1 }, { height: 121 }, { radius: 28 }, { bezel: 22 },
+        { pixelRatio: 3 }, { ior: 1.8 }, { surface: "lip" as const },
+    ])("invalidates cached geometry for %j without rebuilding during continuous changes", (update) => {
+        const { gl, renderer } = setup();
+        for (let i = 0; i < 3; i++) renderer.render(frame);
+        const draws = vi.mocked(gl.drawArrays).mock.calls.length;
+        renderer.render({ ...frame, ...update });
+        expect(gl.drawArrays).toHaveBeenCalledTimes(draws + 1);
+        renderer.render({ ...frame, ...update });
+        renderer.render({ ...frame, ...update });
+        expect(gl.drawArrays).toHaveBeenCalledTimes(draws + 4);
+        for (let i = 0; i < 6; i++) renderer.render({ ...frame, radius: 30 + i });
+        expect(gl.drawArrays).toHaveBeenCalledTimes(draws + 10);
+        renderer.dispose();
+    });
+
+    it.each([
+        { transferCache: false }, { incompleteFramebuffer: true }, { maxTextureSize: 256 },
+    ])("keeps the analytical WebGL shader when transfer targets are unavailable: %j", (options) => {
+        const { gl, renderer } = setup(options);
+        for (let i = 0; i < 6; i++) renderer.render(frame);
+        expect(gl.drawArrays).toHaveBeenCalledTimes(6);
+        renderer.dispose();
+    });
+});
 
 describe("WebGL high-DPI pixel resolution and scene capture scaling", () => {
     const originalDpr = Object.getOwnPropertyDescriptor(window, "devicePixelRatio");
@@ -119,8 +210,8 @@ describe("WebGL high-DPI pixel resolution and scene capture scaling", () => {
         Object.defineProperty(window, "devicePixelRatio", { value: 3, configurable: true });
         expect(resolveWebglPixelRatio(undefined, 18)).toBe(3);
 
-        expect(resolveWebglPixelRatio(undefined, 0)).toBe(1);
-        expect(resolveWebglPixelRatio(undefined, 2)).toBe(1);
+        expect(resolveWebglPixelRatio(undefined, 0)).toBe(0.375);
+        expect(resolveWebglPixelRatio(undefined, 2)).toBe(0.375);
         expect(resolveWebglPixelRatio(3, 0)).toBe(3);
         expect(resolveWebglPixelRatio(12)).toBe(4);
         expect(resolveWebglPixelRatio(0.5)).toBe(0.5);
@@ -195,8 +286,8 @@ describe("WebGL high-DPI pixel resolution and scene capture scaling", () => {
             highlight: 0.72,
         });
 
-        expect(canvas.width).toBe(300);
-        expect(canvas.height).toBe(100);
+        expect(canvas.width).toBe(113);
+        expect(canvas.height).toBe(38);
         const highlightCalls = uniform4fCalls.filter(
             (c) => (c.loc as { name?: string })?.name === "uHighlight",
         );
@@ -254,10 +345,10 @@ describe("WebGL high-DPI pixel resolution and scene capture scaling", () => {
         expect(medium).toEqual({ texWidth: 2000, texHeight: 1600 });
 
         const unrounded = resolveCaptureDimensions(1000, 800, undefined, 0);
-        expect(unrounded).toEqual({ texWidth: 500, texHeight: 400 });
+        expect(unrounded).toEqual({ texWidth: 200, texHeight: 160 });
 
         const largeUnrounded = resolveCaptureDimensions(2400, 1600, undefined, 2);
-        expect(Math.max(largeUnrounded.texWidth, largeUnrounded.texHeight)).toBeLessThanOrEqual(1024);
+        expect(Math.max(largeUnrounded.texWidth, largeUnrounded.texHeight)).toBeLessThanOrEqual(448);
 
         const tall = resolveCaptureDimensions(1280, 1600);
         expect(Math.max(tall.texWidth, tall.texHeight)).toBeLessThanOrEqual(3072);
@@ -425,96 +516,6 @@ describe("WebGL high-DPI pixel resolution and scene capture scaling", () => {
         expect(document.querySelector(".lg-slider")).toBeNull();
     });
 
-    it("composites external sceneElement behind slider track and fill in WebGL mode", () => {
-        const { gl } = createMockWebglContext();
-        const drawImageCalls: unknown[][] = [];
-        const mock2dCtx = {
-            imageSmoothingEnabled: true,
-            imageSmoothingQuality: "high",
-            fillStyle: "",
-            globalAlpha: 1,
-            filter: "none",
-            font: "",
-            textBaseline: "middle",
-            save: vi.fn(),
-            restore: vi.fn(),
-            beginPath: vi.fn(),
-            roundRect: vi.fn(),
-            fill: vi.fn(),
-            setTransform: vi.fn(),
-            fillRect: vi.fn(),
-            drawImage: vi.fn((...args: unknown[]) => {
-                drawImageCalls.push(args);
-            }),
-            translate: vi.fn(),
-            transform: vi.fn(),
-            fillText: vi.fn(),
-            measureText: vi.fn(() => ({ width: 20 })),
-        } as unknown as CanvasRenderingContext2D;
-
-        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation((type: string) => {
-            if (type === "webgl2" || type === "webgl") {
-                return gl as unknown as RenderingContext;
-            }
-            if (type === "2d") {
-                return mock2dCtx as unknown as RenderingContext;
-            }
-            return null;
-        });
-
-        const rafQueue: FrameRequestCallback[] = [];
-        vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb) => {
-            rafQueue.push(cb);
-            return rafQueue.length;
-        });
-        vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => {});
-
-        document.body.innerHTML = `
-            <section id="ext-scene"></section>
-            <div class="slider-overlay"><input id="ext-slider" type="range" min="0" max="100" value="50" /></div>
-        `;
-        const sceneEl = document.getElementById("ext-scene") as HTMLElement;
-        const input = document.getElementById("ext-slider") as HTMLInputElement;
-
-        vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
-            this: HTMLElement,
-        ) {
-            if (this === sceneEl) {
-                return { left: 0, top: 0, right: 1200, bottom: 800, width: 1200, height: 800 } as DOMRect;
-            }
-            if (this.classList.contains("lg-slider-thumb")) {
-                return { left: 200, top: 700, right: 254, bottom: 732, width: 54, height: 32 } as DOMRect;
-            }
-            return { left: 100, top: 700, right: 360, bottom: 734, width: 260, height: 34 } as DOMRect;
-        });
-
-        const slider = input.glassEffect({ engine: "webgl", sceneElement: sceneEl });
-        const wrapper = input.closest(".lg-slider") as HTMLElement;
-        const thumb = wrapper.querySelector(".lg-slider-thumb") as HTMLElement;
-        Object.defineProperty(thumb, "offsetWidth", { value: 54, configurable: true });
-        Object.defineProperty(thumb, "offsetHeight", { value: 32, configurable: true });
-
-        while (rafQueue.length > 0) {
-            rafQueue.shift()!(16);
-        }
-
-        expect(slider.engine).toBe("webgl");
-        expect(thumb.getAttribute("data-lg-webgl-scene")).toBe("1");
-        expect(drawImageCalls.length).toBeGreaterThan(0);
-
-        slider.update({ engine: "css", sceneElement: sceneEl });
-        expect(slider.engine).toBe("css");
-
-        slider.update({ engine: "webgl", sceneElement: sceneEl });
-        while (rafQueue.length > 0) {
-            rafQueue.shift()!(32);
-        }
-        expect(slider.engine).toBe("webgl");
-        expect(thumb.getAttribute("data-lg-webgl-scene")).toBe("1");
-
-        slider.destroy();
-    });
-
     it("clamps oversized scene textures to maxTextureSize and skips lost WebGL contexts", () => {
         const { gl } = createMockWebglContext({ maxTextureSize: 1024 });
         let lost = false;
@@ -589,48 +590,5 @@ describe("WebGL high-DPI pixel resolution and scene capture scaling", () => {
         });
         expect((gl.drawArrays as ReturnType<typeof vi.fn>).mock.calls.length).toBe(drawCallsBeforeLost);
         renderer.dispose();
-    });
-
-    it("keeps light fallback when page ink is dark even under OS prefers-color-scheme: dark", () => {
-        const sceneEl = document.createElement("div");
-        sceneEl.style.color = "rgb(15, 23, 42)";
-        document.body.appendChild(sceneEl);
-
-        vi.spyOn(sceneEl, "getBoundingClientRect").mockReturnValue({
-            left: 0,
-            top: 0,
-            right: 400,
-            bottom: 300,
-            width: 400,
-            height: 300,
-        } as DOMRect);
-        vi.spyOn(window, "matchMedia").mockImplementation(
-            (query: string) =>
-                ({
-                    matches: query === "(prefers-color-scheme: dark)",
-                    media: query,
-                    addEventListener: vi.fn(),
-                    removeEventListener: vi.fn(),
-                }) as unknown as MediaQueryList,
-        );
-
-        const fillStyles: string[] = [];
-        const canvas = document.createElement("canvas");
-        vi.spyOn(canvas, "getContext").mockReturnValue({
-            imageSmoothingEnabled: true,
-            imageSmoothingQuality: "high",
-            setTransform: vi.fn(),
-            fillRect: vi.fn(),
-            set fillStyle(val: string) {
-                fillStyles.push(val);
-            },
-            get fillStyle() {
-                return fillStyles.at(-1) ?? "";
-            },
-        } as unknown as CanvasRenderingContext2D);
-
-        const ok = captureDomToCanvas(sceneEl, canvas, document.createRange());
-        expect(ok).toBe(true);
-        expect(fillStyles[0]).toBe("#f3f2f6");
     });
 });

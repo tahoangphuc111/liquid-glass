@@ -89,6 +89,14 @@ export const LiquidGlass = defineComponent({
             type: Boolean as PropType<boolean | undefined>,
             default: undefined,
         },
+        draggable: {
+            type: [Boolean, String] as PropType<boolean | "elastic" | undefined>,
+            default: undefined,
+        },
+        coalesce: {
+            type: Boolean as PropType<boolean | undefined>,
+            default: undefined,
+        },
         sceneElement: {
             type: Object as PropType<HTMLElement | null>,
             default: undefined,
@@ -124,6 +132,8 @@ export const LiquidGlass = defineComponent({
             pixelRatio: props.pixelRatio,
             chromaticAberration: props.chromaticAberration,
             interactive: props.interactive,
+            draggable: props.draggable,
+            coalesce: props.coalesce,
             sceneElement: props.sceneElement,
             sceneCanvas: props.sceneCanvas,
             onEngineChange: (nextEngine) => emit("engineChange", nextEngine),

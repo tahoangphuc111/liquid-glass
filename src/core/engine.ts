@@ -5,6 +5,7 @@ import {
     MAX_TOTAL_DEVICE_AREA,
     formatGlassFilterStyle,
     pickMapScale,
+    resolveChromaticAberration,
 } from "./config.js";
 import {
     activeBlobUrlCount,
@@ -16,6 +17,7 @@ import {
     filterArchetypeCache,
     lruUnusedFilterKeys,
     releaseSharedFilter,
+    resetActiveBlobUrlCount,
     resetArchetypeHotSlots,
     sharedFilters,
     startMapPreload,
@@ -39,7 +41,7 @@ import {
     setTierChangeCallback,
 } from "./telemetry.js";
 import type { GlassConfig, GlassSurface, LiquidGlassStats } from "./types.js";
-import { isWasmReady, onWasmReady, revokeBlobUrlSafely } from "./wasm.js";
+import { clearDisplacementCache, isWasmReady, onWasmReady, releaseCachedDisplacementBlobUrl } from "./wasm.js";
 
 const QUANTIZE_GRID_W = 2;
 const QUANTIZE_GRID_H = 2;
@@ -324,12 +326,15 @@ export function cleanupAllTargetStates(): void {
     }
     for (const arch of filterArchetypeCache.values()) {
         if (arch.blobUrl) {
-            revokeBlobUrlSafely(arch.blobUrl);
+            if (releaseCachedDisplacementBlobUrl(arch.blobUrl)) {
+                decrementActiveBlobUrlCount();
+            }
             arch.blobUrl = null;
-            decrementActiveBlobUrlCount();
         }
     }
     filterArchetypeCache.clear();
+    clearDisplacementCache();
+    resetActiveBlobUrlCount();
     lruUnusedFilterKeys.clear();
     resetArchetypeHotSlots();
     currentTotalDeviceArea = 0;
@@ -581,7 +586,7 @@ export function rebuildLiquidGlassFilterForElement(
     const dpr = typeof window !== "undefined" && typeof window.devicePixelRatio === "number"
         ? window.devicePixelRatio
         : 1;
-    const rasterScale = Math.min(dpr, 2);
+    const rasterScale = radius <= 2 ? Math.min(dpr, 0.5) : Math.min(dpr, 2);
 
     const clampedBezel = Math.max(1, Math.min(config.bezel, halfMinDim - 1));
     const hasCore = Boolean(
@@ -642,8 +647,11 @@ export function rebuildLiquidGlassFilterForElement(
     const quantH = Math.max(QUANTIZE_GRID_H, Math.round(h / QUANTIZE_GRID_H) * QUANTIZE_GRID_H);
     const quantRadius = config.pill ? Math.min(quantW, quantH) * 0.5 : Math.round(radius);
 
-    const tierKey = qualityTier === 2 ? "_q2" : "";
-    const newSharedKey = `${config.id}|${quantW}_${quantH}_${rasterScale.toFixed(2)}_${quantRadius.toFixed(1)}_${surface}${tierKey}`;
+    const chromaAmount = resolveChromaticAberration(config.chromaticAberration);
+    const chromaKey = chromaAmount > 0 ? `_ca${chromaAmount.toFixed(3)}` : "";
+    const tierKey =
+        qualityTier === 2 || (qualityTier === 1 && chromaAmount > 0) ? `_q${qualityTier}` : "";
+    const newSharedKey = `${surface}_${quantW}_${quantH}_${quantRadius.toFixed(1)}_${clampedBezel}_${config.thickness}_${config.scaleRatio}_${config.maxScaleMultiplier}_${config.blur}_${config.ior.toFixed(2)}_${config.pill ? 1 : 0}_${config.axis ?? ""}_${config.colorMatrix ?? ""}_${rasterScale.toFixed(2)}${chromaKey}${tierKey}`;
 
     const matchesSharedKey =
         state.sharedKey === newSharedKey || state.sharedKey === `${newSharedKey}_${w}x${h}`;
@@ -1012,6 +1020,8 @@ function detectDevicePerformance(): void {
 
     if ((concurrency <= 2 && memory <= 2) || isSaveData) {
         applyQualityTier(2);
+    } else if (concurrency <= 4 && memory <= 4) {
+        applyQualityTier(1);
     }
 }
 
