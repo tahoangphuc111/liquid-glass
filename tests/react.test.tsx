@@ -5,6 +5,7 @@ import {
     LiquidGlass,
     LiquidGlassProvider,
     LiquidGlassSwitch,
+    useLiquidGlass,
 } from "../src/react/index.js";
 import { destroyLiquidGlass } from "../src/index.js";
 
@@ -88,5 +89,22 @@ describe("React bindings", () => {
         expect(handleChange).toHaveBeenCalledTimes(1);
         expect(handleChange.mock.calls[0]?.[0]).toBe("search");
         expect(handleChange.mock.calls[0]?.[1]).toBe(1);
+    });
+
+    it("destroys controller instance cleanly when target element conditionally unmounts", () => {
+        function ConditionalGlass({ show }: { show: boolean }) {
+            const elRef = createRef<HTMLDivElement>();
+            useLiquidGlass(elRef, { engine: "css" });
+
+            return show ? <div ref={elRef} data-testid="surface">Surface</div> : null;
+        }
+
+        const { rerender } = render(<ConditionalGlass show={true} />);
+        const surface = screen.getByTestId("surface");
+        expect(surface.getAttribute("data-lg-surface")).toBe("");
+
+        // Unmount element conditionally while component remains mounted
+        rerender(<ConditionalGlass show={false} />);
+        expect(screen.queryByTestId("surface")).toBeNull();
     });
 });

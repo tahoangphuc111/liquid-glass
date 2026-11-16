@@ -36,11 +36,51 @@ export type NextLiquidGlassSwitchProps<ElementTag extends ElementType = "nav"> =
         >;
 
 function normalizePathname(rawPath: string): string {
-    const cleanPath = rawPath.split(/[?#]/, 1)[0] ?? "/";
-    if (cleanPath.length > 1 && cleanPath.endsWith("/")) {
-        return cleanPath.replace(/\/+$/, "");
+    let cleanPath = rawPath.split(/[?#]/, 1)[0] ?? "/";
+    try {
+        if (cleanPath.includes("://")) {
+            cleanPath = new URL(cleanPath).pathname;
+        }
+    } catch {
+        // fallback
     }
-    return cleanPath || "/";
+    const withLeadingSlash = cleanPath.startsWith("/") ? cleanPath : `/${cleanPath}`;
+    if (withLeadingSlash.length > 1 && withLeadingSlash.endsWith("/")) {
+        return withLeadingSlash.replace(/\/+$/, "");
+    }
+    return withLeadingSlash || "/";
+}
+
+const historyListeners = new Set<() => void>();
+let historyPatched = false;
+
+function ensureHistoryPatched(): void {
+    if (historyPatched || typeof window === "undefined" || !window.history) return;
+    historyPatched = true;
+    const originalPushState = window.history.pushState;
+    const originalReplaceState = window.history.replaceState;
+    window.history.pushState = function (...args) {
+        const result = originalPushState.apply(this, args);
+        historyListeners.forEach((listener) => {
+            try {
+                listener();
+            } catch {
+                // ignore
+            }
+        });
+        return result;
+    };
+    window.history.replaceState = function (...args) {
+        const result = originalReplaceState.apply(this, args);
+        historyListeners.forEach((listener) => {
+            try {
+                listener();
+            } catch {
+                // ignore
+            }
+        });
+        return result;
+    };
 }
 
 export function resolveSwitchValueForPathname(
@@ -148,8 +188,11 @@ const NextLiquidGlassSwitchImpl = forwardRef<
             setClientPathname(window.location.pathname);
         };
         syncLocation();
+        ensureHistoryPatched();
+        historyListeners.add(syncLocation);
         window.addEventListener("popstate", syncLocation);
         return () => {
+            historyListeners.delete(syncLocation);
             window.removeEventListener("popstate", syncLocation);
         };
     }, [pathname]);
@@ -217,6 +260,8 @@ const NextLiquidGlassSwitchImpl = forwardRef<
                               className="lg-switch-item"
                               data-switch-value={item.value}
                               role="tab"
+                              aria-disabled={item.disabled ? "true" : undefined}
+                              tabIndex={item.disabled ? -1 : undefined}
                               aria-label={item.ariaLabel}
                               {...(linkComponent && (item.prefetch ?? prefetch) !== undefined
                                   ? { prefetch: item.prefetch ?? prefetch }
@@ -233,6 +278,8 @@ const NextLiquidGlassSwitchImpl = forwardRef<
                               data-switch-value={item.value}
                               role="tab"
                               disabled={item.disabled}
+                              aria-disabled={item.disabled ? "true" : undefined}
+                              tabIndex={item.disabled ? -1 : undefined}
                               aria-label={item.ariaLabel}
                           >
                               {item.icon}

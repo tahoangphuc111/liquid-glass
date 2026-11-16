@@ -38,6 +38,8 @@ export function useGlassSwitch(
     const syncInstance = () => {
         const element = targetRef.value;
         if (!element) {
+            instance?.destroy();
+            instance = null;
             return;
         }
 

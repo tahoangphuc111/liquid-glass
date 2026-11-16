@@ -30,6 +30,21 @@ describe("LiquidGlass configuration and helpers", () => {
         expect(custom.blur).toBe(4);
         expect(custom.pill).toBe(true);
         expect(custom.scaleRatio).toBe(DEFAULT_GLASS_CONFIG.scaleRatio);
+
+        // NaN protection fallback to defaults
+        const nanConfig = resolveGlassConfig({
+            thickness: NaN,
+            bezel: NaN,
+            ior: NaN,
+            blur: NaN,
+            radius: NaN,
+        });
+        expect(nanConfig.thickness).toBe(DEFAULT_GLASS_CONFIG.thickness);
+        expect(nanConfig.bezel).toBe(DEFAULT_GLASS_CONFIG.bezel);
+        expect(nanConfig.ior).toBe(DEFAULT_GLASS_CONFIG.ior);
+        expect(nanConfig.blur).toBe(DEFAULT_GLASS_CONFIG.blur);
+        expect(nanConfig.radius).toBe(DEFAULT_GLASS_CONFIG.radius);
+        expect(nanConfig.id).not.toContain("NaN");
     });
 
     it("scales displacement maps higher for tight radii and lower for large soft shapes", () => {

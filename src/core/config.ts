@@ -96,14 +96,22 @@ export function resolveChromaticAberration(value?: boolean | number): number {
 
 export function resolveGlassConfig(options: LiquidGlassOptions = {}): GlassConfig {
     const surface = options.surface ?? DEFAULT_GLASS_CONFIG.surface;
-    const thickness = options.thickness ?? DEFAULT_GLASS_CONFIG.thickness;
-    const bezel = options.bezel ?? DEFAULT_GLASS_CONFIG.bezel;
-    const scaleRatio = options.scaleRatio ?? DEFAULT_GLASS_CONFIG.scaleRatio;
+    const thickness =
+        Number.isFinite(options.thickness) ? options.thickness! : DEFAULT_GLASS_CONFIG.thickness;
+    const bezel =
+        Number.isFinite(options.bezel) ? options.bezel! : DEFAULT_GLASS_CONFIG.bezel;
+    const scaleRatio =
+        Number.isFinite(options.scaleRatio) ? options.scaleRatio! : DEFAULT_GLASS_CONFIG.scaleRatio;
     const maxScaleMultiplier =
-        options.maxScaleMultiplier ?? DEFAULT_GLASS_CONFIG.maxScaleMultiplier;
-    const blur = options.blur ?? DEFAULT_GLASS_CONFIG.blur;
-    const ior = options.ior ?? DEFAULT_GLASS_CONFIG.ior;
-    const radius = options.radius ?? DEFAULT_GLASS_CONFIG.radius;
+        Number.isFinite(options.maxScaleMultiplier)
+            ? options.maxScaleMultiplier!
+            : DEFAULT_GLASS_CONFIG.maxScaleMultiplier;
+    const blur =
+        Number.isFinite(options.blur) ? options.blur! : DEFAULT_GLASS_CONFIG.blur;
+    const ior =
+        Number.isFinite(options.ior) ? options.ior! : DEFAULT_GLASS_CONFIG.ior;
+    const radius =
+        Number.isFinite(options.radius) ? options.radius! : DEFAULT_GLASS_CONFIG.radius;
     const pill = options.pill ?? DEFAULT_GLASS_CONFIG.pill;
     const hollow = options.hollow ?? DEFAULT_GLASS_CONFIG.hollow;
     const alwaysOn = options.alwaysOn ?? DEFAULT_GLASS_CONFIG.alwaysOn;

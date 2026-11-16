@@ -7,6 +7,7 @@ import {
     initWasmSimdModule,
     isWasmReady,
     releaseCachedDisplacementBlobUrl,
+    resetWasmModuleForTesting,
 } from "../src/core/wasm.js";
 import type { GlassSurface } from "../src/core/types.js";
 
@@ -99,5 +100,12 @@ describe("WASM displacement generator", () => {
             URL.createObjectURL = originalCreateObjectUrl;
             URL.revokeObjectURL = originalRevokeObjectUrl;
         }
+    });
+
+    it("resets WASM module cleanly and handles re-initialization", () => {
+        resetWasmModuleForTesting();
+        expect(isWasmReady()).toBe(false);
+        initWasmSimdModule();
+        expect(isWasmReady()).toBe(true);
     });
 });

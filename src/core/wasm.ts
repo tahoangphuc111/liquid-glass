@@ -219,14 +219,28 @@ export function initWasmSimdModule(): void {
         const bytes = decodeBase64ToUint8(WASM_SIMD_BASE64);
         if (!bytes) return;
 
+        const wasmBufferSource = (
+            bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+                ? bytes
+                : bytes.slice()
+        ) as BufferSource;
+
+        if (!WebAssembly.validate(wasmBufferSource)) {
+            return;
+        }
+
         try {
-            const module = new WebAssembly.Module(bytes.buffer as ArrayBuffer);
+            const module = new WebAssembly.Module(wasmBufferSource);
             const instance = new WebAssembly.Instance(module);
             bindWasmInstance(instance);
         } catch {
-            WebAssembly.instantiate(bytes.buffer as ArrayBuffer)
+            WebAssembly.instantiate(wasmBufferSource)
                 .then((result) => {
-                    bindWasmInstance(result.instance);
+                    const instance =
+                        "instance" in result
+                            ? (result as { instance: WebAssembly.Instance }).instance
+                            : (result as WebAssembly.Instance);
+                    bindWasmInstance(instance);
                 })
                 .catch((error) => {
                     console.warn("[LiquidGlass] WASM async instantiation failed:", error);
@@ -253,6 +267,13 @@ export function getWasmDisplacementBmp(
     }
     if (!wasmReady || !wasmExports || !wasmBmpU8View || !wasmF32View) {
         return null;
+    }
+
+    if (wasmF32View.buffer.byteLength === 0 || wasmBmpU8View.buffer.byteLength === 0) {
+        const bmpOffset =
+            typeof wasmExports.getBmpOffset === "function" ? wasmExports.getBmpOffset() : 0x14c00;
+        wasmF32View = new Float32Array(wasmExports.memory.buffer);
+        wasmBmpU8View = new Uint8Array(wasmExports.memory.buffer, bmpOffset);
     }
 
     let surfaceId = 0;
@@ -287,6 +308,13 @@ export function getWasmDisplacementBmp(
         flags,
     );
 
+    if (wasmBmpU8View.buffer.byteLength === 0 || wasmF32View.buffer.byteLength === 0) {
+        const bmpOffset =
+            typeof wasmExports.getBmpOffset === "function" ? wasmExports.getBmpOffset() : 0x14c00;
+        wasmF32View = new Float32Array(wasmExports.memory.buffer);
+        wasmBmpU8View = new Uint8Array(wasmExports.memory.buffer, bmpOffset);
+    }
+
     const bmpView = wasmBmpU8View.subarray(0, bmpByteLength);
     const blob = new Blob([bmpView as Uint8Array<ArrayBuffer>], { type: "image/bmp" });
     const maxDisplacement = wasmF32View[wasmMaxDisplacementOffset >> 2] || 1.0;
@@ -313,6 +341,16 @@ export function revokeBlobUrlSafely(url: string | null | undefined): void {
     if (typeof URL !== "undefined" && typeof URL.revokeObjectURL === "function") {
         URL.revokeObjectURL(url);
     }
+}
+
+export function resetWasmModuleForTesting(): void {
+    wasmExports = null;
+    wasmF32View = null;
+    wasmBmpU8View = null;
+    wasmReady = false;
+    wasmInitAttempted = false;
+    wasmReadyCallbacks.length = 0;
+    clearDisplacementCache();
 }
 
 if (typeof window !== "undefined") {

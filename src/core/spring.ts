@@ -52,6 +52,10 @@ export function stepSpring(
     dtSeconds: number,
     params: DampedSpringParams,
 ): SpringStepResult {
+    if (!Number.isFinite(value) || !Number.isFinite(velocity) || !Number.isFinite(target)) {
+        return { value: Number.isFinite(target) ? target : 0, velocity: 0, settled: true };
+    }
+    const safeDt = Number.isFinite(dtSeconds) && dtSeconds > 0 ? dtSeconds : 0.016;
     const {
         stiffness,
         gamma,
@@ -59,7 +63,7 @@ export function stepSpring(
         settleVelocity = SETTLE_VELOCITY,
     } = params;
     const offset = value - target;
-    const decay = Math.exp(-gamma * dtSeconds);
+    const decay = Math.exp(-gamma * safeDt);
     const discriminant = stiffness - gamma * gamma;
 
     let nextOffset: number;
@@ -68,7 +72,7 @@ export function stepSpring(
     if (discriminant > 1e-4) {
         const omegaD = Math.sqrt(discriminant);
         const invOmegaD = 1 / omegaD;
-        const phase = omegaD * dtSeconds;
+        const phase = omegaD * safeDt;
         const cosPhase = Math.cos(phase);
         const sinOverOmega = Math.sin(phase) * invOmegaD;
         nextOffset =
@@ -78,10 +82,10 @@ export function stepSpring(
             (velocity * (cosPhase - gamma * sinOverOmega) - stiffness * offset * sinOverOmega);
     } else {
         // Critically damped limit (omegaD -> 0) avoids division by zero when gamma^2 ~= stiffness.
-        nextOffset = decay * (offset * (1 + gamma * dtSeconds) + velocity * dtSeconds);
+        nextOffset = decay * (offset * (1 + gamma * safeDt) + velocity * safeDt);
         nextVelocity =
             decay *
-            (velocity * (1 - gamma * dtSeconds) - gamma * gamma * offset * dtSeconds);
+            (velocity * (1 - gamma * safeDt) - gamma * gamma * offset * safeDt);
     }
 
     const nextValue = target + nextOffset;
@@ -377,7 +381,11 @@ export function createInteractiveSpring(
             if (destroyed) return;
             destroyed = true;
             stopLoop();
-            onRest();
+            try {
+                onRest();
+            } catch {
+                // ignore
+            }
         },
     };
 }

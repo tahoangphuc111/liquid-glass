@@ -124,6 +124,7 @@ export function createLiquidGlass(
     let renderFrameId: number | null = null;
     let lastSceneBackdropKey = "";
     let listenersAttached = false;
+    let webglWindowListenersAttached = false;
     let isViewportVisible = true;
     let pendingVisibleRender = false;
     let unobserveVisibility: (() => void) | null = null;
@@ -199,10 +200,21 @@ export function createLiquidGlass(
 
     const computeSceneRect = () => {
         const source = sceneEl ?? options.sceneElement;
-        if (!source || !source.isConnected) return undefined;
+        const activeSceneCanvas = externalSceneCanvas ?? capturedSceneCanvas;
+        if (!source || !source.isConnected) {
+            if (activeSceneCanvas && activeSceneCanvas.width > 0 && activeSceneCanvas.height > 0) {
+                return { relX: 0, relY: 0, relW: 1, relH: 1 };
+            }
+            return undefined;
+        }
         const sourceRect = source.getBoundingClientRect();
         const elRect = element.getBoundingClientRect();
-        if (sourceRect.width < 2 || sourceRect.height < 2) return undefined;
+        if (sourceRect.width < 2 || sourceRect.height < 2) {
+            if (activeSceneCanvas && activeSceneCanvas.width > 0 && activeSceneCanvas.height > 0) {
+                return { relX: 0, relY: 0, relW: 1, relH: 1 };
+            }
+            return undefined;
+        }
         const width = element.offsetWidth || elRect.width;
         const height = element.offsetHeight || elRect.height;
         const elCenterX = (elRect.left + elRect.right) * 0.5;
@@ -294,6 +306,8 @@ export function createLiquidGlass(
         element.setAttribute("data-lg-webgl-scene", hasSceneTex ? "1" : "0");
         if (!hasSceneTex && config.coreFilter) {
             element.style.setProperty("--lg-filter", config.coreFilter);
+        } else {
+            element.style.removeProperty("--lg-filter");
         }
 
         webglRenderer.render({
@@ -385,7 +399,8 @@ export function createLiquidGlass(
             cancelAnimationFrame(scrollFrameId);
             scrollFrameId = null;
         }
-        if (typeof window !== "undefined") {
+        if (typeof window !== "undefined" && webglWindowListenersAttached) {
+            webglWindowListenersAttached = false;
             window.removeEventListener("scroll", onViewportScrollOrResize);
             window.removeEventListener("resize", onViewportScrollOrResize);
         }
@@ -545,7 +560,8 @@ export function createLiquidGlass(
             unobserveVisibility = observeElementVisibility(element, handleVisibilityChange);
         }
 
-        if (typeof window !== "undefined") {
+        if (typeof window !== "undefined" && !webglWindowListenersAttached) {
+            webglWindowListenersAttached = true;
             window.addEventListener("scroll", onViewportScrollOrResize, { passive: true });
             window.addEventListener("resize", onViewportScrollOrResize, { passive: true });
         }
@@ -590,6 +606,7 @@ export function createLiquidGlass(
 
     const onInteractivePointerDown = (event: PointerEvent) => {
         if (event.pointerType === "mouse" && event.button !== 0) return;
+        if (isPointerDragging || activeDragPointerId !== null) return;
         hasDraggedBeyondThreshold = false;
         springController?.press();
         const dragMode = resolveDragMode();
@@ -687,12 +704,24 @@ export function createLiquidGlass(
     };
 
     const onInteractivePointerUp = (event: PointerEvent) => {
+        if (activeDragPointerId !== null && event.pointerId !== activeDragPointerId) {
+            return;
+        }
         finishDragInteraction(event, false);
         springController?.release(true);
     };
 
     const onInteractivePointerCancel = (event: Event) => {
         if (isPointerDragging && event.type === "pointerleave") return;
+        const pointerEvent = event as PointerEvent;
+        if (
+            typeof pointerEvent.pointerId === "number" &&
+            activeDragPointerId !== null &&
+            pointerEvent.pointerId !== activeDragPointerId &&
+            event.type !== "blur"
+        ) {
+            return;
+        }
         finishDragInteraction(event, true);
         springController?.setTilt(0, 0);
         springController?.release(false);
@@ -730,6 +759,12 @@ export function createLiquidGlass(
             element.removeEventListener("keydown", onInteractiveKeyDown);
             element.removeEventListener("keyup", onInteractiveKeyUp);
             element.removeEventListener("blur", onInteractivePointerCancel);
+        }
+        if (activeDragPointerId !== null) {
+            try {
+                element.releasePointerCapture?.(activeDragPointerId);
+            } catch {
+            }
         }
         springController?.destroy();
         springController = null;
@@ -777,10 +812,8 @@ export function createLiquidGlass(
                         "--lg-stretch-matrix",
                         `matrix(${m11.toFixed(4)}, ${m12.toFixed(4)}, ${m21.toFixed(4)}, ${m22.toFixed(4)}, 0, 0)`,
                     );
-                    if (frame.dragX !== 0 || frame.dragY !== 0) {
-                        element.style.setProperty("--lg-drag-x", `${frame.dragX.toFixed(2)}px`);
-                        element.style.setProperty("--lg-drag-y", `${frame.dragY.toFixed(2)}px`);
-                    }
+                    element.style.setProperty("--lg-drag-x", `${frame.dragX.toFixed(2)}px`);
+                    element.style.setProperty("--lg-drag-y", `${frame.dragY.toFixed(2)}px`);
                     element.style.setProperty("--lg-press-glow", frame.glow.toFixed(3));
                     const prevGlow = pressGlow;
                     const prevTiltH = lightTiltHorizontal;
@@ -953,6 +986,9 @@ export function createLiquidGlass(
         },
         refresh() {
             if (destroyed) return;
+            cachedRadiusStr = null;
+            const existingState = elementStateMap.get(element);
+            if (existingState) existingState.cachedRadiusStr = null;
             const targetEngine = resolveGlassEngine(options.engine ?? "auto", hasSceneInput());
             if (targetEngine !== activeEngine) {
                 if (targetEngine === "webgl" && activeEngine === "css" && isWebglSlotOnStandby(webglPoolEntry)) {
@@ -970,9 +1006,6 @@ export function createLiquidGlass(
                 syncCoalescenceState(0, true);
                 scheduleWebglRender();
             } else if (activeEngine === "wasm-svg") {
-                cachedRadiusStr = null;
-                const existingState = elementStateMap.get(element);
-                if (existingState) existingState.cachedRadiusStr = null;
                 registerManagedElement(element, config);
                 syncCoalescenceState(0, true);
                 applyCoalescenceVisuals();
@@ -996,6 +1029,11 @@ export function createLiquidGlass(
                 localSceneCapture = null;
                 capturedSceneCanvas = null;
             }
+            const targetEngine = resolveGlassEngine(options.engine ?? "auto", hasSceneInput());
+            if (targetEngine !== activeEngine) {
+                applyEngine();
+                return;
+            }
             if (activeEngine === "webgl" && webglRenderer) {
                 if (!canvas && (sceneEl || options.sceneElement)) {
                     mountWebgl();
@@ -1003,7 +1041,7 @@ export function createLiquidGlass(
                     webglRenderer.setSceneCanvas(canvas);
                     scheduleWebglRender();
                 }
-            } else if ((options.engine ?? "auto") === "auto") {
+            } else {
                 applyEngine();
             }
         },

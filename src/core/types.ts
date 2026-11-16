@@ -73,6 +73,7 @@ export interface LiquidGlassSwitchInstance extends LiquidGlassInstance {
     readonly activeIndex: number;
     setValue(value: string, animate?: boolean): void;
     setActiveIndex(index: number, animate?: boolean): void;
+    update(options: Partial<LiquidGlassSwitchOptions>): void;
 }
 
 export interface LiquidGlassStats {

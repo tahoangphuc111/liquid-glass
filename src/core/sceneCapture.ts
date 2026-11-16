@@ -1446,7 +1446,11 @@ export function createSceneCaptureController(
                 cancelAnimationFrame(captureFrame);
                 captureFrame = null;
             }
-            captureCanvas = null;
+            if (captureCanvas) {
+                captureCanvas.width = 0;
+                captureCanvas.height = 0;
+                captureCanvas = null;
+            }
         },
     };
 }

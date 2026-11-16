@@ -132,6 +132,9 @@ export function resetArchetypeHotSlots(): void {
     lastArchVal2 = null;
 }
 
+const getNowMs = (): number =>
+    typeof performance !== "undefined" ? performance.now() : Date.now();
+
 export function scheduleLruEviction(delay = LRU_IDLE_EVICT_MS): void {
     if (lruEvictionTimer !== null) return;
     lruEvictionTimer = setTimeout(processLruEviction, delay);
@@ -146,7 +149,7 @@ export function clearLruEvictionTimer(): void {
 
 export function processLruEviction(): void {
     lruEvictionTimer = null;
-    const now = performance.now();
+    const now = getNowMs();
     let nextDelay = LRU_IDLE_EVICT_MS;
     for (const key of lruUnusedFilterKeys) {
         const record = sharedFilters.get(key);
@@ -424,7 +427,7 @@ export function acquireSharedFilter(
         svgDefs,
     } = options;
 
-    const now = performance.now();
+    const now = getNowMs();
 
     const existingRecord = sharedFilters.get(sharedKey);
     if (existingRecord !== undefined) {
@@ -796,7 +799,7 @@ export function releaseSharedFilter(
     record.refCount--;
     if (record.refCount <= 0) {
         record.refCount = 0;
-        record.lastUsed = performance.now();
+        record.lastUsed = getNowMs();
         lruUnusedFilterKeys.delete(key);
         lruUnusedFilterKeys.add(key);
         while (lruUnusedFilterKeys.size > MAX_LRU_FILTERS) {

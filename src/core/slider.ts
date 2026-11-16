@@ -45,12 +45,13 @@ const BOUNCE_SPRING: DampedSpringParams = {
 const DRAG_THRESHOLD_PX = 3;
 
 function computeRangeProgress(input: HTMLInputElement): number {
-    const min = input.min !== "" ? Number(input.min) : 0;
-    const max = input.max !== "" ? Number(input.max) : 100;
-    const value = input.value !== "" ? Number(input.value) : min;
+    const min = input.min !== "" && Number.isFinite(Number(input.min)) ? Number(input.min) : 0;
+    const max = input.max !== "" && Number.isFinite(Number(input.max)) ? Number(input.max) : 100;
+    const value = input.value !== "" && Number.isFinite(Number(input.value)) ? Number(input.value) : min;
     const span = max - min;
     if (!Number.isFinite(span) || span <= 0) return 0;
-    return Math.min(1, Math.max(0, (value - min) / span));
+    const progress = (value - min) / span;
+    return Number.isFinite(progress) ? Math.min(1, Math.max(0, progress)) : 0;
 }
 
 export function createGlassSlider(
@@ -132,6 +133,7 @@ export function createGlassSlider(
     let isPressed = false;
     let hasPointerDragged = false;
     let pointerDownX: number | null = null;
+    let activePointerId: number | null = null;
     let bouncePos = 0;
     let bounceVel = 0;
     let lastBounceEdge: -1 | 0 | 1 = 0;
@@ -387,6 +389,10 @@ export function createGlassSlider(
 
     const onPointerDown = (event: PointerEvent): void => {
         if ("pointerType" in event && event.pointerType === "mouse" && event.button !== 0) return;
+        if (activePointerId !== null) return;
+        if ("pointerId" in event && typeof event.pointerId === "number") {
+            activePointerId = event.pointerId;
+        }
         isPressed = true;
         hasPointerDragged = false;
         pointerDownX = "clientX" in event && typeof event.clientX === "number" ? event.clientX : null;
@@ -399,6 +405,9 @@ export function createGlassSlider(
 
     const onPointerMove = (event: PointerEvent): void => {
         if (!isPressed) return;
+        if (activePointerId !== null && "pointerId" in event && event.pointerId !== activePointerId) {
+            return;
+        }
         const clientX = "clientX" in event && typeof event.clientX === "number" ? event.clientX : null;
         if (clientX === null) return;
         if (pointerDownX !== null && Math.abs(clientX - pointerDownX) > DRAG_THRESHOLD_PX) {
@@ -415,7 +424,18 @@ export function createGlassSlider(
         }
     };
 
-    const onPointerUp = (): void => {
+    const onPointerUp = (event?: Event): void => {
+        if (event && "pointerId" in event) {
+            const pointerEvent = event as PointerEvent;
+            if (
+                typeof pointerEvent.pointerId === "number" &&
+                activePointerId !== null &&
+                pointerEvent.pointerId !== activePointerId
+            ) {
+                return;
+            }
+        }
+        activePointerId = null;
         if (!isPressed && !wrapper.classList.contains("is-active")) return;
         const wasPressed = isPressed;
         isPressed = false;
@@ -449,9 +469,13 @@ export function createGlassSlider(
     input.addEventListener("change", onInput);
     input.addEventListener("pointerdown", onPointerDown);
     input.addEventListener("pointermove", onPointerMove);
-    window.addEventListener("pointerup", onPointerUp);
-    window.addEventListener("pointercancel", onPointerUp);
-    window.addEventListener("scroll", scheduleThumbRefresh, { passive: true });
+    if (typeof window !== "undefined") {
+        window.addEventListener("pointermove", onPointerMove);
+        window.addEventListener("pointerup", onPointerUp);
+        window.addEventListener("pointercancel", onPointerUp);
+        window.addEventListener("blur", onPointerUp);
+        window.addEventListener("scroll", scheduleThumbRefresh, { passive: true });
+    }
 
     return {
         get element() {
@@ -528,9 +552,14 @@ export function createGlassSlider(
             input.removeEventListener("change", onInput);
             input.removeEventListener("pointerdown", onPointerDown);
             input.removeEventListener("pointermove", onPointerMove);
-            window.removeEventListener("pointerup", onPointerUp);
-            window.removeEventListener("pointercancel", onPointerUp);
-            window.removeEventListener("scroll", scheduleThumbRefresh);
+            activePointerId = null;
+            if (typeof window !== "undefined") {
+                window.removeEventListener("pointermove", onPointerMove);
+                window.removeEventListener("pointerup", onPointerUp);
+                window.removeEventListener("pointercancel", onPointerUp);
+                window.removeEventListener("blur", onPointerUp);
+                window.removeEventListener("scroll", scheduleThumbRefresh);
+            }
 
             thumbGlass.destroy();
             thumb.style.removeProperty("--lg-press-glow");
@@ -543,6 +572,8 @@ export function createGlassSlider(
                     wrapper.parentNode.insertBefore(input, wrapper);
                 }
                 wrapper.remove();
+            } else if (input.parentElement === wrapper) {
+                wrapper.removeChild(input);
             }
         },
     };

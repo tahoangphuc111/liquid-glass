@@ -336,4 +336,38 @@ describe("360 droplet button drag and liquid coalescence", () => {
 
         renderer!.dispose();
     });
+
+    it("notifies surviving peers on unregister when any peer had active coalescence", () => {
+        const elA = document.createElement("div");
+        const elB = document.createElement("div");
+
+        const notifyA = vi.fn();
+        const notifyB = vi.fn();
+
+        const unregisterA = registerCoalescenceParticipant({
+            element: elA,
+            notifyPeerUpdate: notifyA,
+            readBounds: () => ({ left: 0, top: 0, width: 100, height: 50, radius: 20, bezel: 14 }),
+        });
+
+        const unregisterB = registerCoalescenceParticipant({
+            element: elB,
+            notifyPeerUpdate: notifyB,
+            readBounds: () => ({ left: 110, top: 0, width: 100, height: 50, radius: 20, bezel: 14 }),
+        });
+
+        syncCoalescenceGeometry(elA, 0, 0, 100, 50, 20, 14, 0, true);
+        syncCoalescenceGeometry(elB, 110, 0, 100, 50, 20, 14, 0, true);
+
+        // B collects snapshot and sees A
+        const snapB = collectCoalescenceSnapshot(elB);
+        expect(snapB.peers.length).toBe(1);
+
+        notifyB.mockClear();
+        // Unregister A - B must be notified to clear ghost blend
+        unregisterA();
+        expect(notifyB).toHaveBeenCalled();
+
+        unregisterB();
+    });
 });

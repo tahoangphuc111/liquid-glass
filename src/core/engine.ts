@@ -994,7 +994,7 @@ export function scheduleRebuildLiquidGlass(entries?: ResizeObserverEntry[] | Eve
 
     if (dirtyElements.size === 0) return;
 
-    const now = performance.now();
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now();
     if (resizeLiquidTimer !== null) clearTimeout(resizeLiquidTimer);
 
     if (now - resizeLastScheduleTime > 250) {
@@ -1002,7 +1002,7 @@ export function scheduleRebuildLiquidGlass(entries?: ResizeObserverEntry[] | Eve
         requestAnimationFrame(() => void flushDirtyElements());
     } else {
         resizeLiquidTimer = setTimeout(() => {
-            resizeLastScheduleTime = performance.now();
+            resizeLastScheduleTime = typeof performance !== "undefined" ? performance.now() : Date.now();
             requestAnimationFrame(() => void flushDirtyElements());
         }, 120);
     }

@@ -24,7 +24,8 @@ export function evaluateOpticalProfile(depth: number, surface: GlassSurface, ior
     const denom = 1 + depth * (0.725 + 0.21 * depth);
     const tilt = mask / (denom * denom);
     const xy = Math.min(0.98, Math.max(0, tilt * (0.50 + 0.50 * Math.min(2, slope))));
-    const eta = 1 / Math.max(1.01, ior);
+    const safeIor = Number.isFinite(ior) ? Math.max(1.01, ior) : 1.49;
+    const eta = 1 / safeIor;
     const displacement = (1 - eta * eta) * tilt / (1 + eta * Math.sqrt(1 + slope * slope));
     return [xy, displacement];
 }
@@ -33,7 +34,8 @@ export function buildOpticalLut(surface: GlassSurface, ior: number, size = OPTIC
     if (!Number.isInteger(size) || size < 2) {
         throw new RangeError("Optical LUT size must be an integer of at least 2");
     }
-    const key = `${surface}:${Math.max(1.01, ior)}:${size}`;
+    const safeIor = Number.isFinite(ior) ? Math.max(1.01, ior) : 1.49;
+    const key = `${surface}:${safeIor.toFixed(3)}:${size}`;
     const cached = opticalLutCache.get(key);
     if (cached) {
         opticalLutCache.delete(key);
@@ -42,7 +44,7 @@ export function buildOpticalLut(surface: GlassSurface, ior: number, size = OPTIC
     }
     const data = new Uint8Array(size * 4);
     for (let index = 0; index < size; index++) {
-        const [xy, displacement] = evaluateOpticalProfile(index / (size - 1), surface, ior);
+        const [xy, displacement] = evaluateOpticalProfile(index / (size - 1), surface, safeIor);
         const normal = Math.round(xy * 65535);
         const offset = Math.round(displacement * 65535);
         data[index * 4] = normal >>> 8;
@@ -55,4 +57,8 @@ export function buildOpticalLut(surface: GlassSurface, ior: number, size = OPTIC
     }
     opticalLutCache.set(key, data);
     return data;
+}
+
+export function resetOpticalLutCacheForTesting(): void {
+    opticalLutCache.clear();
 }

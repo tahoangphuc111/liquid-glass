@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createRef, type ReactNode } from "react";
 import { renderToString } from "react-dom/server";
 import {
@@ -32,6 +32,10 @@ describe("Next.js bindings (@tahoangphuc111/liquid-glass/next)", () => {
             "playlists",
         );
         expect(resolveSwitchValueForPathname(items, "/unknown")).toBeUndefined();
+
+        // Edge case: full URL, query string, hash fragment, relative paths, trailing slashes
+        expect(resolveSwitchValueForPathname(items, "https://example.com/search/?ref=header#top")).toBe("search");
+        expect(resolveSwitchValueForPathname(items, "http://localhost:3000/library/playlists/")).toBe("playlists");
     });
 
     it("renders SSR HTML cleanly without browser globals mismatch", () => {
@@ -141,10 +145,34 @@ describe("Next.js bindings (@tahoangphuc111/liquid-glass/next)", () => {
 
         expect(libraryTab.classList.contains("active")).toBe(true);
 
-        fireEvent.click(homeTab, {
-            preventDefault() {},
-        });
+        homeTab.addEventListener("click", (event) => event.preventDefault());
+        fireEvent.click(homeTab);
         expect(handleChange).toHaveBeenCalledTimes(1);
         expect(handleChange.mock.calls[0]?.[0]).toBe("home");
+    });
+
+    it("syncs route on client-side history.pushState when pathname prop is omitted", async () => {
+        window.history.replaceState(null, "", "/home");
+
+        const items = [
+            { value: "home", href: "/home", label: "Home" },
+            { value: "about", href: "/about", label: "About" },
+        ];
+
+        render(
+            <LiquidGlassSwitch
+                engine="css"
+                items={items}
+            />,
+        );
+
+        const homeTab = screen.getByRole("tab", { name: "Home" });
+        expect(homeTab.classList.contains("active")).toBe(true);
+
+        window.history.pushState(null, "", "/about");
+        const aboutTab = screen.getByRole("tab", { name: "About" });
+        await waitFor(() => {
+            expect(aboutTab.classList.contains("active")).toBe(true);
+        });
     });
 });

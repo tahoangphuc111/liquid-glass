@@ -353,4 +353,14 @@ describe("sceneCapture upgrades and visibility gating", () => {
 
         glass.destroy();
     });
+
+    it("zeroes capture canvas dimensions on destroy to free GPU memory", () => {
+        const sceneEl = document.createElement("div");
+        document.body.appendChild(sceneEl);
+        setRect(sceneEl, 200, 200);
+
+        const controller = createSceneCaptureController(sceneEl);
+        controller.destroy();
+        expect(controller.canvas).toBeNull();
+    });
 });

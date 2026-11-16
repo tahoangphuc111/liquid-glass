@@ -20,6 +20,7 @@ export function setTierChangeCallback(
 }
 
 export function scheduleQualityRecovery(): void {
+    if (isGlassDowngraded) return;
     if (typeof requestIdleCallback !== "function") return;
     if (idleTimer !== null) {
         if (typeof cancelIdleCallback === "function") {
@@ -30,6 +31,7 @@ export function scheduleQualityRecovery(): void {
     idleTimer = requestIdleCallback(
         (deadline) => {
             idleTimer = null;
+            if (isGlassDowngraded) return;
             if (deadline.timeRemaining() > 40 && !deadline.didTimeout) {
                 if (qualityTier > 0) {
                     applyQualityTier(0);
@@ -61,7 +63,8 @@ export function recordJankFrame(timestamp: number): void {
 
     let recent = 0;
     for (let i = 0; i < jankCount; i++) {
-        if (timestamp - jankTimestamps[i] <= JANK_WINDOW_MS) {
+        const diff = timestamp - jankTimestamps[i];
+        if (diff >= 0 && diff <= JANK_WINDOW_MS) {
             recent++;
         }
     }

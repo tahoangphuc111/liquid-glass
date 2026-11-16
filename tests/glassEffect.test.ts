@@ -169,7 +169,162 @@ describe("glassEffect helper and HTMLElement prototype method", () => {
         expect(items[1]!.classList.contains("active")).toBe(true);
         expect(items[1]!.style.getPropertyValue("--lg-switch-coverage")).toBe("1.000");
 
+        expect(instance.value).toBe("search");
+        expect(instance.activeIndex).toBe(1);
+        instance.setValue("home", false);
+        expect(instance.value).toBe("home");
+        expect(instance.activeIndex).toBe(0);
+        instance.setActiveIndex(1, false);
+        expect(instance.value).toBe("search");
+        expect(instance.activeIndex).toBe(1);
+
         instance.destroy();
         expect(nav.querySelector(".lg-switch-glider")).toBeNull();
+    });
+
+    it("detects switch container via defaultValue option even without .lg-switch class", () => {
+        document.body.innerHTML = `
+            <nav id="plain-nav">
+                <button type="button" data-switch-value="one">One</button>
+                <button type="button" data-switch-value="two">Two</button>
+            </nav>
+        `;
+        const plainNav = document.getElementById("plain-nav") as HTMLElement;
+        const instance = plainNav.glassEffect({
+            engine: "css",
+            defaultValue: "two",
+        });
+
+        expect(plainNav.classList.contains("lg-switch")).toBe(true);
+        expect(plainNav.querySelector(".lg-switch-glider")).not.toBeNull();
+        expect(instance.value).toBe("two");
+        expect(instance.activeIndex).toBe(1);
+
+        instance.destroy();
+    });
+
+    it("creates a slider from range input and isolates primary pointer from secondary touches", () => {
+        const input = document.createElement("input");
+        input.type = "range";
+        input.min = "0";
+        input.max = "100";
+        input.value = "50";
+        document.body.appendChild(input);
+
+        const instance = glassEffect(input, { engine: "css" });
+        const wrapper = input.parentElement as HTMLElement;
+        expect(wrapper.classList.contains("lg-slider")).toBe(true);
+
+        // Pointer 1 down
+        const pDown1 = new MouseEvent("pointerdown", { bubbles: true, clientX: 50 });
+        Object.defineProperty(pDown1, "pointerId", { value: 1 });
+        Object.defineProperty(pDown1, "pointerType", { value: "touch" });
+        input.dispatchEvent(pDown1);
+        expect(wrapper.classList.contains("is-active")).toBe(true);
+
+        // Secondary pointer down should be ignored
+        const pDown2 = new MouseEvent("pointerdown", { bubbles: true, clientX: 90 });
+        Object.defineProperty(pDown2, "pointerId", { value: 2 });
+        Object.defineProperty(pDown2, "pointerType", { value: "touch" });
+        input.dispatchEvent(pDown2);
+
+        // Secondary pointer up should not release the active slider
+        const pUp2 = new MouseEvent("pointerup", { bubbles: true, clientX: 90 });
+        Object.defineProperty(pUp2, "pointerId", { value: 2 });
+        Object.defineProperty(pUp2, "pointerType", { value: "touch" });
+        window.dispatchEvent(pUp2);
+        expect(wrapper.classList.contains("is-active")).toBe(true);
+
+        // Primary pointer up releases the active slider
+        const pUp1 = new MouseEvent("pointerup", { bubbles: true, clientX: 50 });
+        Object.defineProperty(pUp1, "pointerId", { value: 1 });
+        Object.defineProperty(pUp1, "pointerType", { value: "touch" });
+        window.dispatchEvent(pUp1);
+        expect(wrapper.classList.contains("is-active")).toBe(false);
+
+        instance.destroy();
+        expect(document.querySelector(".lg-slider")).toBeNull();
+    });
+
+    it("returns pure LiquidGlassInstance for regular elements without pseudo switch properties", () => {
+        const button = document.createElement("button");
+        document.body.appendChild(button);
+
+        const instance = glassEffect(button, { engine: "css" });
+        expect("setValue" in instance).toBe(false);
+        expect("activeIndex" in instance).toBe(false);
+
+        instance.destroy();
+    });
+
+    it("resets slider active drag state when window receives blur event", () => {
+        const input = document.createElement("input");
+        input.type = "range";
+        document.body.appendChild(input);
+
+        const instance = glassEffect(input, { engine: "css" });
+        const wrapper = input.parentElement as HTMLElement;
+
+        const pDown = new MouseEvent("pointerdown", { bubbles: true, clientX: 20 });
+        Object.defineProperty(pDown, "pointerId", { value: 5 });
+        input.dispatchEvent(pDown);
+        expect(wrapper.classList.contains("is-active")).toBe(true);
+
+        window.dispatchEvent(new Event("blur"));
+        expect(wrapper.classList.contains("is-active")).toBe(false);
+
+        instance.destroy();
+    });
+
+    it("safely unparents input when wrapper is already disconnected on destroy", () => {
+        const input = document.createElement("input");
+        input.type = "range";
+        document.body.appendChild(input);
+
+        const instance = glassEffect(input, { engine: "css" });
+        const wrapper = input.parentElement as HTMLElement;
+        expect(wrapper.classList.contains("lg-slider")).toBe(true);
+
+        // Simulate external DOM framework disconnecting wrapper first
+        wrapper.remove();
+        expect(wrapper.parentNode).toBeNull();
+        expect(input.parentElement).toBe(wrapper);
+
+        instance.destroy();
+        expect(input.parentElement).toBeNull();
+    });
+
+    it("tracks pointermove on window during active drag and guards against NaN progress", () => {
+        const input = document.createElement("input");
+        input.type = "range";
+        input.min = "0";
+        input.max = "100";
+        input.value = "invalid";
+        document.body.appendChild(input);
+
+        const instance = glassEffect(input, { engine: "css" });
+        const wrapper = input.parentElement as HTMLElement;
+
+        // computeRangeProgress should not produce NaN
+        const progressVal = wrapper.style.getPropertyValue("--lg-slider-progress");
+        expect(progressVal).not.toBe("NaN");
+
+        // Pointer down to begin drag
+        const pDown = new MouseEvent("pointerdown", { bubbles: true, clientX: 50 });
+        Object.defineProperty(pDown, "pointerId", { value: 11 });
+        Object.defineProperty(pDown, "pointerType", { value: "touch" });
+        input.dispatchEvent(pDown);
+        expect(wrapper.classList.contains("is-active")).toBe(true);
+
+        // Window pointer move past threshold
+        const pMove = new MouseEvent("pointermove", { bubbles: true, clientX: 200 });
+        Object.defineProperty(pMove, "pointerId", { value: 11 });
+        window.dispatchEvent(pMove);
+        expect(wrapper.classList.contains("is-active")).toBe(true);
+
+        window.dispatchEvent(new Event("blur"));
+        expect(wrapper.classList.contains("is-active")).toBe(false);
+
+        instance.destroy();
     });
 });

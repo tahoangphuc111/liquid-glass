@@ -136,6 +136,8 @@ const LiquidGlassSwitchImpl = forwardRef<
                               className="lg-switch-item"
                               data-switch-value={item.value}
                               role="tab"
+                              aria-disabled={item.disabled ? "true" : undefined}
+                              tabIndex={item.disabled ? -1 : undefined}
                               aria-label={item.ariaLabel}
                           >
                               {item.icon}
@@ -149,6 +151,8 @@ const LiquidGlassSwitchImpl = forwardRef<
                               data-switch-value={item.value}
                               role="tab"
                               disabled={item.disabled}
+                              aria-disabled={item.disabled ? "true" : undefined}
+                              tabIndex={item.disabled ? -1 : undefined}
                               aria-label={item.ariaLabel}
                           >
                               {item.icon}

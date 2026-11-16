@@ -57,6 +57,11 @@ export function getMediaQueries() {
 
 let isBatteryLow = false;
 let batteryListenerAttached = false;
+let activeBatteryManager: {
+    addEventListener(type: string, listener: () => void): void;
+    removeEventListener?(type: string, listener: () => void): void;
+} | null = null;
+let activeBatteryListener: (() => void) | null = null;
 let onBatteryChange: (() => void) | null = null;
 
 export function setBatteryRefreshCallback(callback: (() => void) | null): void {
@@ -72,6 +77,8 @@ function attachBatteryListener(): void {
     nav
         .getBattery()
         .then((battery) => {
+            if (!batteryListenerAttached) return;
+            activeBatteryManager = battery;
             const updateBattery = () => {
                 const wasLow = isBatteryLow;
                 isBatteryLow = battery.level <= 0.2 && !battery.charging;
@@ -79,11 +86,13 @@ function attachBatteryListener(): void {
                     onBatteryChange?.();
                 }
             };
+            activeBatteryListener = updateBattery;
             updateBattery();
             battery.addEventListener("levelchange", updateBattery);
             battery.addEventListener("chargingchange", updateBattery);
         })
         .catch(() => {
+            batteryListenerAttached = false;
         });
 }
 
@@ -185,5 +194,27 @@ export function detachGlobalListeners(): void {
     window.removeEventListener("focus", notifyUserActivity);
     window.removeEventListener("blur", onBlur);
     window.removeEventListener("resize", onResize);
+
+    if (activeBatteryManager && activeBatteryListener) {
+        activeBatteryManager.removeEventListener?.("levelchange", activeBatteryListener);
+        activeBatteryManager.removeEventListener?.("chargingchange", activeBatteryListener);
+        activeBatteryManager = null;
+        activeBatteryListener = null;
+    }
+    batteryListenerAttached = false;
+
     disconnectLoafTelemetry();
+}
+
+export function resetObserverForTesting(): void {
+    detachGlobalListeners();
+    reducedMotionQuery = null;
+    mobileOrTouchQuery = null;
+    reducedTransparencyQuery = null;
+    highContrastQuery = null;
+    isBatteryLow = false;
+    onBatteryChange = null;
+    onDprResize = null;
+    isDocumentIdle = false;
+    lastActivityTick = 0;
 }

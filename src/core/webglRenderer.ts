@@ -742,12 +742,16 @@ export function parseCssColorToRgb(colorStr = "#ffffff"): [number, number, numbe
             ];
         }
     }
-    const rgbMatch = trimmed.match(/rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i);
+    const rgbMatch = trimmed.match(/rgba?\(\s*([\d.]+%?)[,\s]+([\d.]+%?)[,\s]+([\d.]+%?)/i);
     if (rgbMatch) {
+        const parseChannel = (channelStr: string) =>
+            channelStr.endsWith("%")
+                ? Math.min(1, Math.max(0, parseFloat(channelStr) / 100))
+                : Math.min(1, Math.max(0, parseFloat(channelStr) / 255));
         return [
-            Math.min(1, Math.max(0, Number(rgbMatch[1]) / 255)),
-            Math.min(1, Math.max(0, Number(rgbMatch[2]) / 255)),
-            Math.min(1, Math.max(0, Number(rgbMatch[3]) / 255)),
+            parseChannel(rgbMatch[1]!),
+            parseChannel(rgbMatch[2]!),
+            parseChannel(rgbMatch[3]!),
         ];
     }
     return [1, 1, 1];
@@ -860,10 +864,10 @@ export class GlassWebglRenderer {
     private lastBlurOffset2X = Number.NaN;
     private lastBlurOffset2Y = Number.NaN;
     private lastDirectBlurClamp = -1;
-    private lastLightTiltHorizontal = 0;
-    private lastLightTiltVertical = 0;
+    private lastLightTiltHorizontal = Number.NaN;
+    private lastLightTiltVertical = Number.NaN;
     private lastBleedPx = -1;
-    private lastPeerCount = 0;
+    private lastPeerCount = -1;
     private readonly peerBoundsBuffer = new Float32Array(16);
     private readonly peerPropsBuffer = new Float32Array(16);
     private disposed = false;
@@ -1012,7 +1016,7 @@ export class GlassWebglRenderer {
             this.hasSceneTextureData = false;
             return;
         }
-        if (!sourceCanvas || sourceCanvas.width === 0 || sourceCanvas.height === 0) {
+        if (!sourceCanvas || sourceCanvas.width <= 0 || sourceCanvas.height <= 0) {
             this.hasSceneTextureData = false;
             return;
         }
@@ -1554,7 +1558,11 @@ export class GlassWebglRenderer {
             this.blurDownsampleProgram = null;
         }
         this.boundSceneTexture = null;
-        this.uploadCanvas = null;
+        if (this.uploadCanvas) {
+            this.uploadCanvas.width = 0;
+            this.uploadCanvas.height = 0;
+            this.uploadCanvas = null;
+        }
         this.transferCache?.dispose();
         this.transferCache = null;
         this.gl.deleteTexture(this.opticalTexture);

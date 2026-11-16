@@ -5,6 +5,13 @@ import {
     createSceneCaptureController,
     resolveCaptureDimensions,
 } from "../src/core/sceneCapture.js";
+import {
+    buildOpticalLut,
+    evaluateOpticalProfile,
+    OPTICAL_LUT_SIZE,
+    resetOpticalLutCacheForTesting,
+} from "../src/core/optics.js";
+import { resetOpticalTransferForTesting } from "../src/core/opticalTransfer.js";
 import { GlassWebglRenderer, resolveWebglPixelRatio } from "../src/core/webglRenderer.js";
 
 function createMockWebglContext(options?: {
@@ -590,5 +597,20 @@ describe("WebGL high-DPI pixel resolution and scene capture scaling", () => {
         });
         expect((gl.drawArrays as ReturnType<typeof vi.fn>).mock.calls.length).toBe(drawCallsBeforeLost);
         renderer.dispose();
+    });
+
+    it("builds and caches optical lookup tables and guards parameters", () => {
+        const lut = buildOpticalLut("convex_squircle", 1.5);
+        expect(lut.length).toBe(OPTICAL_LUT_SIZE * 4);
+        expect(buildOpticalLut("convex_squircle", 1.5)).toBe(lut);
+        expect(buildOpticalLut("convex_squircle", NaN).length).toBe(OPTICAL_LUT_SIZE * 4);
+        expect(() => buildOpticalLut("linear", 1.5, -1)).toThrow(RangeError);
+
+        const profile = evaluateOpticalProfile(0.5, "convex_circle", 1.5);
+        expect(Number.isFinite(profile[0])).toBe(true);
+        expect(Number.isFinite(profile[1])).toBe(true);
+
+        expect(() => resetOpticalLutCacheForTesting()).not.toThrow();
+        expect(() => resetOpticalTransferForTesting()).not.toThrow();
     });
 });

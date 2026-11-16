@@ -145,13 +145,10 @@ function computeMidpointDetent(rawPos: number, anchors: SwitchItemAnchor[]): num
 
     const normSegment = (rawPos - segmentStart) / segmentSpan;
     if (normSegment > 0.35 && normSegment < 0.65) {
-        const offsetFromMid = normSegment - 0.5;
-        const offsetSquared = offsetFromMid * offsetFromMid;
-        return (
-            rawPos +
-            offsetFromMid *
-                (6.283185307 - offsetSquared * (10.33542556 - 5.1003304 * offsetSquared))
-        );
+        const x = (normSegment - 0.5) / 0.15;
+        const oneMinusX2 = 1 - x * x;
+        const deflection = segmentSpan * 0.05 * (oneMinusX2 * oneMinusX2) * x;
+        return rawPos + deflection;
     }
 
     return rawPos;
@@ -183,21 +180,45 @@ function interpolateGliderWidth(posPx: number, anchors: SwitchItemAnchor[]): num
     return lastAnchor.width;
 }
 
-function findClosestAnchorIndex(posPx: number, anchors: SwitchItemAnchor[]): number {
+function isItemDisabled(el?: HTMLElement | null): boolean {
+    if (!el) return false;
+    return (
+        el.hasAttribute("disabled") ||
+        (el as HTMLButtonElement).disabled === true ||
+        el.getAttribute("aria-disabled") === "true" ||
+        el.classList.contains("disabled") ||
+        el.classList.contains("is-disabled")
+    );
+}
+
+function findClosestAnchorIndex(posPx: number, anchors: SwitchItemAnchor[], fallbackIndex = 0): number {
     if (anchors.length <= 1) {
-        return 0;
+        if (anchors.length === 1 && !isItemDisabled(anchors[0]!.element)) {
+            return 0;
+        }
+        return fallbackIndex;
     }
 
-    let bestIndex = 0;
-    let bestDistance = Math.abs(anchors[0]!.left - posPx);
-    for (let idx = 1; idx < anchors.length; idx += 1) {
+    let bestIndex = -1;
+    let bestDistance = Infinity;
+    for (let idx = 0; idx < anchors.length; idx += 1) {
+        if (isItemDisabled(anchors[idx]!.element)) {
+            continue;
+        }
         const distance = Math.abs(anchors[idx]!.left - posPx);
         if (distance < bestDistance) {
             bestDistance = distance;
             bestIndex = idx;
         }
     }
-    return bestIndex;
+    if (bestIndex >= 0) {
+        return bestIndex;
+    }
+    if (fallbackIndex >= 0 && fallbackIndex < anchors.length && !isItemDisabled(anchors[fallbackIndex]!.element)) {
+        return fallbackIndex;
+    }
+    const firstEnabled = anchors.findIndex((anchor) => !isItemDisabled(anchor.element));
+    return firstEnabled >= 0 ? firstEnabled : fallbackIndex;
 }
 
 export function createGlassSwitch(
@@ -205,11 +226,12 @@ export function createGlassSwitch(
     options: LiquidGlassSwitchOptions = {},
 ): LiquidGlassSwitchInstance {
     element.classList.add("lg-switch");
-    if (!element.getAttribute("role")) {
+    const assignedRole = !element.getAttribute("role");
+    if (assignedRole) {
         element.setAttribute("role", "tablist");
     }
 
-    const itemSelector =
+    let itemSelector =
         options.itemSelector ??
         "[data-switch-item], .lg-switch-item, button, a, [role='tab']";
 
@@ -232,6 +254,7 @@ export function createGlassSwitch(
         tintOpacity: 0.08,
         highlight: 0.32,
         ...baseGlassOptions,
+        onEngineChange: undefined,
         pill: true,
         interactive: false,
         draggable: false,
@@ -298,6 +321,7 @@ export function createGlassSwitch(
 
     let anchors: SwitchItemAnchor[] = [];
     let currentIndex = 0;
+    let pendingWantedValue: string | undefined = options.value ?? options.defaultValue;
     let baseOffsetLeft = CONTAINER_PADDING_PX;
 
     let posX = 0;
@@ -339,15 +363,24 @@ export function createGlassSwitch(
     let isDestroyed = false;
 
     function measureAnchors(): void {
-        const candidates = Array.from(element.querySelectorAll<HTMLElement>(itemSelector)).filter(
+        const rawCandidates = Array.from(element.querySelectorAll<HTMLElement>(itemSelector)).filter(
             (candidate) => candidate !== gliderEl && !gliderEl.contains(candidate),
+        );
+        const candidates = rawCandidates.filter(
+            (candidate) => !rawCandidates.some((other) => other !== candidate && other.contains(candidate)),
         );
 
         if (candidates.length === 0) {
             anchors = [];
+            currentIndex = 0;
+            targetPosX = 0;
             baseOffsetLeft = CONTAINER_PADDING_PX;
+            gliderEl.style.left = `${baseOffsetLeft}px`;
+            gliderEl.style.opacity = "0";
             return;
         }
+
+        gliderEl.style.opacity = "";
 
         const firstOffset = candidates[0]!.offsetLeft;
         const firstWidth = candidates[0]!.offsetWidth;
@@ -377,6 +410,29 @@ export function createGlassSwitch(
         if (!hasLayoutGeometry && firstWidth === 0) {
             for (let idx = 0; idx < anchors.length; idx += 1) {
                 anchors[idx]!.left = idx * FALLBACK_ITEM_WIDTH_PX;
+            }
+        }
+
+        if (pendingWantedValue !== undefined) {
+            const matchedIndex = anchors.findIndex(
+                (anchor) => anchor.value === pendingWantedValue,
+            );
+            if (matchedIndex >= 0) {
+                if (!isItemDisabled(anchors[matchedIndex]!.element)) {
+                    currentIndex = matchedIndex;
+                }
+                pendingWantedValue = undefined;
+            }
+        }
+
+        if (currentIndex >= anchors.length) {
+            currentIndex = Math.max(0, anchors.length - 1);
+        }
+
+        if (anchors.length > 0 && isItemDisabled(anchors[currentIndex]?.element)) {
+            const firstEnabled = anchors.findIndex((anchor) => !isItemDisabled(anchor.element));
+            if (firstEnabled >= 0) {
+                currentIndex = firstEnabled;
             }
         }
     }
@@ -411,7 +467,7 @@ export function createGlassSwitch(
             element.style.setProperty("--sweep", `${(sweepQuant * 0.1).toFixed(1)}%`);
         }
 
-        const closestIndex = findClosestAnchorIndex(visualPosX, anchors);
+        const closestIndex = findClosestAnchorIndex(visualPosX, anchors, currentIndex);
         if (force || closestIndex !== lastHighlightIndex) {
             lastHighlightIndex = closestIndex;
             for (let idx = 0; idx < anchors.length; idx += 1) {
@@ -688,6 +744,7 @@ export function createGlassSwitch(
         const boundedIndex = Math.max(0, Math.min(anchors.length - 1, nextIndex));
         const previousIndex = currentIndex;
         currentIndex = boundedIndex;
+        pendingWantedValue = undefined;
         const targetAnchor = anchors[boundedIndex]!;
         targetPosX = targetAnchor.left;
 
@@ -715,6 +772,9 @@ export function createGlassSwitch(
     }
 
     function cleanupWindowPointerListeners(): void {
+        if (typeof window === "undefined") {
+            return;
+        }
         window.removeEventListener("pointermove", handlePointerMove);
         window.removeEventListener("pointerup", handlePointerEnd);
         window.removeEventListener("pointercancel", handlePointerCancel);
@@ -722,7 +782,7 @@ export function createGlassSwitch(
     }
 
     function handlePointerDown(event: PointerEvent): void {
-        if (isDestroyed || anchors.length === 0) {
+        if (isDestroyed || isPointerDown) {
             return;
         }
         if (event.button !== 0 && event.pointerType === "mouse") {
@@ -730,6 +790,20 @@ export function createGlassSwitch(
         }
 
         measureAnchors();
+        if (anchors.length === 0) {
+            return;
+        }
+
+        const eventTarget = event.target as HTMLElement | null;
+        if (eventTarget) {
+            const hitAnchor = anchors.find(
+                (anchor) => anchor.element === eventTarget || anchor.element.contains(eventTarget),
+            );
+            if (hitAnchor && isItemDisabled(hitAnchor.element)) {
+                return;
+            }
+        }
+
         isPointerDown = true;
         isDragging = false;
         activePointerId = event.pointerId;
@@ -758,6 +832,9 @@ export function createGlassSwitch(
 
     function handlePointerMove(event: PointerEvent): void {
         if (!isPointerDown || isDestroyed) {
+            return;
+        }
+        if (activePointerId !== -1 && event.pointerId !== activePointerId) {
             return;
         }
 
@@ -818,10 +895,13 @@ export function createGlassSwitch(
     }
 
     function handlePointerEnd(event: PointerEvent): void {
-        cleanupWindowPointerListeners();
         if (!isPointerDown) {
             return;
         }
+        if (activePointerId !== -1 && event.pointerId !== activePointerId) {
+            return;
+        }
+        cleanupWindowPointerListeners();
         isPointerDown = false;
         element.classList.remove("is-pressed");
 
@@ -840,7 +920,7 @@ export function createGlassSwitch(
             const releaseVel = Math.max(-3.0, Math.min(3.0, rawReleaseVel));
 
             const projectedPosX = posX + releaseVel * 1000 * 0.12;
-            const nextIndex = findClosestAnchorIndex(projectedPosX, anchors);
+            const nextIndex = findClosestAnchorIndex(projectedPosX, anchors, currentIndex);
 
             velX = releaseVel * 1000;
             targetSwell = 1.0;
@@ -855,11 +935,14 @@ export function createGlassSwitch(
         }
     }
 
-    function handlePointerCancel(): void {
-        cleanupWindowPointerListeners();
+    function handlePointerCancel(event?: PointerEvent): void {
         if (!isPointerDown) {
             return;
         }
+        if (event && activePointerId !== -1 && event.pointerId !== activePointerId) {
+            return;
+        }
+        cleanupWindowPointerListeners();
         isPointerDown = false;
         isDragging = false;
         element.classList.remove("is-pressed", "is-dragging");
@@ -886,32 +969,65 @@ export function createGlassSwitch(
             return;
         }
 
-        const matchedIndex = anchors.findIndex(
+        if (anchors.length === 0) {
+            measureAnchors();
+        }
+
+        let matchedIndex = anchors.findIndex(
             (anchor) =>
                 anchor.element === eventTarget || anchor.element.contains(eventTarget),
         );
         if (matchedIndex === -1) {
+            measureAnchors();
+            matchedIndex = anchors.findIndex(
+                (anchor) =>
+                    anchor.element === eventTarget || anchor.element.contains(eventTarget),
+            );
+        }
+        if (matchedIndex === -1) {
+            return;
+        }
+        if (isItemDisabled(anchors[matchedIndex]!.element)) {
+            event.preventDefault();
             return;
         }
 
-        measureAnchors();
         commitActiveIndex(matchedIndex, true, true, true);
     }
 
     function handleKeyDown(event: KeyboardEvent): void {
         if (anchors.length === 0) {
+            measureAnchors();
+        }
+        if (anchors.length === 0) {
             return;
         }
 
         let targetIndex = -1;
-        if (event.key === "ArrowRight") {
-            targetIndex = Math.min(anchors.length - 1, currentIndex + 1);
-        } else if (event.key === "ArrowLeft") {
-            targetIndex = Math.max(0, currentIndex - 1);
+        if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+            let next = currentIndex + 1;
+            while (next < anchors.length && isItemDisabled(anchors[next]!.element)) {
+                next++;
+            }
+            if (next < anchors.length) targetIndex = next;
+        } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+            let prev = currentIndex - 1;
+            while (prev >= 0 && isItemDisabled(anchors[prev]!.element)) {
+                prev--;
+            }
+            if (prev >= 0) targetIndex = prev;
         } else if (event.key === "Home") {
-            targetIndex = 0;
+            let first = 0;
+            while (first < anchors.length && isItemDisabled(anchors[first]!.element)) {
+                first++;
+            }
+            if (first < anchors.length) targetIndex = first;
         } else if (event.key === "End") {
-            targetIndex = anchors.length - 1;
+            let last = anchors.length - 1;
+            while (last >= 0 && isItemDisabled(anchors[last]!.element)) {
+                last--;
+            }
+            if (last >= 0) targetIndex = last;
         }
 
         if (targetIndex === -1) {
@@ -930,7 +1046,15 @@ export function createGlassSwitch(
         const matchedInitial = anchors.findIndex(
             (anchor) => anchor.value === initialWantedValue,
         );
-        currentIndex = matchedInitial >= 0 ? matchedInitial : 0;
+        if (matchedInitial >= 0 && !isItemDisabled(anchors[matchedInitial]!.element)) {
+            currentIndex = matchedInitial;
+        }
+    }
+    if (anchors.length > 0 && isItemDisabled(anchors[currentIndex]?.element)) {
+        const firstEnabled = anchors.findIndex((anchor) => !isItemDisabled(anchor.element));
+        if (firstEnabled >= 0) {
+            currentIndex = firstEnabled;
+        }
     }
 
     if (anchors.length > 0) {
@@ -951,10 +1075,12 @@ export function createGlassSwitch(
                       return;
                   }
                   measureAnchors();
-                  if (anchors.length > 0 && !rafId) {
-                      posX = anchors[currentIndex]?.left ?? 0;
-                      targetPosX = posX;
-                      renderGliderTransform(true);
+                  if (anchors.length > 0) {
+                      targetPosX = anchors[currentIndex]?.left ?? 0;
+                      if (!rafId) {
+                          posX = targetPosX;
+                          renderGliderTransform(true);
+                      }
                   }
               })
             : null;
@@ -968,12 +1094,13 @@ export function createGlassSwitch(
             return gliderGlass.engine;
         },
         get value(): string {
-            return anchors[currentIndex]?.value ?? "";
+            return anchors[currentIndex]?.value ?? pendingWantedValue ?? "";
         },
         get activeIndex(): number {
             return currentIndex;
         },
         setValue(value: string, animate = true): void {
+            pendingWantedValue = value;
             measureAnchors();
             const foundIndex = anchors.findIndex((anchor) => anchor.value === value);
             if (foundIndex >= 0) {
@@ -981,6 +1108,7 @@ export function createGlassSwitch(
             }
         },
         setActiveIndex(index: number, animate = true): void {
+            pendingWantedValue = undefined;
             measureAnchors();
             commitActiveIndex(index, animate, true, true);
         },
@@ -988,12 +1116,17 @@ export function createGlassSwitch(
             if (nextOptions.onChange !== undefined) {
                 onChangeCallback = nextOptions.onChange;
             }
+            if (nextOptions.itemSelector !== undefined && nextOptions.itemSelector !== itemSelector) {
+                itemSelector = nextOptions.itemSelector;
+                measureAnchors();
+            }
             if (nextOptions.value !== undefined) {
+                pendingWantedValue = nextOptions.value;
                 measureAnchors();
                 const foundIndex = anchors.findIndex(
                     (anchor) => anchor.value === nextOptions.value,
                 );
-                if (foundIndex >= 0 && foundIndex !== currentIndex) {
+                if (foundIndex >= 0 && (foundIndex !== currentIndex || posX !== anchors[foundIndex]!.left)) {
                     commitActiveIndex(foundIndex, true, false, true);
                 }
             }
@@ -1001,6 +1134,7 @@ export function createGlassSwitch(
             if (Object.keys(glassPatch).length > 0) {
                 trackGlass.update({
                     ...glassPatch,
+                    onEngineChange: undefined,
                     pill: true,
                     interactive: false,
                     draggable: false,
@@ -1044,6 +1178,16 @@ export function createGlassSwitch(
             trackGlass.destroy();
             if (createdGlider) {
                 gliderEl.remove();
+            } else {
+                gliderEl.style.removeProperty("--p");
+                gliderEl.style.removeProperty("transform");
+                gliderEl.style.removeProperty("width");
+                gliderEl.style.removeProperty("left");
+                gliderEl.style.removeProperty("opacity");
+                gliderEl.style.removeProperty("will-change");
+            }
+            if (assignedRole) {
+                element.removeAttribute("role");
             }
             element.classList.remove(
                 "lg-switch",
@@ -1053,6 +1197,9 @@ export function createGlassSwitch(
             );
             element.style.removeProperty("--sweep");
             for (const anchor of anchors) {
+                anchor.element.classList.remove("active");
+                anchor.element.removeAttribute("aria-selected");
+                anchor.element.removeAttribute("aria-pressed");
                 anchor.element.style.removeProperty("--lg-switch-coverage");
                 anchor.element.style.removeProperty("--lg-switch-hit-start");
                 anchor.element.style.removeProperty("--lg-switch-hit-end");

@@ -69,11 +69,15 @@ function findBestStandbyCandidate(): WebglPoolEntry | null {
 }
 
 function promoteStandbyIfPossible(): void {
-    if (activeEntries.size >= maxActiveContexts) return;
-    const candidate = findBestStandbyCandidate();
-    if (!candidate) return;
-    standbyEntries.delete(candidate.token);
-    candidate.restoreWebgl();
+    while (activeEntries.size < maxActiveContexts) {
+        const candidate = findBestStandbyCandidate();
+        if (!candidate) break;
+        standbyEntries.delete(candidate.token);
+        candidate.restoreWebgl();
+        if (!activeEntries.has(candidate.token)) {
+            break;
+        }
+    }
 }
 
 export function acquireWebglSlot(entry: WebglPoolEntry, allowEvictVisible = true): boolean {

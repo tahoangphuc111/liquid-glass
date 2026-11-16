@@ -93,7 +93,16 @@ export function registerCoalescenceParticipant(participant: CoalescenceParticipa
         const node = participantNodes.get(participant.element);
         if (!node) return;
         participantNodes.delete(participant.element);
-        if (node.lastPeerCount > 0) {
+        let hadAnyActivePeers = node.lastPeerCount > 0;
+        if (!hadAnyActivePeers) {
+            for (const other of participantNodes.values()) {
+                if (other.lastPeerCount > 0) {
+                    hadAnyActivePeers = true;
+                    break;
+                }
+            }
+        }
+        if (hadAnyActivePeers) {
             for (const other of participantNodes.values()) {
                 other.participant.notifyPeerUpdate();
             }

@@ -44,6 +44,8 @@ export function useGlassSwitch(
     useEffect(() => {
         const element = targetRef.current;
         if (!element) {
+            instanceRef.current?.destroy();
+            instanceRef.current = null;
             return;
         }
 

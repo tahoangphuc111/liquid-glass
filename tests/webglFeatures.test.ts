@@ -6,12 +6,13 @@ import {
     resetWebglPoolForTesting,
     setMaxActiveWebglContextsForTesting,
 } from "../src/core/webglPool.js";
-import { GlassWebglRenderer } from "../src/core/webglRenderer.js";
+import { GlassWebglRenderer, parseCssColorToRgb } from "../src/core/webglRenderer.js";
 
 function createMockGl() {
     const uniforms = new Map<string, number>();
     let nextLocId = 1;
     const uniform2fCalls: Array<{ name: string; x: number; y: number }> = [];
+    const uniform1fCalls: Array<{ name: string; val: number }> = [];
     const locNames = new Map<number, string>();
 
     const gl = {
@@ -93,7 +94,12 @@ function createMockGl() {
         deleteFramebuffer: vi.fn(),
         getError: vi.fn(() => 0),
         uniform1i: vi.fn(),
-        uniform1f: vi.fn(),
+        uniform1f: vi.fn((loc: unknown, val: number) => {
+            uniform1fCalls.push({
+                name: locNames.get(loc as number) ?? "unknown",
+                val,
+            });
+        }),
         uniform2f: vi.fn((loc: unknown, horizontal: number, vertical: number) => {
             uniform2fCalls.push({
                 name: locNames.get(loc as number) ?? "unknown",
@@ -106,7 +112,7 @@ function createMockGl() {
         drawArrays: vi.fn(),
     } as unknown as WebGL2RenderingContext;
 
-    return { gl, uniform2fCalls };
+    return { gl, uniform2fCalls, uniform1fCalls };
 }
 
 function setBox(el: HTMLElement, width: number, height: number, left = 0, top = 0) {
@@ -333,5 +339,109 @@ describe("WebGL pool, dynamic light tilt, and Kawase blur", () => {
         renderer.dispose();
         expect(gl.deleteFramebuffer).toHaveBeenCalledTimes(3);
         expect(gl.deleteTexture).toHaveBeenCalledTimes(6);
+    });
+
+    it("activates webgl scene texture when sceneCanvas is provided without sceneElement", () => {
+        const rafQueue: FrameRequestCallback[] = [];
+        vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb) => {
+            rafQueue.push(cb);
+            return rafQueue.length;
+        });
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation((type: string) => {
+            if (type === "webgl2" || type === "webgl") return createMockGl().gl as unknown as RenderingContext;
+            return null;
+        });
+
+        const targetEl = document.createElement("div");
+        setBox(targetEl, 200, 60);
+        document.body.appendChild(targetEl);
+
+        const customSceneCanvas = document.createElement("canvas");
+        customSceneCanvas.width = 400;
+        customSceneCanvas.height = 120;
+
+        const glass = createLiquidGlass(targetEl, {
+            engine: "webgl",
+            sceneCanvas: customSceneCanvas,
+        });
+
+        expect(glass.engine).toBe("webgl");
+        while (rafQueue.length > 0) {
+            rafQueue.shift()!(16);
+        }
+        expect(targetEl.getAttribute("data-lg-webgl-scene")).toBe("1");
+        expect(targetEl.style.getPropertyValue("--lg-filter")).toBe("");
+
+        glass.destroy();
+    });
+
+    it("parses percentage rgb colors cleanly in parseCssColorToRgb", () => {
+        expect(parseCssColorToRgb("rgb(100%, 50%, 0%)")).toEqual([1, 0.5, 0]);
+        expect(parseCssColorToRgb("rgba(0%, 100%, 50%, 0.5)")).toEqual([0, 1, 0.5]);
+        expect(parseCssColorToRgb("#ff8000")).toEqual([1, 128 / 255, 0]);
+    });
+
+    it("transitions properly to WebGL when setSceneCanvas is called dynamically", () => {
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation((type: string) => {
+            if (type === "webgl2" || type === "webgl") return createMockGl().gl as unknown as RenderingContext;
+            return null;
+        });
+
+        const targetEl = document.createElement("div");
+        setBox(targetEl, 200, 60);
+        document.body.appendChild(targetEl);
+
+        // Created without scene canvas initially with engine "webgl"
+        const glass = createLiquidGlass(targetEl, {
+            engine: "webgl",
+        });
+
+        const sceneCanvas = document.createElement("canvas");
+        sceneCanvas.width = 400;
+        sceneCanvas.height = 120;
+
+        glass.setSceneCanvas(sceneCanvas);
+        expect(glass.engine).toBe("webgl");
+
+        glass.destroy();
+    });
+
+    it("uploads uLightTilt uniform on initial render even with zero tilt (0, 0)", () => {
+        const rafQueue: Array<(time: number) => void> = [];
+        vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb) => {
+            rafQueue.push(cb);
+            return rafQueue.length;
+        });
+
+        const { gl, uniform2fCalls, uniform1fCalls } = createMockGl();
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation((type: string) => {
+            if (type === "webgl2" || type === "webgl") return gl as unknown as RenderingContext;
+            return null;
+        });
+
+        const targetEl = document.createElement("div");
+        setBox(targetEl, 200, 60);
+        document.body.appendChild(targetEl);
+
+        const glass = createLiquidGlass(targetEl, {
+            engine: "webgl",
+            blur: 0,
+            interactive: false,
+        });
+
+        while (rafQueue.length > 0) {
+            rafQueue.shift()!(16);
+        }
+
+        const initialLightUniform = uniform2fCalls.find((call) => call.name === "uLightTilt");
+        expect(initialLightUniform).toBeDefined();
+        expect(initialLightUniform?.x).toBe(0);
+        expect(initialLightUniform?.y).toBe(0);
+
+        const initialPeerCountUniform = uniform1fCalls.find((call) => call.name === "uPeerCount");
+        expect(initialPeerCountUniform).toBeDefined();
+        expect(initialPeerCountUniform?.val).toBe(0);
+
+        glass.destroy();
     });
 });

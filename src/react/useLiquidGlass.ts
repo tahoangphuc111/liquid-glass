@@ -33,7 +33,11 @@ export function useLiquidGlass(
 
     useEffect(() => {
         const element = targetRef.current;
-        if (!element) return;
+        if (!element) {
+            instanceRef.current?.destroy();
+            instanceRef.current = null;
+            return;
+        }
 
         const mergedOptions: LiquidGlassOptions = {
             ...context?.defaults,

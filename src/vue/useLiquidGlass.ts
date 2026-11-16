@@ -30,7 +30,11 @@ export function useLiquidGlass(
 
     const syncInstance = () => {
         const element = targetRef.value;
-        if (!element) return;
+        if (!element) {
+            instance?.destroy();
+            instance = null;
+            return;
+        }
 
         const currentOptions = toValue(options);
         if (currentOptions.engine === "webgl" && context && !context.sceneCanvas.value) {

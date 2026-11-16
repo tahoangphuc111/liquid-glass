@@ -265,8 +265,8 @@ function createSampleEntry(gl: WebGL2RenderingContext, program: WebGLProgram): S
         lastBlurOffset1Y: Number.NaN,
         lastBlurOffset2X: Number.NaN,
         lastBlurOffset2Y: Number.NaN,
-        lastLightTiltHorizontal: 0,
-        lastLightTiltVertical: 0,
+        lastLightTiltHorizontal: Number.NaN,
+        lastLightTiltVertical: Number.NaN,
     };
 }
 
@@ -775,4 +775,8 @@ export class OpticalTransferCache {
         this.sampleEntries.clear();
         this.failedVariants.clear();
     }
+}
+
+export function resetOpticalTransferForTesting(): void {
+    totalAllocatedBytes = 0;
 }
