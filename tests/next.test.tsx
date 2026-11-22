@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createRef, type ReactNode } from "react";
 import { renderToString } from "react-dom/server";
 import {
     LiquidGlass,
     LiquidGlassProvider,
+    LiquidGlassSlider,
     LiquidGlassSwitch,
     resolveSwitchValueForPathname,
 } from "../src/next/index.js";
@@ -33,7 +34,6 @@ describe("Next.js bindings (@tahoangphuc111/liquid-glass/next)", () => {
         );
         expect(resolveSwitchValueForPathname(items, "/unknown")).toBeUndefined();
 
-        // Edge case: full URL, query string, hash fragment, relative paths, trailing slashes
         expect(resolveSwitchValueForPathname(items, "https://example.com/search/?ref=header#top")).toBe("search");
         expect(resolveSwitchValueForPathname(items, "http://localhost:3000/library/playlists/")).toBe("playlists");
     });
@@ -174,5 +174,53 @@ describe("Next.js bindings (@tahoangphuc111/liquid-glass/next)", () => {
         await waitFor(() => {
             expect(aboutTab.classList.contains("active")).toBe(true);
         });
+    });
+
+    it("guards query/hash root matching, restores or preserves third-party history hooks on unmount, and renders Next LiquidGlassSlider", () => {
+        const items = [
+            { value: "home", label: "Home", href: "/" },
+            { value: "section", label: "Section", href: "#pricing" },
+            { value: "filter", label: "Filtered", href: "?tab=pro" },
+        ];
+        expect(resolveSwitchValueForPathname(items, "#pricing")).toBeUndefined();
+        expect(resolveSwitchValueForPathname(items, "?tab=pro")).toBeUndefined();
+        expect(resolveSwitchValueForPathname(items, "/")).toBe("home");
+
+        const originalPush = window.history.pushState;
+        const originalReplace = window.history.replaceState;
+
+        const cleanView = render(
+            <LiquidGlassSwitch
+                engine="css"
+                items={[
+                    { value: "home", label: "Home", href: "/" },
+                    { value: "docs", label: "Docs", href: "/docs" },
+                ]}
+            />,
+        );
+        expect(window.history.pushState).not.toBe(originalPush);
+        act(() => cleanView.unmount());
+        expect(window.history.pushState).toBe(originalPush);
+        expect(window.history.replaceState).toBe(originalReplace);
+
+        const wrappedView = render(
+            <LiquidGlassSwitch
+                engine="css"
+                items={[
+                    { value: "home", label: "Home", href: "/" },
+                    { value: "about", label: "About", href: "/about" },
+                ]}
+            />,
+        );
+        const thirdPartyPush: History["pushState"] = function (this: History, ...args) {
+            return originalPush.apply(this, args);
+        };
+        window.history.pushState = thirdPartyPush;
+        act(() => wrappedView.unmount());
+        expect(window.history.pushState).toBe(thirdPartyPush);
+        window.history.pushState = originalPush;
+
+        render(<LiquidGlassSlider data-testid="next-slider" engine="css" min={0} max={100} defaultValue={55} />);
+        expect(screen.getByTestId("next-slider").closest(".lg-slider")).not.toBeNull();
     });
 });

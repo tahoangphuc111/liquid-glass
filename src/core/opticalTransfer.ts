@@ -1,6 +1,10 @@
+import { useSmallMemoryBudget } from "./renderBudget.js";
+import { resolveCornerStyle, resolveSurfaceId } from "./config.js";
 import type { GlassFrameParams } from "./webglRenderer.js";
 
-const MAX_CACHE_BYTES = 32 * 1024 * 1024;
+function getMaxTransferCacheBytes(): number {
+    return (useSmallMemoryBudget() ? 8 : 32) * 1024 * 1024;
+}
 const MAX_CACHE_PIXELS = 1_048_576;
 const BYTES_PER_PIXEL = 24;
 
@@ -32,6 +36,8 @@ interface SampleProgramEntry {
     readonly uGeomLoc: WebGLUniformLocation | null;
     readonly uOpticalLoc: WebGLUniformLocation | null;
     readonly uTintLoc: WebGLUniformLocation | null;
+    readonly uSaturationLoc: WebGLUniformLocation | null;
+    lastSaturation: number;
     readonly uHighlightLoc: WebGLUniformLocation | null;
     readonly uSceneRectLoc: WebGLUniformLocation | null;
     readonly uDprLoc: WebGLUniformLocation | null;
@@ -39,6 +45,8 @@ interface SampleProgramEntry {
     readonly uBlurOffset1Loc: WebGLUniformLocation | null;
     readonly uBlurOffset2Loc: WebGLUniformLocation | null;
     readonly uLightTiltLoc: WebGLUniformLocation | null;
+    readonly uSquircleLoc: WebGLUniformLocation | null;
+    readonly uUseInteriorTexLoc: WebGLUniformLocation | null;
     lastWidth: number;
     lastHeight: number;
     lastRadius: number;
@@ -52,6 +60,7 @@ interface SampleProgramEntry {
     lastTintB: number;
     lastTintA: number;
     lastHighlight: number;
+    lastDarkRimScale: number;
     lastChromaStrength: number;
     lastBlurRadiusPx: number;
     lastRelX: number;
@@ -66,6 +75,8 @@ interface SampleProgramEntry {
     lastBlurOffset2Y: number;
     lastLightTiltHorizontal: number;
     lastLightTiltVertical: number;
+    lastSquircle: number;
+    lastUseInteriorTex: number;
 }
 
 interface BuildProgramEntry {
@@ -73,9 +84,11 @@ interface BuildProgramEntry {
     readonly uSizeLoc: WebGLUniformLocation | null;
     readonly uGeomLoc: WebGLUniformLocation | null;
     readonly uOpticalLoc: WebGLUniformLocation | null;
+    readonly uRefractionLoc: WebGLUniformLocation | null;
     readonly uDprLoc: WebGLUniformLocation | null;
     readonly uInteriorMarginLoc: WebGLUniformLocation | null;
     readonly uLutScaleLoc: WebGLUniformLocation | null;
+    readonly uSquircleLoc: WebGLUniformLocation | null;
     lastLutSize: number;
 }
 
@@ -208,6 +221,9 @@ function createProgramWithDefines(
     }
     gl.attachShader(program, vertexShader);
     gl.attachShader(program, fragmentShader);
+    if (typeof gl.bindAttribLocation === "function") {
+        gl.bindAttribLocation(program, 0, "aPosition");
+    }
     gl.linkProgram(program);
     gl.deleteShader(vertexShader);
     gl.deleteShader(fragmentShader);
@@ -226,6 +242,10 @@ function createSampleEntry(gl: WebGL2RenderingContext, program: WebGLProgram): S
     if (uTransferGeometryLoc) gl.uniform1i(uTransferGeometryLoc, 2);
     const uTransferLightingLoc = gl.getUniformLocation(program, "uTransferLighting");
     if (uTransferLightingLoc) gl.uniform1i(uTransferLightingLoc, 3);
+    const uInteriorTexLoc = gl.getUniformLocation(program, "uInteriorTex");
+    if (uInteriorTexLoc) gl.uniform1i(uInteriorTexLoc, 4);
+    const uCoalesceBleedLoc = gl.getUniformLocation(program, "uCoalesceBleed");
+    if (uCoalesceBleedLoc) gl.uniform4f(uCoalesceBleedLoc, 0, 0, 0, 0);
 
     return {
         program,
@@ -233,6 +253,8 @@ function createSampleEntry(gl: WebGL2RenderingContext, program: WebGLProgram): S
         uGeomLoc: gl.getUniformLocation(program, "uGeom"),
         uOpticalLoc: gl.getUniformLocation(program, "uOptical"),
         uTintLoc: gl.getUniformLocation(program, "uTint"),
+        uSaturationLoc: gl.getUniformLocation(program, "uSaturation"),
+        lastSaturation: -2,
         uHighlightLoc: gl.getUniformLocation(program, "uHighlight"),
         uSceneRectLoc: gl.getUniformLocation(program, "uSceneRect"),
         uDprLoc: gl.getUniformLocation(program, "uDpr"),
@@ -240,6 +262,8 @@ function createSampleEntry(gl: WebGL2RenderingContext, program: WebGLProgram): S
         uBlurOffset1Loc: gl.getUniformLocation(program, "uBlurOffset1"),
         uBlurOffset2Loc: gl.getUniformLocation(program, "uBlurOffset2"),
         uLightTiltLoc: gl.getUniformLocation(program, "uLightTilt"),
+        uSquircleLoc: gl.getUniformLocation(program, "uSquircle"),
+        uUseInteriorTexLoc: gl.getUniformLocation(program, "uUseInteriorTex"),
         lastWidth: -1,
         lastHeight: -1,
         lastRadius: -1,
@@ -253,6 +277,7 @@ function createSampleEntry(gl: WebGL2RenderingContext, program: WebGLProgram): S
         lastTintB: -1,
         lastTintA: -1,
         lastHighlight: -1,
+        lastDarkRimScale: -1,
         lastChromaStrength: -1,
         lastBlurRadiusPx: -1,
         lastRelX: -1,
@@ -267,14 +292,9 @@ function createSampleEntry(gl: WebGL2RenderingContext, program: WebGLProgram): S
         lastBlurOffset2Y: Number.NaN,
         lastLightTiltHorizontal: Number.NaN,
         lastLightTiltVertical: Number.NaN,
+        lastSquircle: -1,
+        lastUseInteriorTex: -1,
     };
-}
-
-function resolveSurfaceId(surface: GlassFrameParams["surface"]): number {
-    if (surface === "convex_circle") return 1;
-    if (surface === "linear") return 2;
-    if (surface === "lip") return 3;
-    return 0;
 }
 
 function selectSampleVariantKey(
@@ -305,7 +325,20 @@ export class OpticalTransferCache {
     private framebuffer: WebGLFramebuffer | null;
     private geometryTexture: WebGLTexture | null = null;
     private lightingTexture: WebGLTexture | null = null;
-    geometryKey = "";
+    private geomKeyValid = false;
+    private lastGeomTargetW = 0;
+    private lastGeomTargetH = 0;
+    private lastGeomFrameW = 0;
+    private lastGeomFrameH = 0;
+    private lastGeomRadius = 0;
+    private lastGeomDirection = -1;
+    private lastGeomEdgeFade = -1;
+    private lastGeomBezel = 0;
+    private lastGeomDpr = 0;
+    private lastGeomSurface = "";
+    private lastGeomCornerStyle = "";
+    private lastGeomIor = 0;
+    private lastGeomInteriorMargin = 0;
     width = 0;
     height = 0;
     allocatedBytes = 0;
@@ -317,7 +350,6 @@ export class OpticalTransferCache {
         fragmentSource: string,
         maxTextureSize: number,
         buildEntry: BuildProgramEntry,
-        initialSampleEntries: readonly [SampleVariantKey, SampleProgramEntry][],
         framebuffer: WebGLFramebuffer,
     ) {
         this.gl = gl;
@@ -325,9 +357,6 @@ export class OpticalTransferCache {
         this.fragmentSource = fragmentSource;
         this.maxTextureSize = maxTextureSize;
         this.buildEntry = buildEntry;
-        for (const [key, entry] of initialSampleEntries) {
-            this.sampleEntries.set(key, entry);
-        }
         this.framebuffer = framebuffer;
     }
 
@@ -353,37 +382,16 @@ export class OpticalTransferCache {
         );
         if (!buildProgram) return null;
 
-        const coreVariants: readonly SampleVariantKey[] = ["NO_SCENE", "CLEAR_CHROMA", "BLUR_CHROMA"];
-        const compiledCore: [SampleVariantKey, SampleProgramEntry][] = [];
-        for (const variantKey of coreVariants) {
-            const sampleProgram = createProgramWithDefines(
-                gl,
-                vertexSource,
-                fragmentSource,
-                VARIANT_DEFINES[variantKey],
-                false,
-            );
-            if (!sampleProgram) {
-                gl.deleteProgram(buildProgram);
-                for (const [, entry] of compiledCore) {
-                    gl.deleteProgram(entry.program);
-                }
-                return null;
-            }
-            compiledCore.push([variantKey, createSampleEntry(gl, sampleProgram)]);
-        }
-
         const framebuffer = gl.createFramebuffer();
         if (!framebuffer) {
             gl.deleteProgram(buildProgram);
-            for (const [, entry] of compiledCore) {
-                gl.deleteProgram(entry.program);
-            }
             return null;
         }
 
         gl.useProgram(buildProgram);
         gl.uniform1i(gl.getUniformLocation(buildProgram, "uOpticalLut"), 1);
+        const buildBleedLoc = gl.getUniformLocation(buildProgram, "uCoalesceBleed");
+        if (buildBleedLoc) gl.uniform4f(buildBleedLoc, 0, 0, 0, 0);
         gl.activeTexture(gl.TEXTURE0);
 
         const buildEntry: BuildProgramEntry = {
@@ -391,9 +399,11 @@ export class OpticalTransferCache {
             uSizeLoc: gl.getUniformLocation(buildProgram, "uSize"),
             uGeomLoc: gl.getUniformLocation(buildProgram, "uGeom"),
             uOpticalLoc: gl.getUniformLocation(buildProgram, "uOptical"),
+            uRefractionLoc: gl.getUniformLocation(buildProgram, "uRefraction"),
             uDprLoc: gl.getUniformLocation(buildProgram, "uDpr"),
             uInteriorMarginLoc: gl.getUniformLocation(buildProgram, "uInteriorMargin"),
             uLutScaleLoc: gl.getUniformLocation(buildProgram, "uLutScale"),
+            uSquircleLoc: gl.getUniformLocation(buildProgram, "uSquircle"),
             lastLutSize: -1,
         };
 
@@ -405,7 +415,6 @@ export class OpticalTransferCache {
             fragmentSource,
             maxTextureSize,
             buildEntry,
-            compiledCore,
             framebuffer,
         );
     }
@@ -434,6 +443,13 @@ export class OpticalTransferCache {
     }
 
     private releaseStorage(): void {
+        if (this.framebuffer && (this.geometryTexture || this.lightingTexture)) {
+            const { gl } = this;
+            gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, null, 0);
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        }
         if (this.allocatedBytes > 0) {
             totalAllocatedBytes = Math.max(0, totalAllocatedBytes - this.allocatedBytes);
             this.allocatedBytes = 0;
@@ -448,7 +464,7 @@ export class OpticalTransferCache {
         }
         this.width = 0;
         this.height = 0;
-        this.geometryKey = "";
+        this.geomKeyValid = false;
     }
 
     private ensureStorage(targetWidth: number, targetHeight: number): boolean {
@@ -462,6 +478,7 @@ export class OpticalTransferCache {
         }
         if (!this.framebuffer) return false;
 
+        const maxCacheBytes = getMaxTransferCacheBytes();
         const pixelCount = targetWidth * targetHeight;
         const requiredBytes = pixelCount * BYTES_PER_PIXEL;
         const projectedBytes = totalAllocatedBytes - this.allocatedBytes + requiredBytes;
@@ -471,14 +488,20 @@ export class OpticalTransferCache {
             targetWidth > this.maxTextureSize ||
             targetHeight > this.maxTextureSize ||
             pixelCount > MAX_CACHE_PIXELS ||
-            requiredBytes > MAX_CACHE_BYTES ||
-            projectedBytes > MAX_CACHE_BYTES
+            requiredBytes > maxCacheBytes ||
+            projectedBytes > maxCacheBytes
         ) {
             this.releaseStorage();
             return false;
         }
 
         const { gl } = this;
+        const hasGetError = typeof gl.getError === "function";
+        if (hasGetError) {
+            for (let drain = 0; drain < 8 && gl.getError() !== gl.NO_ERROR; drain += 1) {
+                void 0;
+            }
+        }
         if (!this.geometryTexture) {
             this.geometryTexture = gl.createTexture();
         }
@@ -529,12 +552,16 @@ export class OpticalTransferCache {
         this.allocatedBytes = requiredBytes;
         this.width = targetWidth;
         this.height = targetHeight;
-        this.geometryKey = "";
+        this.geomKeyValid = false;
         return true;
     }
 
     render(
         frame: GlassFrameParams,
+        bezel: number,
+        scaleRatio: number,
+        direction: number,
+        edgeFade: number,
         targetWidth: number,
         targetHeight: number,
         dpr: number,
@@ -543,11 +570,13 @@ export class OpticalTransferCache {
         useScene: boolean,
         blurRadiusPx: number,
         chromaStrength: number,
+        saturation: number,
+        useInteriorTex = false,
     ): boolean {
         if (this.disposed) return false;
         if (useScene && !frame.sceneRect) return false;
 
-        const interiorMargin = Math.max(Math.max(1.0, frame.bezel), 14.0, 0.707107 / dpr + 0.5);
+        const interiorMargin = Math.max(Math.max(1.0, bezel), 14.0, 0.707107 / dpr + 0.5);
         const innerW = Math.max(0, frame.width - 2 * interiorMargin);
         const innerH = Math.max(0, frame.height - 2 * interiorMargin);
         const useInteriorBranch = (innerW * innerH) / Math.max(1, frame.width * frame.height) >= 0.45;
@@ -576,6 +605,8 @@ export class OpticalTransferCache {
                 relY + relH + padY > 0.998;
         }
 
+        if (!this.ensureStorage(targetWidth, targetHeight)) return false;
+
         const variantKey = selectSampleVariantKey(
             useScene,
             blurRadiusPx,
@@ -586,15 +617,30 @@ export class OpticalTransferCache {
         const sampleEntry = this.getOrCompileSampleEntry(variantKey);
         if (!sampleEntry) return false;
 
-        if (!this.ensureStorage(targetWidth, targetHeight)) return false;
-
         const { gl } = this;
         const surfaceId = resolveSurfaceId(frame.surface);
-        const nextGeometryKey = `${targetWidth}:${targetHeight}:${frame.width}:${frame.height}:${frame.radius}:${frame.bezel}:${dpr}:${frame.surface}:${frame.ior}:${interiorMargin}`;
+        const cornerStyle = resolveCornerStyle(frame.cornerStyle);
+        const squircleFlag = cornerStyle === "squircle" ? 1 : 0;
+        const geomChanged =
+            !this.geomKeyValid ||
+            targetWidth !== this.lastGeomTargetW ||
+            targetHeight !== this.lastGeomTargetH ||
+            frame.width !== this.lastGeomFrameW ||
+            frame.height !== this.lastGeomFrameH ||
+            frame.radius !== this.lastGeomRadius ||
+            bezel !== this.lastGeomBezel ||
+            direction !== this.lastGeomDirection ||
+            edgeFade !== this.lastGeomEdgeFade ||
+            dpr !== this.lastGeomDpr ||
+            frame.surface !== this.lastGeomSurface ||
+            cornerStyle !== this.lastGeomCornerStyle ||
+            frame.ior !== this.lastGeomIor ||
+            interiorMargin !== this.lastGeomInteriorMargin;
 
-        if (nextGeometryKey !== this.geometryKey && this.framebuffer) {
+        if (geomChanged && this.framebuffer) {
             const buildEntry = this.buildEntry;
             gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer);
+            gl.viewport(0, 0, targetWidth, targetHeight);
             gl.useProgram(buildEntry.program);
             gl.activeTexture(gl.TEXTURE1);
             gl.bindTexture(gl.TEXTURE_2D, opticalTexture);
@@ -603,24 +649,39 @@ export class OpticalTransferCache {
                 if (buildEntry.uLutScaleLoc) {
                     gl.uniform2f(
                         buildEntry.uLutScaleLoc,
-                        (opticalLutSize - 1) / opticalLutSize,
-                        0.5 / opticalLutSize,
+                        opticalLutSize - 1,
+                        1 / opticalLutSize,
                     );
                 }
             }
             if (buildEntry.uSizeLoc) gl.uniform2f(buildEntry.uSizeLoc, frame.width, frame.height);
             if (buildEntry.uGeomLoc) {
-                gl.uniform4f(buildEntry.uGeomLoc, frame.width * 0.5, frame.height * 0.5, frame.radius, frame.bezel);
+                gl.uniform4f(buildEntry.uGeomLoc, frame.width * 0.5, frame.height * 0.5, frame.radius, bezel);
             }
             if (buildEntry.uOpticalLoc) {
-                gl.uniform4f(buildEntry.uOpticalLoc, frame.ior, frame.thickness, frame.scaleRatio, surfaceId);
+                gl.uniform4f(buildEntry.uOpticalLoc, frame.ior, frame.thickness, scaleRatio, surfaceId);
             }
+            if (buildEntry.uRefractionLoc) gl.uniform2f(buildEntry.uRefractionLoc, direction, edgeFade);
             if (buildEntry.uDprLoc) gl.uniform1f(buildEntry.uDprLoc, dpr);
             if (buildEntry.uInteriorMarginLoc) gl.uniform1f(buildEntry.uInteriorMarginLoc, interiorMargin);
+            if (buildEntry.uSquircleLoc) gl.uniform1f(buildEntry.uSquircleLoc, squircleFlag);
             gl.drawArrays(gl.TRIANGLES, 0, 3);
             gl.bindFramebuffer(gl.FRAMEBUFFER, null);
             gl.activeTexture(gl.TEXTURE0);
-            this.geometryKey = nextGeometryKey;
+            this.geomKeyValid = true;
+            this.lastGeomTargetW = targetWidth;
+            this.lastGeomTargetH = targetHeight;
+            this.lastGeomFrameW = frame.width;
+            this.lastGeomFrameH = frame.height;
+            this.lastGeomRadius = frame.radius;
+            this.lastGeomBezel = bezel;
+            this.lastGeomDirection = direction;
+            this.lastGeomEdgeFade = edgeFade;
+            this.lastGeomDpr = dpr;
+            this.lastGeomSurface = frame.surface;
+            this.lastGeomCornerStyle = cornerStyle;
+            this.lastGeomIor = frame.ior;
+            this.lastGeomInteriorMargin = interiorMargin;
         }
 
         gl.useProgram(sampleEntry.program);
@@ -645,34 +706,34 @@ export class OpticalTransferCache {
             frame.width !== sampleEntry.lastWidth ||
             frame.height !== sampleEntry.lastHeight ||
             frame.radius !== sampleEntry.lastRadius ||
-            frame.bezel !== sampleEntry.lastBezel
+            bezel !== sampleEntry.lastBezel
         ) {
             sampleEntry.lastWidth = frame.width;
             sampleEntry.lastHeight = frame.height;
             sampleEntry.lastRadius = frame.radius;
-            sampleEntry.lastBezel = frame.bezel;
+            sampleEntry.lastBezel = bezel;
             if (sampleEntry.uGeomLoc) {
                 gl.uniform4f(
                     sampleEntry.uGeomLoc,
                     frame.width * 0.5,
                     frame.height * 0.5,
                     frame.radius,
-                    frame.bezel,
+                    bezel,
                 );
             }
         }
         if (
             frame.ior !== sampleEntry.lastIor ||
             frame.thickness !== sampleEntry.lastThickness ||
-            frame.scaleRatio !== sampleEntry.lastScaleRatio ||
+            scaleRatio !== sampleEntry.lastScaleRatio ||
             surfaceId !== sampleEntry.lastSurfaceId
         ) {
             sampleEntry.lastIor = frame.ior;
             sampleEntry.lastThickness = frame.thickness;
-            sampleEntry.lastScaleRatio = frame.scaleRatio;
+            sampleEntry.lastScaleRatio = scaleRatio;
             sampleEntry.lastSurfaceId = surfaceId;
             if (sampleEntry.uOpticalLoc) {
-                gl.uniform4f(sampleEntry.uOpticalLoc, frame.ior, frame.thickness, frame.scaleRatio, surfaceId);
+                gl.uniform4f(sampleEntry.uOpticalLoc, frame.ior, frame.thickness, scaleRatio, surfaceId);
             }
         }
         if (
@@ -695,16 +756,29 @@ export class OpticalTransferCache {
                 );
             }
         }
+        if (sampleEntry.uSaturationLoc && saturation !== sampleEntry.lastSaturation) {
+            sampleEntry.lastSaturation = saturation;
+            gl.uniform1f(sampleEntry.uSaturationLoc, saturation);
+        }
+        const darkRimScale = frame.darkRimScale ?? 1;
         if (
             frame.highlight !== sampleEntry.lastHighlight ||
+            darkRimScale !== sampleEntry.lastDarkRimScale ||
             chromaStrength !== sampleEntry.lastChromaStrength ||
             blurRadiusPx !== sampleEntry.lastBlurRadiusPx
         ) {
             sampleEntry.lastHighlight = frame.highlight;
+            sampleEntry.lastDarkRimScale = darkRimScale;
             sampleEntry.lastChromaStrength = chromaStrength;
             sampleEntry.lastBlurRadiusPx = blurRadiusPx;
             if (sampleEntry.uHighlightLoc) {
-                gl.uniform4f(sampleEntry.uHighlightLoc, frame.highlight, chromaStrength, 4.0, blurRadiusPx);
+                gl.uniform4f(
+                    sampleEntry.uHighlightLoc,
+                    frame.highlight,
+                    chromaStrength,
+                    darkRimScale,
+                    blurRadiusPx,
+                );
             }
         }
         if (useScene && frame.sceneRect) {
@@ -752,22 +826,37 @@ export class OpticalTransferCache {
             gl.uniform2f(sampleEntry.uLightTiltLoc, lightTiltHorizontal, lightTiltVertical);
         }
 
+        if (sampleEntry.uSquircleLoc && squircleFlag !== sampleEntry.lastSquircle) {
+            sampleEntry.lastSquircle = squircleFlag;
+            gl.uniform1f(sampleEntry.uSquircleLoc, squircleFlag);
+        }
+
+        const useInteriorFlag = useInteriorTex ? 1 : 0;
+        if (sampleEntry.uUseInteriorTexLoc && useInteriorFlag !== sampleEntry.lastUseInteriorTex) {
+            sampleEntry.lastUseInteriorTex = useInteriorFlag;
+            gl.uniform1f(sampleEntry.uUseInteriorTexLoc, useInteriorFlag);
+        }
+
         gl.drawArrays(gl.TRIANGLES, 0, 3);
         return true;
     }
 
-    invalidate(): void {
-        this.releaseStorage();
+    invalidate(releaseTextures = false): void {
+        if (releaseTextures) {
+            this.releaseStorage();
+        } else {
+            this.geomKeyValid = false;
+        }
     }
 
     dispose(): void {
         if (this.disposed) return;
         this.disposed = true;
-        this.releaseStorage();
         if (this.framebuffer) {
             this.gl.deleteFramebuffer(this.framebuffer);
             this.framebuffer = null;
         }
+        this.releaseStorage();
         this.gl.deleteProgram(this.buildEntry.program);
         for (const entry of this.sampleEntries.values()) {
             this.gl.deleteProgram(entry.program);

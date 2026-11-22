@@ -1,6 +1,6 @@
 {
     "name": "@tahoangphuc111/liquid-glass",
-    "version": "0.3.1",
+    "version": "0.4.0",
     "description": "liquid glass refraction for vanilla js, react, and vue 3 using wasm svg displacement on desktop chromium and webgl/css scene capture on mobile and safari",
     "type": "module",
     "license": "MIT",
@@ -16,24 +16,44 @@
     "types": "./dist/index.d.ts",
     "exports": {
         ".": {
-            "types": "./dist/index.d.ts",
-            "import": "./dist/index.js",
-            "require": "./dist/index.cjs"
+            "import": {
+                "types": "./dist/index.d.ts",
+                "default": "./dist/index.js"
+            },
+            "require": {
+                "types": "./dist/index.d.cts",
+                "default": "./dist/index.cjs"
+            }
         },
         "./react": {
-            "types": "./dist/react/index.d.ts",
-            "import": "./dist/react/index.js",
-            "require": "./dist/react/index.cjs"
+            "import": {
+                "types": "./dist/react/index.d.ts",
+                "default": "./dist/react/index.js"
+            },
+            "require": {
+                "types": "./dist/react/index.d.cts",
+                "default": "./dist/react/index.cjs"
+            }
         },
         "./next": {
-            "types": "./dist/next/index.d.ts",
-            "import": "./dist/next/index.js",
-            "require": "./dist/next/index.cjs"
+            "import": {
+                "types": "./dist/next/index.d.ts",
+                "default": "./dist/next/index.js"
+            },
+            "require": {
+                "types": "./dist/next/index.d.cts",
+                "default": "./dist/next/index.cjs"
+            }
         },
         "./vue": {
-            "types": "./dist/vue/index.d.ts",
-            "import": "./dist/vue/index.js",
-            "require": "./dist/vue/index.cjs"
+            "import": {
+                "types": "./dist/vue/index.d.ts",
+                "default": "./dist/vue/index.js"
+            },
+            "require": {
+                "types": "./dist/vue/index.d.cts",
+                "default": "./dist/vue/index.cjs"
+            }
         },
         "./styles.css": "./dist/styles.css",
         "./package.json": "./package.json"

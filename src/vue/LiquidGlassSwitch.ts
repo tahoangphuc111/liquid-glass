@@ -1,14 +1,23 @@
-import { defineComponent, h, ref, watch, type PropType } from "vue";
+import { defineComponent, h, ref, watch, type PropType, type VNodeChild } from "vue";
 import type {
+    GlassCornerStyle,
+    GlassRefractionDirection,
+    LiquidGlassSwitchLayerOptions,
+    GlassDragMode,
     GlassEngine,
     GlassEngineMode,
+    GlassLightTiltMode,
+    GlassPreset,
     GlassSurface,
+    GlassSwitchOrientation,
+    GlassTheme,
 } from "../core/types.js";
 import { useGlassSwitch } from "./useGlassSwitch.js";
 
 export interface LiquidGlassSwitchItem {
     value: string;
     label: string;
+    icon?: VNodeChild;
     href?: string;
     disabled?: boolean;
     ariaLabel?: string;
@@ -37,8 +46,32 @@ export const LiquidGlassSwitch = defineComponent({
             type: String,
             default: undefined,
         },
+        orientation: {
+            type: String as PropType<GlassSwitchOrientation | undefined>,
+            default: undefined,
+        },
         itemSelector: {
             type: String,
+            default: undefined,
+        },
+        trackOptions: {
+            type: Object as PropType<LiquidGlassSwitchLayerOptions>,
+            default: undefined,
+        },
+        gliderOptions: {
+            type: Object as PropType<LiquidGlassSwitchLayerOptions>,
+            default: undefined,
+        },
+        gliderElement: {
+            type: Object as PropType<HTMLElement | null | undefined>,
+            default: undefined,
+        },
+        preset: {
+            type: String as PropType<GlassPreset | undefined>,
+            default: undefined,
+        },
+        theme: {
+            type: String as PropType<GlassTheme | undefined>,
             default: undefined,
         },
         surface: {
@@ -55,6 +88,22 @@ export const LiquidGlassSwitch = defineComponent({
         },
         bezel: {
             type: Number,
+            default: undefined,
+        },
+        refractionDirection: {
+            type: String as PropType<GlassRefractionDirection>,
+            default: undefined,
+        },
+        refractionEdgeFade: {
+            type: Number,
+            default: undefined,
+        },
+        maxRefractionPx: {
+            type: Number,
+            default: undefined,
+        },
+        adaptiveRefraction: {
+            type: Boolean,
             default: undefined,
         },
         scaleRatio: {
@@ -75,6 +124,10 @@ export const LiquidGlassSwitch = defineComponent({
         },
         radius: {
             type: Number,
+            default: undefined,
+        },
+        cornerStyle: {
+            type: String as PropType<GlassCornerStyle | undefined>,
             default: undefined,
         },
         pill: {
@@ -105,7 +158,15 @@ export const LiquidGlassSwitch = defineComponent({
             type: Number,
             default: undefined,
         },
+        lightTilt: {
+            type: [Object, String] as PropType<GlassLightTiltMode | undefined>,
+            default: undefined,
+        },
         pixelRatio: {
+            type: Number,
+            default: undefined,
+        },
+        saturation: {
             type: Number,
             default: undefined,
         },
@@ -113,12 +174,16 @@ export const LiquidGlassSwitch = defineComponent({
             type: [Boolean, Number] as PropType<boolean | number | undefined>,
             default: undefined,
         },
+        abbeNumber: {
+            type: Number,
+            default: undefined,
+        },
         interactive: {
             type: Boolean as PropType<boolean | undefined>,
             default: undefined,
         },
         draggable: {
-            type: [Boolean, String] as PropType<boolean | "elastic" | undefined>,
+            type: [Boolean, String] as PropType<GlassDragMode | undefined>,
             default: undefined,
         },
         coalesce: {
@@ -145,16 +210,27 @@ export const LiquidGlassSwitch = defineComponent({
         const { refresh } = useGlassSwitch(containerRef, () => ({
             value: props.modelValue ?? props.value,
             defaultValue: props.defaultValue,
+            orientation: props.orientation,
             itemSelector: props.itemSelector,
+            gliderElement: props.gliderElement,
+            trackOptions: props.trackOptions,
+            gliderOptions: props.gliderOptions,
+            preset: props.preset,
+            theme: props.theme,
             surface: props.surface,
             engine: props.engine,
             thickness: props.thickness,
             bezel: props.bezel,
+            adaptiveRefraction: props.adaptiveRefraction,
+            refractionDirection: props.refractionDirection,
+            refractionEdgeFade: props.refractionEdgeFade,
+            maxRefractionPx: props.maxRefractionPx,
             scaleRatio: props.scaleRatio,
             maxScaleMultiplier: props.maxScaleMultiplier,
             blur: props.blur,
             ior: props.ior,
             radius: props.radius,
+            cornerStyle: props.cornerStyle,
             pill: props.pill,
             hollow: props.hollow,
             alwaysOn: props.alwaysOn,
@@ -162,8 +238,11 @@ export const LiquidGlassSwitch = defineComponent({
             tintColor: props.tintColor,
             tintOpacity: props.tintOpacity,
             highlight: props.highlight,
+            lightTilt: props.lightTilt,
             pixelRatio: props.pixelRatio,
+            saturation: props.saturation,
             chromaticAberration: props.chromaticAberration,
+            abbeNumber: props.abbeNumber,
             interactive: props.interactive,
             draggable: props.draggable,
             coalesce: props.coalesce,
@@ -206,7 +285,7 @@ export const LiquidGlassSwitch = defineComponent({
                                         tabindex: item.disabled ? -1 : undefined,
                                         "aria-label": item.ariaLabel,
                                     },
-                                    [h("span", item.label)],
+                                    [item.icon ?? null, h("span", item.label)],
                                 )
                               : h(
                                     "button",
@@ -221,7 +300,7 @@ export const LiquidGlassSwitch = defineComponent({
                                         tabindex: item.disabled ? -1 : undefined,
                                         "aria-label": item.ariaLabel,
                                     },
-                                    [h("span", item.label)],
+                                    [item.icon ?? null, h("span", item.label)],
                                 ),
                       )
                     : slots.default?.(),

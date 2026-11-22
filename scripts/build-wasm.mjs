@@ -69,6 +69,7 @@ function verifyWasmBinary(wasmBytes) {
     const {
         initTables,
         generateDisplacementBmp,
+        generateDirectionalDisplacementBmp,
         getBmpOffset,
         getMaxDisplacementOffset,
         memory,
@@ -77,9 +78,10 @@ function verifyWasmBinary(wasmBytes) {
     if (
         typeof initTables !== "function" ||
         typeof generateDisplacementBmp !== "function" ||
+        typeof generateDirectionalDisplacementBmp !== "function" ||
         !(memory instanceof WebAssembly.Memory)
     ) {
-        throw new Error("Compiled WASM is missing required exports (initTables, generateDisplacementBmp, memory)");
+        throw new Error("Compiled WASM is missing required displacement exports");
     }
 
     const bmpOffset = typeof getBmpOffset === "function" ? getBmpOffset() : 0x14c00;
@@ -101,6 +103,18 @@ function verifyWasmBinary(wasmBytes) {
     const maxDisp = f32[maxDispOffset >> 2];
     if (!Number.isFinite(maxDisp) || maxDisp <= 0) {
         throw new Error(`Invalid maxDisplacement at 0x${maxDispOffset.toString(16)}: ${maxDisp}`);
+    }
+
+    const directionalLength = generateDirectionalDisplacementBmp(32, 16, 8, 6, 30, 1.0, 1.5, 0, 0, 1, 0.35);
+    const topMiddle = 64 + 16 * 4;
+    const leftMiddle = 64 + (8 * 32 + 2) * 4;
+    if (
+        directionalLength !== len ||
+        u8[topMiddle + 2] !== 128 ||
+        u8[leftMiddle + 1] !== 128 ||
+        Math.abs(u8[leftMiddle + 2] - 128) <= 1
+    ) {
+        throw new Error("WASM directional map did not isolate horizontal refraction");
     }
 }
 

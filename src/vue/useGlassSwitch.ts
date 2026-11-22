@@ -7,6 +7,7 @@ import {
     type MaybeRefOrGetter,
     type Ref,
 } from "vue";
+import { computeMergedOptionPatch, mergeGlassOptions } from "../core/config.js";
 import { createGlassSwitch } from "../core/switch.js";
 import type {
     GlassEngine,
@@ -22,6 +23,7 @@ export interface UseVueGlassSwitchResult {
     setValue: (value: string, animate?: boolean) => void;
     setActiveIndex: (index: number, animate?: boolean) => void;
     refresh: () => void;
+    setLightTilt: (horizontal: number, vertical: number) => void;
 }
 
 export function useGlassSwitch(
@@ -34,25 +36,31 @@ export function useGlassSwitch(
     const value = ref<string>(initialOptions.value ?? initialOptions.defaultValue ?? "");
     const activeIndex = ref<number>(0);
     let instance: LiquidGlassSwitchInstance | null = null;
+    let prevMergedOptions: LiquidGlassSwitchOptions | null = null;
 
     const syncInstance = () => {
         const element = targetRef.value;
         if (!element) {
             instance?.destroy();
             instance = null;
+            prevMergedOptions = null;
             return;
         }
 
         const currentOptions = toValue(options);
-        if (currentOptions.engine === "webgl" && context && !context.sceneCanvas.value) {
+        if (
+            (currentOptions.engine ?? context?.defaults.value?.engine) === "webgl" &&
+            context &&
+            !context.sceneCanvas.value
+        ) {
             context.requestSceneCapture();
         }
 
+        const sceneElement = currentOptions.sceneElement ?? context?.sceneElement.value ?? null;
         const mergedOptions: LiquidGlassSwitchOptions = {
-            ...(context?.defaults.value ?? {}),
-            ...currentOptions,
-            sceneCanvas: currentOptions.sceneCanvas ?? context?.sceneCanvas.value ?? null,
-            sceneElement: currentOptions.sceneElement ?? context?.sceneElement.value ?? null,
+            ...mergeGlassOptions(context?.defaults.value, currentOptions),
+            sceneCanvas: currentOptions.sceneCanvas ?? (sceneElement ? null : context?.sceneCanvas.value) ?? null,
+            sceneElement,
             onChange: (nextValue, nextIndex, itemElement) => {
                 value.value = nextValue;
                 activeIndex.value = nextIndex;
@@ -67,11 +75,14 @@ export function useGlassSwitch(
         if (!instance || instance.element !== element) {
             instance?.destroy();
             instance = createGlassSwitch(element, mergedOptions);
+            prevMergedOptions = mergedOptions;
             engine.value = instance.engine;
             value.value = instance.value;
             activeIndex.value = instance.activeIndex;
         } else {
-            instance.update(mergedOptions);
+            const patch = computeMergedOptionPatch(prevMergedOptions, mergedOptions);
+            prevMergedOptions = mergedOptions;
+            instance.update(patch);
             engine.value = instance.engine;
             value.value = instance.value;
             activeIndex.value = instance.activeIndex;
@@ -95,6 +106,7 @@ export function useGlassSwitch(
     onBeforeUnmount(() => {
         instance?.destroy();
         instance = null;
+        prevMergedOptions = null;
     });
 
     const setValue = (nextValue: string, animate = true) => {
@@ -119,6 +131,10 @@ export function useGlassSwitch(
         instance?.refresh();
     };
 
+    const setLightTilt = (horizontal: number, vertical: number) => {
+        instance?.setLightTilt?.(horizontal, vertical);
+    };
+
     return {
         engine,
         value,
@@ -126,5 +142,6 @@ export function useGlassSwitch(
         setValue,
         setActiveIndex,
         refresh,
+        setLightTilt,
     };
 }

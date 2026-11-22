@@ -12,10 +12,10 @@ import {
     type PropType,
     type Ref,
 } from "vue";
-import { canUseSvgGlass, getMediaQueries } from "../core/observer.js";
-import { createSceneCaptureController } from "../core/sceneCapture.js";
+import { canUseSvgGlass, canUseWebglRefraction, getMediaQueries, subscribeBatteryChanges } from "../core/observer.js";
+import { acquireSharedSceneCapture } from "../core/sceneCapture.js";
 import type { LiquidGlassOptions, SceneCaptureController } from "../core/types.js";
-import { onWasmReady } from "../core/wasm.js";
+import { isWasmReady, onWasmReady } from "../core/wasm.js";
 
 export interface VueLiquidGlassContext {
     sceneCanvas: Ref<HTMLCanvasElement | null>;
@@ -66,8 +66,8 @@ export const LiquidGlassProvider = defineComponent({
 
         const shouldCaptureNow = () => {
             if (props.captureScene === "never") return false;
-            if (props.captureScene === "always" || forcedCapture.value) return true;
-            return !canUseSvgGlass();
+            if (props.captureScene === "always") return true;
+            return canUseWebglRefraction() && (forcedCapture.value || !canUseSvgGlass());
         };
 
         const syncCapture = () => {
@@ -87,7 +87,8 @@ export const LiquidGlassProvider = defineComponent({
             }
 
             controller?.destroy();
-            controller = createSceneCaptureController(target, () => ({
+            sceneCanvas.value = null;
+            controller = acquireSharedSceneCapture(target, () => ({
                 pixelRatio: defaultsRef.value.pixelRatio,
                 radius: defaultsRef.value.pill ? 9999 : defaultsRef.value.radius,
             }));
@@ -99,6 +100,9 @@ export const LiquidGlassProvider = defineComponent({
         };
 
         watch([() => props.sceneElement, () => props.captureScene, forcedCapture], syncCapture);
+
+        let unsubWasm: (() => void) | null = null;
+        let unsubscribeBattery: (() => void) | null = null;
 
         onMounted(() => {
             syncCapture();
@@ -112,10 +116,17 @@ export const LiquidGlassProvider = defineComponent({
             mobileOrTouchQuery?.addEventListener?.("change", syncCapture);
             reducedTransparencyQuery?.addEventListener?.("change", syncCapture);
             highContrastQuery?.addEventListener?.("change", syncCapture);
-            onWasmReady(syncCapture);
+            if (!isWasmReady()) {
+                unsubWasm = onWasmReady(syncCapture);
+            }
+            unsubscribeBattery = subscribeBatteryChanges(syncCapture);
         });
 
         onBeforeUnmount(() => {
+            unsubWasm?.();
+            unsubWasm = null;
+            unsubscribeBattery?.();
+            unsubscribeBattery = null;
             const {
                 reducedMotionQuery,
                 mobileOrTouchQuery,

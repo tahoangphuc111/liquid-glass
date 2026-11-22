@@ -359,15 +359,268 @@ describe("360 droplet button drag and liquid coalescence", () => {
         syncCoalescenceGeometry(elA, 0, 0, 100, 50, 20, 14, 0, true);
         syncCoalescenceGeometry(elB, 110, 0, 100, 50, 20, 14, 0, true);
 
-        // B collects snapshot and sees A
         const snapB = collectCoalescenceSnapshot(elB);
         expect(snapB.peers.length).toBe(1);
 
         notifyB.mockClear();
-        // Unregister A - B must be notified to clear ghost blend
         unregisterA();
         expect(notifyB).toHaveBeenCalled();
 
         unregisterB();
+    });
+
+    it("accounts for rounded-corner clearance when elements are diagonally adjacent", () => {
+        const elemA = document.createElement("div");
+        const elemB = document.createElement("div");
+        const elemSharpA = document.createElement("div");
+        const elemSharpB = document.createElement("div");
+
+        const unregA = registerCoalescenceParticipant({
+            element: elemA,
+            notifyPeerUpdate: () => {},
+            readBounds: () => ({ left: 0, top: 0, width: 100, height: 60, radius: 30, bezel: 14 }),
+        });
+        const unregB = registerCoalescenceParticipant({
+            element: elemB,
+            notifyPeerUpdate: () => {},
+            readBounds: () => ({ left: 124, top: 84, width: 100, height: 60, radius: 30, bezel: 14 }),
+        });
+        const unregSharpA = registerCoalescenceParticipant({
+            element: elemSharpA,
+            notifyPeerUpdate: () => {},
+            readBounds: () => ({ left: 0, top: 400, width: 100, height: 60, radius: 0, bezel: 14 }),
+        });
+        const unregSharpB = registerCoalescenceParticipant({
+            element: elemSharpB,
+            notifyPeerUpdate: () => {},
+            readBounds: () => ({ left: 124, top: 484, width: 100, height: 60, radius: 0, bezel: 14 }),
+        });
+
+        syncCoalescenceGeometry(elemA, 0, 0, 100, 60, 30, 14);
+        syncCoalescenceGeometry(elemB, 124, 84, 100, 60, 30, 14);
+        const roundedSnap = collectCoalescenceSnapshot(elemA);
+        expect(roundedSnap.peers).toHaveLength(0);
+
+        syncCoalescenceGeometry(elemSharpA, 0, 400, 100, 60, 0, 14);
+        syncCoalescenceGeometry(elemSharpB, 124, 484, 100, 60, 0, 14);
+        const sharpSnap = collectCoalescenceSnapshot(elemSharpA);
+        expect(sharpSnap.peers).toHaveLength(1);
+
+        unregA();
+        unregB();
+        unregSharpA();
+        unregSharpB();
+    });
+
+    it("returns shared frozen empty snapshot for out-of-range participants without invoking DOM contains", () => {
+        const elemA = document.createElement("div");
+        const elemB = document.createElement("div");
+        const containsSpy = vi.spyOn(elemA, "contains");
+        const notifyB = vi.fn();
+
+        const unregA = registerCoalescenceParticipant({
+            element: elemA,
+            notifyPeerUpdate: () => {},
+            readBounds: () => ({ left: 0, top: 0, width: 100, height: 60, radius: 18, bezel: 14 }),
+        });
+        const unregB = registerCoalescenceParticipant({
+            element: elemB,
+            notifyPeerUpdate: notifyB,
+            readBounds: () => ({ left: 400, top: 0, width: 100, height: 60, radius: 18, bezel: 14 }),
+        });
+
+        syncCoalescenceGeometry(elemA, 0, 0, 100, 60, 18, 14);
+        syncCoalescenceGeometry(elemB, 400, 0, 100, 60, 18, 14);
+        const snap1 = collectCoalescenceSnapshot(elemA);
+        const snap2 = collectCoalescenceSnapshot(elemB);
+
+        expect(snap1).toBe(snap2);
+        expect(snap1.peers).toHaveLength(0);
+        expect(containsSpy).not.toHaveBeenCalled();
+        expect(notifyB).not.toHaveBeenCalled();
+
+        unregA();
+        unregB();
+    });
+
+    it("notifies both endpoints of a jump once, including a peer spanning both", () => {
+        const add = (left: number, width: number) => {
+            const element = document.createElement("div");
+            const notify = vi.fn();
+            registerCoalescenceParticipant({ element, notifyPeerUpdate: notify, readBounds: () => null });
+            syncCoalescenceGeometry(element, left, 0, width, 48, 12, 8, 0, false);
+            return { element, notify };
+        };
+        const moving = add(-10, 80);
+        const origin = add(80, 40);
+        const destination = add(10030, 40);
+        const middle = add(5000, 40);
+        const spanning = add(0, 10100);
+        for (let i = 0; i < 20; i++) add(20000 + 250 * i, 40);
+        collectCoalescenceSnapshot(moving.element);
+        syncCoalescenceGeometry(moving.element, 10000, 0, 80, 48, 12, 8);
+        expect(origin.notify).toHaveBeenCalledOnce();
+        expect(destination.notify).toHaveBeenCalledOnce();
+        expect(spanning.notify).toHaveBeenCalledOnce();
+        expect(middle.notify).not.toHaveBeenCalled();
+    });
+
+    it("deduplicates grid cells, indexes large bounds, and refreshes only affected peers", () => {
+        const registerAt = (left: number, top: number, width = 72) => {
+            const element = document.createElement("div");
+            const notify = vi.fn();
+            const bounds = { left, top, width, height: 48, radius: 14, bezel: 12 };
+            const unregister = registerCoalescenceParticipant({
+                element,
+                notifyPeerUpdate: notify,
+                readBounds: () => bounds,
+            });
+            syncCoalescenceGeometry(element, left, top, width, 48, 14, 12, 0, false);
+            return { element, notify, unregister };
+        };
+        const glass = registerAt(-18, 118);
+        const acrossCell = registerAt(62, 118);
+        const wide = registerAt(-3000, 118, 2975);
+        const far = registerAt(1000, 1000);
+        registerAt(1080, 1000);
+        for (let idx = 0; idx < 16; idx += 1) registerAt(4000 + idx * 200, 4000);
+
+        const snapshot = collectCoalescenceSnapshot(glass.element);
+        expect(snapshot.peers.map((peer) => peer.halfWidth)).toEqual([1487.5, 36]);
+        expect(collectCoalescenceSnapshot(far.element).peers).toHaveLength(1);
+
+        syncCoalescenceGeometry(wide.element, -4000, 2500, 2975, 48, 14, 12, 0, false);
+        syncCoalescenceGeometry(wide.element, -4000, 2500, 2975, 48, 14, 12, 1);
+        expect(glass.notify).toHaveBeenCalledTimes(1);
+        expect(far.notify).not.toHaveBeenCalled();
+        expect(collectCoalescenceSnapshot(glass.element).peers).toHaveLength(1);
+
+        acrossCell.unregister();
+        expect(glass.notify).toHaveBeenCalledTimes(2);
+        expect(collectCoalescenceSnapshot(glass.element).peers).toHaveLength(0);
+    });
+
+    it("cleans dependent peer references on unregister and lazily indexes spatial grid on large teleports", () => {
+        const makePeer = (left: number, top: number) => {
+            const element = document.createElement("div");
+            const notify = vi.fn();
+            const unregister = registerCoalescenceParticipant({
+                element,
+                notifyPeerUpdate: notify,
+                readBounds: () => ({ left, top, width: 60, height: 40, radius: 12, bezel: 10 }),
+            });
+            syncCoalescenceGeometry(element, left, top, 60, 40, 12, 10, 0, false);
+            return { element, notify, unregister };
+        };
+
+        const mover = makePeer(0, 0);
+        const startNeighbor = makePeer(68, 0);
+        const endNeighbor = makePeer(8068, 0);
+        for (let idx = 0; idx < 18; idx++) {
+            makePeer(2000 + idx * 150, 2000);
+        }
+
+        syncCoalescenceGeometry(mover.element, 8000, 0, 60, 40, 12, 10);
+        expect(startNeighbor.notify).toHaveBeenCalledTimes(1);
+        expect(endNeighbor.notify).toHaveBeenCalledTimes(1);
+
+        collectCoalescenceSnapshot(mover.element);
+        endNeighbor.unregister();
+        expect(mover.notify).toHaveBeenCalledTimes(1);
+        endNeighbor.unregister();
+        expect(mover.notify).toHaveBeenCalledTimes(1);
+        expect(collectCoalescenceSnapshot(mover.element).peers).toHaveLength(0);
+    });
+
+    it("computes Minkowski diagonal rounded-rect distance and C2 quintic coalescence falloff", () => {
+        const elA = document.createElement("div");
+        const elB = document.createElement("div");
+        document.body.append(elA, elB);
+
+        const unregA = registerCoalescenceParticipant({
+            element: elA,
+            readBounds: () => ({ left: 0, top: 0, width: 60, height: 60, radius: 15, bezel: 12 }),
+            notifyPeerUpdate: () => {},
+        });
+        const unregB = registerCoalescenceParticipant({
+            element: elB,
+            readBounds: () => ({ left: 80, top: 80, width: 60, height: 60, radius: 15, bezel: 12 }),
+            notifyPeerUpdate: () => {},
+        });
+
+        syncCoalescenceGeometry(elA, 0, 0, 60, 60, 15, 12, 0, false);
+        syncCoalescenceGeometry(elB, 80, 80, 60, 60, 15, 12, 0, false);
+        expect(collectCoalescenceSnapshot(elA).peers).toHaveLength(1);
+
+        syncCoalescenceGeometry(elB, 82, 82, 60, 60, 15, 12, 0, false);
+        expect(collectCoalescenceSnapshot(elA).peers).toHaveLength(0);
+
+        syncCoalescenceGeometry(elB, 0, 64, 60, 60, 15, 12, 0, false);
+        const closeSnap = collectCoalescenceSnapshot(elA);
+        expect(closeSnap.interferenceIntensity).toBeGreaterThan(0.95);
+        expect(closeSnap.requiredBleedPx).toBeGreaterThan(12);
+
+        unregA();
+        unregB();
+    });
+
+    it("preserves stationary participants in spatial grid after dropping below and re-crossing threshold", () => {
+        const registerAt = (left: number, top: number) => {
+            const element = document.createElement("div");
+            const unregister = registerCoalescenceParticipant({
+                element,
+                notifyPeerUpdate: () => {},
+                readBounds: () => ({ left, top, width: 60, height: 48, radius: 14, bezel: 12 }),
+            });
+            syncCoalescenceGeometry(element, left, top, 60, 48, 14, 12, 0, false);
+            return { element, unregister };
+        };
+
+        const pairA = registerAt(0, 0);
+        const pairB = registerAt(70, 0);
+        const extras = Array.from({ length: 15 }, (_, idx) => registerAt(3000 + idx * 200, 3000));
+
+        expect(collectCoalescenceSnapshot(pairA.element).peers).toHaveLength(1);
+
+        extras.pop()!.unregister();
+        extras.pop()!.unregister();
+        expect(collectCoalescenceSnapshot(pairA.element).peers).toHaveLength(1);
+
+        const extra1 = registerAt(9000, 9000);
+        const extra2 = registerAt(9200, 9000);
+        expect(collectCoalescenceSnapshot(pairA.element).peers).toHaveLength(1);
+        expect(collectCoalescenceSnapshot(pairB.element).peers).toHaveLength(1);
+
+        extra1.unregister();
+        extra2.unregister();
+        for (const extra of extras) extra.unregister();
+        pairA.unregister();
+        pairB.unregister();
+    });
+
+    it("does not repeatedly poll readBounds for hidden collapsed participants", () => {
+        const visibleEl = document.createElement("div");
+        const hiddenEl = document.createElement("div");
+        const readHiddenBounds = vi.fn(() => ({ left: 0, top: 0, width: 0, height: 0, radius: 0, bezel: 12 }));
+
+        const unregVisible = registerCoalescenceParticipant({
+            element: visibleEl,
+            notifyPeerUpdate: () => {},
+            readBounds: () => ({ left: 0, top: 0, width: 80, height: 48, radius: 14, bezel: 12 }),
+        });
+        const unregHidden = registerCoalescenceParticipant({
+            element: hiddenEl,
+            notifyPeerUpdate: () => {},
+            readBounds: readHiddenBounds,
+        });
+
+        syncCoalescenceGeometry(visibleEl, 0, 0, 80, 48, 14, 12, 0, false);
+        for (let idx = 0; idx < 5; idx += 1) {
+            collectCoalescenceSnapshot(visibleEl);
+        }
+        expect(readHiddenBounds).toHaveBeenCalledTimes(1);
+
+        unregVisible();
+        unregHidden();
     });
 });

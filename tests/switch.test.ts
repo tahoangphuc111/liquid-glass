@@ -98,6 +98,28 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
         expect(items[1]!.style.getPropertyValue("--lg-switch-hit-end")).toBe("");
     });
 
+    it("applies per-part optics and follows orientation when overrides are reset", () => {
+        const { nav } = buildSwitchFixture([90, 90], ["one", "two"]);
+        const sw = createGlassSwitch(nav, {
+            engine: "css",
+            trackOptions: { refractionDirection: "all", blur: 2 },
+            gliderOptions: { refractionEdgeFade: 0.6 },
+        });
+        const glider = nav.querySelector<HTMLElement>(".lg-switch-glider")!;
+        expect(nav.getAttribute("data-lg-refraction-axis")).toBe("all");
+        expect(nav.style.getPropertyValue("--lg-filter")).toContain("blur(7.0px)");
+        expect(glider.getAttribute("data-lg-refraction-axis")).toBe("horizontal");
+        expect(glider.style.getPropertyValue("--lg-refraction-fade")).toBe("30%");
+
+        sw.update({ orientation: "vertical", trackOptions: undefined, gliderOptions: undefined });
+        expect(nav.getAttribute("data-lg-refraction-axis")).toBe("vertical");
+        expect(nav.style.getPropertyValue("--lg-filter")).toBe("blur(0.0px)");
+        expect(glider.getAttribute("data-lg-refraction-axis")).toBe("vertical");
+        expect(glider.style.getPropertyValue("--lg-refraction-fade")).toBe("17.5%");
+        sw.destroy();
+        expect(nav.hasAttribute("data-lg-refraction-axis")).toBe(false);
+    });
+
     it("switches tabs on click and suppresses trailing click immediately after a real drag", () => {
         let nowMs = 1000;
         let nextFrameId = 1;
@@ -153,6 +175,38 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
         expect(switchInstance.value).toBe("library");
 
         switchInstance.destroy();
+    });
+
+    it("sleeps while held still, wakes on drag and settles at the released anchor", () => {
+        vi.useFakeTimers();
+        const { nav } = buildSwitchFixture([96, 96], ["one", "two"]);
+        const sw = createGlassSwitch(nav, { engine: "css" });
+        const glider = nav.querySelector<HTMLElement>(".lg-switch-glider")!;
+        const frames = vi.spyOn(window, "requestAnimationFrame");
+        try {
+            dispatchPointerEvent(nav, "pointerdown", { clientX: 40 });
+            vi.advanceTimersByTime(2000);
+            expect(nav.classList.contains("is-animating")).toBe(false);
+            expect(nav.classList.contains("is-pressed")).toBe(true);
+            expect(Number(glider.style.getPropertyValue("--p"))).toBeGreaterThan(0);
+            frames.mockClear();
+            vi.advanceTimersByTime(2000);
+            expect(frames).not.toHaveBeenCalled();
+
+            dispatchPointerEvent(window, "pointermove", { clientX: 138 });
+            expect(nav.classList.contains("is-animating")).toBe(true);
+            vi.advanceTimersByTime(2000);
+            expect(nav.classList.contains("is-animating")).toBe(false);
+            expect(nav.classList.contains("is-dragging")).toBe(true);
+            dispatchPointerEvent(window, "pointerup", { clientX: 138 });
+            vi.advanceTimersByTime(2000);
+            expect(sw.value).toBe("two");
+            expect(nav.classList.contains("is-animating")).toBe(false);
+            expect(Number(glider.style.getPropertyValue("--p"))).toBe(0);
+        } finally {
+            sw.destroy();
+            vi.useRealTimers();
+        }
     });
 
     it("projects swipe throw velocity forward and excites swell & wobble physics", () => {
@@ -261,7 +315,7 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
         expect(nav.querySelector(".lg-switch-glider")).toBeNull();
     });
 
-    it("updates per-frame color coverage and horizontal hit bounds as the glider moves across tabs", () => {
+    it.each([3, 30])("updates per-frame color coverage and hit bounds with %i tabs", (tabCount) => {
         let nowMs = 200;
         let nextRafId = 1;
         const queuedCallbacks = new Map<number, FrameRequestCallback>();
@@ -277,7 +331,8 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
             queuedCallbacks.delete(id);
         });
 
-        const { nav, items } = buildSwitchFixture([100, 100, 100], ["a", "b", "c"]);
+        const values = ["a", "b", ...Array.from({ length: tabCount - 2 }, (_, idx) => String(idx))];
+        const { nav, items } = buildSwitchFixture(values.map(() => 100), values);
         const switchInstance = createGlassSwitch(nav, {
             engine: "css",
             defaultValue: "a",
@@ -287,6 +342,7 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
         expect(items[1]!.style.getPropertyValue("--lg-switch-coverage")).toBe("0.000");
 
         switchInstance.setValue("b", true);
+        const distantItem = vi.spyOn(items.at(-1)!, "setAttribute");
 
         for (let frame = 0; frame < 4; frame += 1) {
             const pending = Array.from(queuedCallbacks.entries());
@@ -295,6 +351,7 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
             for (const [, callback] of pending) {
                 callback(nowMs);
             }
+            if (frame === 0) distantItem.mockClear();
         }
 
         const midCoverageFirst = Number.parseFloat(
@@ -314,6 +371,7 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
         expect(items[1]!.style.getPropertyValue("--lg-switch-hit-start")).toBe("0.0%");
         expect(midHitEndSecond).toBeGreaterThan(0);
         expect(midHitEndSecond).toBeLessThan(100);
+        expect(distantItem).not.toHaveBeenCalledWith("aria-selected", expect.anything());
 
         for (let frame = 0; frame < 90; frame += 1) {
             const pending = Array.from(queuedCallbacks.entries());
@@ -342,24 +400,19 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
             defaultValue: "one",
         });
 
-        // Start drag with pointerId 10
         dispatchPointerEvent(nav, "pointerdown", { pointerId: 10, clientX: 20 });
         expect(nav.classList.contains("is-pressed")).toBe(true);
 
-        // Move pointerId 10 past threshold
         dispatchPointerEvent(window, "pointermove", { pointerId: 10, clientX: 50 });
         expect(nav.classList.contains("is-dragging")).toBe(true);
 
-        // Secondary pointer 20 moves - should be ignored
         dispatchPointerEvent(window, "pointermove", { pointerId: 20, clientX: 999 });
         expect(nav.classList.contains("is-dragging")).toBe(true);
 
-        // Secondary pointer 20 releases - should NOT cancel pointer 10's drag
         dispatchPointerEvent(window, "pointerup", { pointerId: 20, clientX: 999 });
         expect(nav.classList.contains("is-dragging")).toBe(true);
         expect(nav.classList.contains("is-pressed")).toBe(true);
 
-        // Primary pointer 10 releases - ends drag
         dispatchPointerEvent(window, "pointerup", { pointerId: 10, clientX: 50 });
         expect(nav.classList.contains("is-dragging")).toBe(false);
         expect(nav.classList.contains("is-pressed")).toBe(false);
@@ -371,11 +424,9 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
         const nav = document.createElement("nav");
         document.body.appendChild(nav);
 
-        // Initialize with empty nav
         const switchInstance = createGlassSwitch(nav, { engine: "css" });
         expect(switchInstance.value).toBe("");
 
-        // Now mount items dynamically
         const button1 = document.createElement("button");
         button1.className = "lg-switch-item";
         button1.dataset.switchValue = "alpha";
@@ -393,7 +444,6 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
         nav.appendChild(button1);
         nav.appendChild(button2);
 
-        // Click on button2 - should measure and select Beta
         button2.click();
         expect(switchInstance.value).toBe("beta");
         expect(switchInstance.activeIndex).toBe(1);
@@ -411,7 +461,6 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
         expect(switchInstance.activeIndex).toBe(3);
         expect(switchInstance.value).toBe("d");
 
-        // Remove 2 items from DOM (down to 2 items)
         items[2]!.remove();
         items[3]!.remove();
 
@@ -420,6 +469,22 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
         expect(switchInstance.value).toBe("b");
 
         switchInstance.destroy();
+    });
+
+    it("keeps selection by element when tabs are reordered and ignores non-finite indices", async () => {
+        const { nav, items } = buildSwitchFixture([80, 60, 100], ["a", "b", "c"]);
+        const onChange = vi.fn();
+        const sw = createGlassSwitch(nav, { engine: "css", defaultValue: "b", onChange });
+
+        nav.appendChild(items[1]!);
+        await Promise.resolve();
+        expect(sw.activeIndex).toBe(2);
+        expect(sw.value).toBe("b");
+        expect(items[1]!.getAttribute("aria-selected")).toBe("true");
+        sw.setActiveIndex(NaN);
+        expect(sw.value).toBe("b");
+        expect(onChange).not.toHaveBeenCalled();
+        sw.destroy();
     });
 
     it("supports dynamic itemSelector update via switchInstance.update()", () => {
@@ -446,7 +511,6 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
         });
         expect(switchInstance.value).toBe("");
 
-        // Update selector
         switchInstance.update({ itemSelector: ".custom-tab" });
         switchInstance.setValue("custom2", false);
         expect(switchInstance.value).toBe("custom2");
@@ -464,7 +528,6 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
             defaultValue: "charlie",
         });
 
-        // Even with no elements initially, value returns the pending wanted value
         expect(switchInstance.value).toBe("charlie");
 
         const button1 = document.createElement("button");
@@ -501,7 +564,6 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
 
     it("ignores clicks and skips disabled items during keyboard navigation", () => {
         const { nav, items } = buildSwitchFixture([80, 80, 80], ["first", "second", "third"]);
-        // Mark the middle item disabled
         items[1]!.disabled = true;
 
         const switchInstance = createGlassSwitch(nav, {
@@ -511,21 +573,17 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
 
         expect(switchInstance.activeIndex).toBe(0);
 
-        // Clicking the disabled button must not select it
         items[1]!.click();
         expect(switchInstance.activeIndex).toBe(0);
         expect(switchInstance.value).toBe("first");
 
-        // Pointerdown on disabled button does not trigger is-pressed
         dispatchPointerEvent(items[1]!, "pointerdown", { clientX: 120, pointerId: 10 });
         expect(nav.classList.contains("is-pressed")).toBe(false);
 
-        // ArrowRight from 0 should skip disabled item 1 and land on item 2
         nav.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
         expect(switchInstance.activeIndex).toBe(2);
         expect(switchInstance.value).toBe("third");
 
-        // ArrowLeft from 2 should skip disabled item 1 and land on item 0
         nav.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true }));
         expect(switchInstance.activeIndex).toBe(0);
         expect(switchInstance.value).toBe("first");
@@ -557,11 +615,9 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
         nav.appendChild(link2);
 
         const switchInstance = createGlassSwitch(nav, { engine: "css" });
-        // Since link 1 is disabled and no initial value specified, link 2 is selected
         expect(switchInstance.activeIndex).toBe(1);
         expect(switchInstance.value).toBe("l2");
 
-        // Clicking disabled link calls preventDefault
         const clickEvent = new MouseEvent("click", { bubbles: true, cancelable: true });
         const preventDefaultSpy = vi.spyOn(clickEvent, "preventDefault");
         link1.dispatchEvent(clickEvent);
@@ -585,15 +641,12 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
         expect(switchInstance.activeIndex).toBe(0);
         expect(switchInstance.value).toBe("tab0");
 
-        // User or code switches to tab2
         switchInstance.setActiveIndex(2, false);
         expect(switchInstance.activeIndex).toBe(2);
         expect(switchInstance.value).toBe("tab2");
 
-        // Trigger refresh (as happens during window/container resize)
         switchInstance.refresh();
 
-        // Must not reset back to tab0
         expect(switchInstance.activeIndex).toBe(2);
         expect(switchInstance.value).toBe("tab2");
 
@@ -642,12 +695,10 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
 
         expect(switchInstance.activeIndex).toBe(0);
 
-        // ArrowDown moves forward like ArrowRight
         nav.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
         expect(switchInstance.activeIndex).toBe(1);
         expect(switchInstance.value).toBe("tab1");
 
-        // ArrowUp moves backward like ArrowLeft
         nav.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true }));
         expect(switchInstance.activeIndex).toBe(0);
         expect(switchInstance.value).toBe("tab0");
@@ -681,7 +732,6 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
             ["tab0", "tab1", "tab2"],
         );
 
-        // Mark tab1 disabled via CSS class
         items[1]!.classList.add("is-disabled");
 
         const switchInstance = createGlassSwitch(nav, {
@@ -691,12 +741,10 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
 
         expect(switchInstance.activeIndex).toBe(0);
 
-        // Clicking disabled tab1 should be prevented
         items[1]!.click();
         expect(switchInstance.activeIndex).toBe(0);
         expect(switchInstance.value).toBe("tab0");
 
-        // ArrowRight navigation should skip tab1 and go straight to tab2
         nav.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
         expect(switchInstance.activeIndex).toBe(2);
         expect(switchInstance.value).toBe("tab2");
@@ -720,10 +768,417 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
 
         switchInstance.destroy();
 
-        // Custom glider must remain in the DOM, but its inline properties must be stripped
         expect(nav.contains(customGlider)).toBe(true);
         expect(customGlider.style.getPropertyValue("--p")).toBe("");
         expect(customGlider.style.getPropertyValue("transform")).toBe("");
         expect(customGlider.style.getPropertyValue("width")).toBe("");
+    });
+
+    it("preserves the track sceneElement fallback for the glider across update() calls", () => {
+        const win = window as unknown as { __LG_FORCE_CHROMIUM__?: boolean };
+        win.__LG_FORCE_CHROMIUM__ = false;
+        const getContextSpy = vi
+            .spyOn(HTMLCanvasElement.prototype, "getContext")
+            .mockImplementation((type: string) => {
+                if (type === "webgl2" || type === "webgl") {
+                    return {
+                        VERTEX_SHADER: 0x8b31,
+                        FRAGMENT_SHADER: 0x8b30,
+                        COMPILE_STATUS: 0x8b81,
+                        LINK_STATUS: 0x8b82,
+                        ARRAY_BUFFER: 0x8892,
+                        STATIC_DRAW: 0x88e4,
+                        FLOAT: 0x1406,
+                        TEXTURE0: 0x84c0,
+                        TEXTURE1: 0x84c1,
+                        TEXTURE_2D: 0x0de1,
+                        RGBA: 0x1908,
+                        UNSIGNED_BYTE: 0x1401,
+                        TEXTURE_WRAP_S: 0x2802,
+                        TEXTURE_WRAP_T: 0x2803,
+                        TEXTURE_MIN_FILTER: 0x2801,
+                        TEXTURE_MAG_FILTER: 0x2800,
+                        CLAMP_TO_EDGE: 0x812f,
+                        LINEAR: 0x2601,
+                        MAX_VIEWPORT_DIMS: 0x0d3a,
+                        MAX_TEXTURE_SIZE: 0x0d33,
+                        UNPACK_FLIP_Y_WEBGL: 0x9240,
+                        UNPACK_PREMULTIPLY_ALPHA_WEBGL: 0x9241,
+                        getParameter: () => 4096,
+                        getExtension: () => null,
+                        createShader: () => ({}),
+                        shaderSource: () => {},
+                        compileShader: () => {},
+                        getShaderParameter: () => true,
+                        deleteShader: () => {},
+                        createProgram: () => ({}),
+                        attachShader: () => {},
+                        bindAttribLocation: () => {},
+                        linkProgram: () => {},
+                        getProgramParameter: () => true,
+                        deleteProgram: () => {},
+                        useProgram: () => {},
+                        createBuffer: () => ({}),
+                        bindBuffer: () => {},
+                        bufferData: () => {},
+                        deleteBuffer: () => {},
+                        getAttribLocation: () => 0,
+                        enableVertexAttribArray: () => {},
+                        vertexAttribPointer: () => {},
+                        getUniformLocation: () => ({}),
+                        activeTexture: () => {},
+                        createTexture: () => ({}),
+                        bindTexture: () => {},
+                        pixelStorei: () => {},
+                        texParameteri: () => {},
+                        texImage2D: () => {},
+                        deleteTexture: () => {},
+                        uniform1i: () => {},
+                        uniform1f: () => {},
+                        uniform2f: () => {},
+                        uniform4f: () => {},
+                        viewport: () => {},
+                        drawArrays: () => {},
+                    } as unknown as RenderingContext;
+                }
+                return null;
+            });
+
+        const { nav } = buildSwitchFixture([80, 80], ["tab0", "tab1"]);
+        const switchInstance = createGlassSwitch(nav, {
+            engine: "auto",
+        });
+        expect(switchInstance.engine).toBe("webgl");
+
+        switchInstance.update({ sceneElement: null, tintOpacity: 0.2 });
+        expect(switchInstance.engine).toBe("webgl");
+
+        switchInstance.destroy();
+        getContextSpy.mockRestore();
+        delete win.__LG_FORCE_CHROMIUM__;
+    });
+
+    it("supports non-monotonic / RTL spatial anchor ordering for sweep, width interpolation, and dragging", () => {
+        const nav = document.createElement("nav");
+        const specs = [
+            { value: "first", left: 204, width: 80 },
+            { value: "second", left: 104, width: 100 },
+            { value: "third", left: 4, width: 100 },
+        ];
+
+        specs.forEach((spec) => {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "lg-switch-item";
+            button.dataset.switchValue = spec.value;
+            button.textContent = spec.value;
+            Object.defineProperty(button, "offsetLeft", {
+                get: () => spec.left,
+                configurable: true,
+            });
+            Object.defineProperty(button, "offsetWidth", {
+                get: () => spec.width,
+                configurable: true,
+            });
+            nav.appendChild(button);
+        });
+        document.body.appendChild(nav);
+
+        const sw = createGlassSwitch(nav, {
+            engine: "css",
+            defaultValue: "third",
+        });
+
+        expect(nav.style.getPropertyValue("--sweep")).toBe("-15.0%");
+
+        const glider = nav.querySelector(".lg-switch-glider") as HTMLElement;
+        expect(parseFloat(glider.style.width)).toBe(100);
+
+        sw.setValue("first", false);
+        expect(nav.style.getPropertyValue("--sweep")).toBe("115.0%");
+        expect(parseFloat(glider.style.width)).toBe(80);
+
+        let nowMs = 1000;
+        vi.spyOn(performance, "now").mockImplementation(() => nowMs);
+        dispatchPointerEvent(nav, "pointerdown", { clientX: 244, pointerId: 1 });
+        nowMs += 200;
+        dispatchPointerEvent(nav, "pointermove", { clientX: 144, pointerId: 1 });
+        nowMs += 100;
+        dispatchPointerEvent(nav, "pointermove", { clientX: 144, pointerId: 1 });
+        expect(parseFloat(glider.style.width)).toBeCloseTo(100, 1);
+        dispatchPointerEvent(nav, "pointerup", { clientX: 144, pointerId: 1 });
+        expect(sw.value).toBe("second");
+
+        sw.destroy();
+    });
+
+    it("gates progressive label and icon highlight strictly to active liquid glass lenses and manages track element lifecycle", () => {
+        const nav = document.createElement("nav");
+        const labels: HTMLSpanElement[] = [];
+        const buttons: HTMLButtonElement[] = [];
+
+        ["Home", "Search"].forEach((name, idx) => {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "lg-switch-item";
+            btn.dataset.switchValue = name.toLowerCase();
+            const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+            svg.getBoundingClientRect = () =>
+                ({ left: 4 + idx * 100 + 40, top: 6, right: 4 + idx * 100 + 60, bottom: 26, width: 20, height: 20, x: 4 + idx * 100 + 40, y: 6, toJSON() {} }) as DOMRect;
+            const span = document.createElement("span");
+            span.textContent = name;
+            Object.defineProperty(span, "offsetLeft", { get: () => 25, configurable: true });
+            Object.defineProperty(span, "offsetWidth", { get: () => 50, configurable: true });
+            btn.append(svg, span);
+
+            const left = 4 + idx * 100;
+            Object.defineProperty(btn, "offsetLeft", { get: () => left, configurable: true });
+            Object.defineProperty(btn, "offsetWidth", { get: () => 100, configurable: true });
+            btn.getBoundingClientRect = () =>
+                ({ left, top: 0, right: left + 100, bottom: 44, width: 100, height: 44, x: left, y: 0, toJSON() {} }) as DOMRect;
+
+            nav.appendChild(btn);
+            buttons.push(btn);
+            labels.push(span);
+        });
+        document.body.appendChild(nav);
+
+        const cssSwitch = createGlassSwitch(nav, {
+            engine: "css",
+            blur: 12,
+            defaultValue: "home",
+        });
+
+        expect(nav.querySelector(".lg-switch-track")).not.toBeNull();
+        expect(nav.hasAttribute("data-lg-switch-glass")).toBe(false);
+        expect(labels[0]!.hasAttribute("data-lg-switch-lit")).toBe(false);
+        expect(labels[1]!.hasAttribute("data-lg-switch-lit")).toBe(false);
+        expect(buttons[0]!.style.getPropertyValue("--lg-switch-icon-coverage")).toBe("0.000");
+        expect(buttons[1]!.style.getPropertyValue("--lg-switch-icon-coverage")).toBe("0.000");
+
+        let nowMs = 1000;
+        vi.spyOn(performance, "now").mockImplementation(() => nowMs);
+        dispatchPointerEvent(nav, "pointerdown", { clientX: 50, pointerId: 1 });
+        nowMs += 200;
+        dispatchPointerEvent(window, "pointermove", { clientX: 110, pointerId: 1 });
+        expect(labels[1]!.hasAttribute("data-lg-switch-lit")).toBe(false);
+        expect(buttons[1]!.style.getPropertyValue("--lg-switch-icon-coverage")).toBe("0.000");
+        dispatchPointerEvent(window, "pointerup", { clientX: 110, pointerId: 1 });
+        cssSwitch.destroy();
+        expect(nav.querySelector(".lg-switch-track")).toBeNull();
+
+        const win = window as unknown as { __LG_FORCE_CHROMIUM__?: boolean };
+        win.__LG_FORCE_CHROMIUM__ = false;
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation((type: string) => {
+            if (type === "webgl2" || type === "webgl") {
+                return {
+                    VERTEX_SHADER: 0x8b31,
+                    FRAGMENT_SHADER: 0x8b30,
+                    COMPILE_STATUS: 0x8b81,
+                    LINK_STATUS: 0x8b82,
+                    ARRAY_BUFFER: 0x8892,
+                    STATIC_DRAW: 0x88e4,
+                    FLOAT: 0x1406,
+                    TEXTURE0: 0x84c0,
+                    TEXTURE1: 0x84c1,
+                    TEXTURE_2D: 0x0de1,
+                    RGBA: 0x1908,
+                    UNSIGNED_BYTE: 0x1401,
+                    TEXTURE_WRAP_S: 0x2802,
+                    TEXTURE_WRAP_T: 0x2803,
+                    TEXTURE_MIN_FILTER: 0x2801,
+                    TEXTURE_MAG_FILTER: 0x2800,
+                    CLAMP_TO_EDGE: 0x812f,
+                    LINEAR: 0x2601,
+                    MAX_VIEWPORT_DIMS: 0x0d3a,
+                    MAX_TEXTURE_SIZE: 0x0d33,
+                    UNPACK_FLIP_Y_WEBGL: 0x9240,
+                    UNPACK_PREMULTIPLY_ALPHA_WEBGL: 0x9241,
+                    getParameter: () => 4096,
+                    getExtension: () => null,
+                    createShader: () => ({}),
+                    shaderSource: () => {},
+                    compileShader: () => {},
+                    getShaderParameter: () => true,
+                    deleteShader: () => {},
+                    createProgram: () => ({}),
+                    attachShader: () => {},
+                    bindAttribLocation: () => {},
+                    linkProgram: () => {},
+                    getProgramParameter: () => true,
+                    deleteProgram: () => {},
+                    useProgram: () => {},
+                    createBuffer: () => ({}),
+                    bindBuffer: () => {},
+                    bufferData: () => {},
+                    deleteBuffer: () => {},
+                    getAttribLocation: () => 0,
+                    enableVertexAttribArray: () => {},
+                    vertexAttribPointer: () => {},
+                    getUniformLocation: () => ({}),
+                    activeTexture: () => {},
+                    createTexture: () => ({}),
+                    bindTexture: () => {},
+                    pixelStorei: () => {},
+                    texParameteri: () => {},
+                    texImage2D: () => {},
+                    deleteTexture: () => {},
+                    uniform1i: () => {},
+                    uniform1f: () => {},
+                    uniform2f: () => {},
+                    uniform4f: () => {},
+                    viewport: () => {},
+                    drawArrays: () => {},
+                } as unknown as RenderingContext;
+            }
+            return null;
+        });
+
+        const glassSwitch = createGlassSwitch(nav, {
+            engine: "auto",
+            blur: 14,
+            defaultValue: "home",
+        });
+        expect(glassSwitch.engine).toBe("webgl");
+        expect(nav.getAttribute("data-lg-switch-glass")).toBe("1");
+        expect(nav.style.getPropertyValue("--lg-filter")).not.toContain("blur(14px)");
+        expect(labels[0]!.getAttribute("data-lg-switch-lit")).toBe("1");
+        expect(labels[1]!.hasAttribute("data-lg-switch-lit")).toBe(false);
+
+        nowMs += 200;
+        dispatchPointerEvent(nav, "pointerdown", { clientX: 50, pointerId: 2 });
+        nowMs += 200;
+        dispatchPointerEvent(window, "pointermove", { clientX: 65, pointerId: 2 });
+        expect(Number.parseFloat(buttons[1]!.style.getPropertyValue("--lg-switch-hit-end"))).toBeGreaterThan(0);
+        expect(labels[1]!.hasAttribute("data-lg-switch-lit")).toBe(false);
+        expect(buttons[1]!.style.getPropertyValue("--lg-switch-icon-coverage")).toBe("0.000");
+
+        nowMs += 200;
+        dispatchPointerEvent(window, "pointermove", { clientX: 110, pointerId: 2 });
+        expect(labels[1]!.getAttribute("data-lg-switch-lit")).toBe("1");
+        expect(Number.parseFloat(labels[1]!.style.getPropertyValue("--lg-switch-label-hit-end"))).toBeGreaterThan(0);
+        expect(Number.parseFloat(buttons[1]!.style.getPropertyValue("--lg-switch-icon-coverage"))).toBeGreaterThan(0);
+
+        dispatchPointerEvent(window, "pointerup", { clientX: 110, pointerId: 2 });
+        glassSwitch.destroy();
+        expect(nav.hasAttribute("data-lg-switch-glass")).toBe(false);
+        expect(nav.querySelector(".lg-switch-track")).toBeNull();
+        expect(labels[1]!.hasAttribute("data-lg-switch-lit")).toBe(false);
+        expect(buttons[1]!.style.getPropertyValue("--lg-switch-icon-coverage")).toBe("");
+    });
+
+    it("emits onChange from setValue, guards disabled/destroyed state, clears tintColor, observes dynamic items, and supports vertical stale fling decay", async () => {
+        const nav = document.createElement("nav");
+        const tabA = document.createElement("button");
+        tabA.dataset.switchValue = "a";
+        Object.defineProperties(tabA, { offsetTop: { value: 4 }, offsetHeight: { value: 44 }, offsetLeft: { value: 4 }, offsetWidth: { value: 120 } });
+        const tabB = document.createElement("button");
+        tabB.dataset.switchValue = "b";
+        Object.defineProperties(tabB, { offsetTop: { value: 52 }, offsetHeight: { value: 44 }, offsetLeft: { value: 4 }, offsetWidth: { value: 120 } });
+        const tabC = document.createElement("button");
+        tabC.dataset.switchValue = "c";
+        tabC.disabled = true;
+        nav.append(tabA, tabB, tabC);
+        document.body.appendChild(nav);
+
+        let nowPerf = 100;
+        vi.spyOn(performance, "now").mockImplementation(() => nowPerf);
+
+        const changes: Array<[string, number]> = [];
+        const sw = createGlassSwitch(nav, {
+            engine: "css",
+            orientation: "vertical",
+            defaultValue: "a",
+            tintColor: "rgb(10, 20, 30)",
+            onChange: (val, idx) => changes.push([val, idx]),
+        });
+        expect(nav.getAttribute("data-lg-switch-orientation")).toBe("vertical");
+        const glider = nav.querySelector<HTMLElement>(".lg-switch-glider")!;
+        expect(glider.style.transform).toContain("translate3d(0, 0.00px, 0)");
+
+        nav.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, clientX: 20, clientY: 10 }));
+        nowPerf = 116;
+        window.dispatchEvent(new MouseEvent("pointermove", { bubbles: true, clientX: 20, clientY: 22 }));
+        nowPerf = 450;
+        window.dispatchEvent(new MouseEvent("pointerup", { bubbles: true, clientX: 20, clientY: 22 }));
+        expect(sw.value).toBe("a");
+
+        sw.setValue("b", false);
+        expect(sw.value).toBe("b");
+        expect(changes).toEqual([["b", 1]]);
+        expect(glider.style.transform).toContain("translate3d(0, 48.00px, 0)");
+
+        sw.setValue("c", false);
+        sw.setActiveIndex(2, false);
+        expect(sw.value).toBe("b");
+        expect(changes).toEqual([["b", 1]]);
+
+        expect(nav.style.getPropertyValue("--lg-tint")).toBe("rgba(10, 20, 30, 0.06)");
+        sw.update({ tintColor: undefined });
+        expect(nav.style.getPropertyValue("--lg-tint")).toBe("rgba(255, 255, 255, 0.06)");
+
+        const tabD = document.createElement("button");
+        tabD.dataset.switchValue = "d";
+        nav.appendChild(tabD);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        sw.setValue("d", false);
+        expect(sw.value).toBe("d");
+
+        sw.destroy();
+        sw.setValue("a", false);
+        sw.update({ orientation: "horizontal" });
+        expect(sw.value).toBe("d");
+    });
+
+    it("defers glider style writes until after all anchor layout reads during measureAnchors", () => {
+        let sawReadAfterWrite = false;
+        let wroteGliderLeft = false;
+        const nav = document.createElement("nav");
+        const tab1 = document.createElement("button");
+        tab1.dataset.switchValue = "one";
+        const tab2 = document.createElement("button");
+        tab2.dataset.switchValue = "two";
+        Object.defineProperties(tab1, {
+            offsetLeft: { configurable: true, get: () => 4 },
+            offsetWidth: { configurable: true, get: () => 80 },
+        });
+        Object.defineProperties(tab2, {
+            offsetLeft: {
+                configurable: true,
+                get: () => {
+                    if (wroteGliderLeft) sawReadAfterWrite = true;
+                    return 88;
+                },
+            },
+            offsetWidth: {
+                configurable: true,
+                get: () => {
+                    if (wroteGliderLeft) sawReadAfterWrite = true;
+                    return 80;
+                },
+            },
+        });
+        nav.append(tab1, tab2);
+        document.body.appendChild(nav);
+
+        const sw = createGlassSwitch(nav, { engine: "css", defaultValue: "one" });
+        const glider = nav.querySelector<HTMLElement>(".lg-switch-glider")!;
+
+        const origLeftDescriptor = Object.getOwnPropertyDescriptor(CSSStyleDeclaration.prototype, "left");
+        Object.defineProperty(glider.style, "left", {
+            configurable: true,
+            set(val: string) {
+                wroteGliderLeft = true;
+                origLeftDescriptor?.set?.call(this, val);
+            },
+            get() {
+                return origLeftDescriptor?.get?.call(this) ?? "";
+            },
+        });
+
+        sw.refresh();
+        expect(wroteGliderLeft).toBe(true);
+        expect(sawReadAfterWrite).toBe(false);
+        sw.destroy();
     });
 });

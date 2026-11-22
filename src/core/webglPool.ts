@@ -1,3 +1,5 @@
+import { useSmallMemoryBudget } from "./renderBudget.js";
+
 export const DEFAULT_MAX_ACTIVE_WEBGL_CONTEXTS = 8;
 
 export interface WebglPoolEntry {
@@ -8,20 +10,29 @@ export interface WebglPoolEntry {
     restoreWebgl: () => void;
 }
 
-let maxActiveContexts = DEFAULT_MAX_ACTIVE_WEBGL_CONTEXTS;
+function deviceContextLimit(): number {
+    return useSmallMemoryBudget() ? 2 : DEFAULT_MAX_ACTIVE_WEBGL_CONTEXTS;
+}
+
+let maxActiveContextsOverride: number | null = null;
 let sequenceCounter = 0;
+let promotingStandby = false;
+
+function resolveMaxActiveContexts(): number {
+    return maxActiveContextsOverride ?? deviceContextLimit();
+}
 
 const activeEntries = new Map<symbol, WebglPoolEntry>();
 const standbyEntries = new Map<symbol, WebglPoolEntry>();
 
 export function setMaxActiveWebglContextsForTesting(limit: number | null): void {
-    maxActiveContexts = limit === null ? DEFAULT_MAX_ACTIVE_WEBGL_CONTEXTS : Math.max(1, Math.floor(limit));
+    maxActiveContextsOverride = limit === null ? null : Math.max(1, Math.floor(limit));
 }
 
 export function resetWebglPoolForTesting(): void {
     activeEntries.clear();
     standbyEntries.clear();
-    maxActiveContexts = DEFAULT_MAX_ACTIVE_WEBGL_CONTEXTS;
+    maxActiveContextsOverride = null;
     sequenceCounter = 0;
 }
 
@@ -33,7 +44,7 @@ export function getWebglPoolStats(): {
     return {
         activeCount: activeEntries.size,
         standbyCount: standbyEntries.size,
-        maxActiveContexts,
+        maxActiveContexts: resolveMaxActiveContexts(),
     };
 }
 
@@ -56,10 +67,10 @@ function findEvictionCandidate(allowEvictVisible: boolean): WebglPoolEntry | nul
     return offscreenCandidate ?? visibleCandidate;
 }
 
-function findBestStandbyCandidate(): WebglPoolEntry | null {
+function findBestStandbyCandidate(excluded?: Set<symbol>): WebglPoolEntry | null {
     let bestVisible: WebglPoolEntry | null = null;
     for (const candidate of standbyEntries.values()) {
-        if (candidate.isVisible) {
+        if (candidate.isVisible && (!excluded || !excluded.has(candidate.token))) {
             if (!bestVisible || candidate.lastUsedOrder > bestVisible.lastUsedOrder) {
                 bestVisible = candidate;
             }
@@ -69,18 +80,27 @@ function findBestStandbyCandidate(): WebglPoolEntry | null {
 }
 
 function promoteStandbyIfPossible(): void {
-    while (activeEntries.size < maxActiveContexts) {
-        const candidate = findBestStandbyCandidate();
-        if (!candidate) break;
-        standbyEntries.delete(candidate.token);
-        candidate.restoreWebgl();
-        if (!activeEntries.has(candidate.token)) {
-            break;
+    if (promotingStandby) return;
+    promotingStandby = true;
+    let failedTokens: Set<symbol> | undefined;
+    try {
+        while (activeEntries.size < resolveMaxActiveContexts()) {
+            const candidate = findBestStandbyCandidate(failedTokens);
+            if (!candidate) break;
+            standbyEntries.delete(candidate.token);
+            candidate.restoreWebgl();
+            if (standbyEntries.has(candidate.token) || !activeEntries.has(candidate.token)) {
+                failedTokens ??= new Set();
+                failedTokens.add(candidate.token);
+            }
         }
+    } finally {
+        promotingStandby = false;
     }
 }
 
-export function acquireWebglSlot(entry: WebglPoolEntry, allowEvictVisible = true): boolean {
+export function acquireWebglSlot(entry: WebglPoolEntry, allowEvictVisible = !useSmallMemoryBudget()): boolean {
+    const maxContexts = resolveMaxActiveContexts();
     entry.lastUsedOrder = ++sequenceCounter;
     standbyEntries.delete(entry.token);
 
@@ -90,7 +110,7 @@ export function acquireWebglSlot(entry: WebglPoolEntry, allowEvictVisible = true
         return true;
     }
 
-    if (activeEntries.size < maxActiveContexts) {
+    if (activeEntries.size < maxContexts) {
         activeEntries.set(entry.token, entry);
         return true;
     }
@@ -110,7 +130,7 @@ export function acquireWebglSlot(entry: WebglPoolEntry, allowEvictVisible = true
     standbyEntries.set(candidate.token, candidate);
     candidate.evictToCss();
 
-    if (activeEntries.size < maxActiveContexts) {
+    if (activeEntries.size < maxContexts) {
         activeEntries.set(entry.token, entry);
         return true;
     }
@@ -125,7 +145,7 @@ export function updateWebglSlotVisibility(entry: WebglPoolEntry, isVisible: bool
 
     if (isVisible) {
         if (standbyEntries.has(entry.token)) {
-            if (activeEntries.size < maxActiveContexts || findEvictionCandidate(false) !== null) {
+            if (activeEntries.size < resolveMaxActiveContexts() || findEvictionCandidate(false) !== null) {
                 standbyEntries.delete(entry.token);
                 entry.restoreWebgl();
             }
@@ -139,8 +159,7 @@ export function updateWebglSlotVisibility(entry: WebglPoolEntry, isVisible: bool
             activeEntries.delete(entry.token);
             standbyEntries.set(entry.token, entry);
             entry.evictToCss();
-            standbyEntries.delete(waitingVisible.token);
-            waitingVisible.restoreWebgl();
+            promoteStandbyIfPossible();
         }
     }
 }

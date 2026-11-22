@@ -1,10 +1,11 @@
 const JANK_WINDOW_MS = 1000;
-const JANK_THRESHOLD = 3;
-const jankTimestamps = new Float64Array(8);
+const QUALITY_RECOVERY_MS = 3000;
 
-let jankHead = 0;
-let jankCount = 0;
-let idleTimer: number | null = null;
+let prevJankOlder = -Infinity;
+let prevJankNewer = -Infinity;
+let jankStreakCount = 0;
+let recoveryTimer: ReturnType<typeof setTimeout> | null = null;
+let recoveryAt = 0;
 let loafObserver: PerformanceObserver | null = null;
 let onTierChange: ((tier: number, prevTier: number) => void) | null = null;
 
@@ -19,29 +20,26 @@ export function setTierChangeCallback(
     onTierChange = callback;
 }
 
-export function scheduleQualityRecovery(): void {
-    if (isGlassDowngraded) return;
-    if (typeof requestIdleCallback !== "function") return;
-    if (idleTimer !== null) {
-        if (typeof cancelIdleCallback === "function") {
-            cancelIdleCallback(idleTimer);
-        }
-        idleTimer = null;
+function recoverQualityAfterQuietPeriod(): void {
+    recoveryTimer = null;
+    if (isGlassDowngraded || qualityTier <= 0) return;
+
+    const remaining = recoveryAt - Date.now();
+    if (remaining > 0) {
+        recoveryTimer = setTimeout(recoverQualityAfterQuietPeriod, remaining);
+        return;
     }
-    idleTimer = requestIdleCallback(
-        (deadline) => {
-            idleTimer = null;
-            if (isGlassDowngraded) return;
-            if (deadline.timeRemaining() > 40 && !deadline.didTimeout) {
-                if (qualityTier > 0) {
-                    applyQualityTier(0);
-                }
-            } else {
-                scheduleQualityRecovery();
-            }
-        },
-        { timeout: 3000 },
-    );
+    jankStreakCount = 0;
+    prevJankOlder = -Infinity;
+    prevJankNewer = -Infinity;
+    applyQualityTier(qualityTier - 1);
+    scheduleQualityRecovery();
+}
+
+export function scheduleQualityRecovery(): void {
+    if (isGlassDowngraded || qualityTier <= 0) return;
+    recoveryAt = Date.now() + QUALITY_RECOVERY_MS;
+    recoveryTimer ??= setTimeout(recoverQualityAfterQuietPeriod, QUALITY_RECOVERY_MS);
 }
 
 export function applyQualityTier(tier: number): void {
@@ -57,21 +55,33 @@ export function applyQualityTier(tier: number): void {
 }
 
 export function recordJankFrame(timestamp: number): void {
-    jankTimestamps[jankHead] = timestamp;
-    jankHead = (jankHead + 1) & 7;
-    if (jankCount < 8) jankCount++;
+    if (isGlassDowngraded) return;
+    if (qualityTier > 0) scheduleQualityRecovery();
+    if (qualityTier >= 2) return;
 
-    let recent = 0;
-    for (let i = 0; i < jankCount; i++) {
-        const diff = timestamp - jankTimestamps[i];
-        if (diff >= 0 && diff <= JANK_WINDOW_MS) {
-            recent++;
-        }
-    }
-
-    if (recent >= JANK_THRESHOLD && qualityTier < 2) {
+    if (
+        jankStreakCount >= 2 &&
+        Math.max(timestamp, prevJankNewer) - Math.min(timestamp, prevJankOlder) <= JANK_WINDOW_MS
+    ) {
+        jankStreakCount = 0;
+        prevJankOlder = -Infinity;
+        prevJankNewer = -Infinity;
         applyQualityTier(qualityTier + 1);
         scheduleQualityRecovery();
+        return;
+    }
+
+    if (jankStreakCount === 0) {
+        prevJankNewer = timestamp;
+        jankStreakCount = 1;
+    } else {
+        if (timestamp >= prevJankNewer) {
+            prevJankOlder = prevJankNewer;
+            prevJankNewer = timestamp;
+        } else if (timestamp > prevJankOlder) {
+            prevJankOlder = timestamp;
+        }
+        jankStreakCount = 2;
     }
 }
 
@@ -81,10 +91,14 @@ export function downgradeLiquidGlass(): void {
 }
 
 export function initLoafTelemetry(): void {
+    if (recoveryTimer === null && qualityTier > 0 && !isGlassDowngraded) {
+        scheduleQualityRecovery();
+    }
     if (loafObserver || typeof PerformanceObserver !== "function") return;
     try {
         if (PerformanceObserver.supportedEntryTypes?.includes("long-animation-frame")) {
             loafObserver = new PerformanceObserver((list) => {
+                if (typeof document !== "undefined" && document.hidden) return;
                 for (const entry of list.getEntries()) {
                     const loaf = entry as PerformanceEntry & { blockingDuration?: number };
                     if (loaf.duration > 50 && (loaf.blockingDuration ?? 0) > 0) {
@@ -103,16 +117,17 @@ export function disconnectLoafTelemetry(): void {
         loafObserver.disconnect();
         loafObserver = null;
     }
-    if (idleTimer !== null && typeof cancelIdleCallback === "function") {
-        cancelIdleCallback(idleTimer);
-        idleTimer = null;
+    if (recoveryTimer !== null) {
+        clearTimeout(recoveryTimer);
+        recoveryTimer = null;
     }
 }
 
 export function resetTelemetryForTesting(): void {
-    jankTimestamps.fill(0);
-    jankHead = 0;
-    jankCount = 0;
+    prevJankOlder = -Infinity;
+    prevJankNewer = -Infinity;
+    jankStreakCount = 0;
+    recoveryAt = 0;
     qualityTier = 0;
     isGlassDowngraded = false;
     qualityUpgrades = 0;

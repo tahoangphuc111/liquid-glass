@@ -9,10 +9,10 @@ import {
     type ReactNode,
     type RefObject,
 } from "react";
-import { canUseSvgGlass, getMediaQueries } from "../core/observer.js";
-import { createSceneCaptureController } from "../core/sceneCapture.js";
+import { canUseSvgGlass, canUseWebglRefraction, getMediaQueries, subscribeBatteryChanges } from "../core/observer.js";
+import { acquireSharedSceneCapture } from "../core/sceneCapture.js";
 import type { LiquidGlassOptions, SceneCaptureController } from "../core/types.js";
-import { onWasmReady } from "../core/wasm.js";
+import { isWasmReady, onWasmReady } from "../core/wasm.js";
 
 export interface LiquidGlassContextValue {
     sceneCanvas: HTMLCanvasElement | null;
@@ -32,25 +32,62 @@ export interface LiquidGlassProviderProps {
     className?: string;
 }
 
+const EMPTY_DEFAULTS: Partial<LiquidGlassOptions> = {};
+
+function shallowDefaultsEqual(
+    prev: Partial<LiquidGlassOptions>,
+    next: Partial<LiquidGlassOptions>,
+): boolean {
+    if (prev === next) return true;
+    const prevKeys = Object.keys(prev) as Array<keyof LiquidGlassOptions>;
+    const nextKeys = Object.keys(next) as Array<keyof LiquidGlassOptions>;
+    if (prevKeys.length !== nextKeys.length) return false;
+    for (const key of prevKeys) {
+        const aVal = prev[key];
+        const bVal = next[key];
+        if (Object.is(aVal, bVal)) continue;
+        if (
+            key === "lightTilt" &&
+            aVal &&
+            bVal &&
+            typeof aVal === "object" &&
+            typeof bVal === "object"
+        ) {
+            const tiltA = aVal as { horizontal?: number; vertical?: number };
+            const tiltB = bVal as { horizontal?: number; vertical?: number };
+            if (Object.is(tiltA.horizontal, tiltB.horizontal) && Object.is(tiltA.vertical, tiltB.vertical)) {
+                continue;
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
 export function LiquidGlassProvider({
     children,
     sceneRef,
     captureScene = "auto",
-    defaults = {},
+    defaults = EMPTY_DEFAULTS,
     className,
 }: LiquidGlassProviderProps) {
     const wrapperRef = useRef<HTMLDivElement | null>(null);
     const controllerRef = useRef<SceneCaptureController | null>(null);
-    const defaultsRef = useRef(defaults);
-    defaultsRef.current = defaults;
+    const stabilizedDefaultsRef = useRef<Partial<LiquidGlassOptions>>(defaults);
+    if (!shallowDefaultsEqual(stabilizedDefaultsRef.current, defaults)) {
+        stabilizedDefaultsRef.current = defaults;
+    }
+    const stableDefaults = stabilizedDefaultsRef.current;
+    const defaultsRef = useRef(stableDefaults);
+    defaultsRef.current = stableDefaults;
     const [sceneCanvas, setSceneCanvas] = useState<HTMLCanvasElement | null>(null);
     const [sceneElement, setSceneElement] = useState<HTMLElement | null>(null);
     const [forcedCapture, setForcedCapture] = useState(false);
 
     const shouldCaptureNow = useCallback(() => {
         if (captureScene === "never") return false;
-        if (captureScene === "always" || forcedCapture) return true;
-        return !canUseSvgGlass();
+        if (captureScene === "always") return true;
+        return canUseWebglRefraction() && (forcedCapture || !canUseSvgGlass());
     }, [captureScene, forcedCapture]);
 
     const syncCapture = useCallback(() => {
@@ -70,7 +107,8 @@ export function LiquidGlassProvider({
         }
 
         controllerRef.current?.destroy();
-        const controller = createSceneCaptureController(target, () => ({
+        setSceneCanvas(null);
+        const controller = acquireSharedSceneCapture(target, () => ({
             pixelRatio: defaultsRef.current.pixelRatio,
             radius: defaultsRef.current.pill ? 9999 : defaultsRef.current.radius,
         }));
@@ -95,9 +133,12 @@ export function LiquidGlassProvider({
         mobileOrTouchQuery?.addEventListener?.("change", syncCapture);
         reducedTransparencyQuery?.addEventListener?.("change", syncCapture);
         highContrastQuery?.addEventListener?.("change", syncCapture);
-        onWasmReady(syncCapture);
+        const unsubWasm = isWasmReady() ? null : onWasmReady(syncCapture);
+        const unsubscribeBattery = captureScene === "auto" ? subscribeBatteryChanges(syncCapture) : null;
 
         return () => {
+            unsubWasm?.();
+            unsubscribeBattery?.();
             reducedMotionQuery?.removeEventListener?.("change", syncCapture);
             mobileOrTouchQuery?.removeEventListener?.("change", syncCapture);
             reducedTransparencyQuery?.removeEventListener?.("change", syncCapture);
@@ -105,7 +146,7 @@ export function LiquidGlassProvider({
             controllerRef.current?.destroy();
             controllerRef.current = null;
         };
-    }, [syncCapture]);
+    }, [captureScene, syncCapture]);
 
     const requestSceneCapture = useCallback(() => {
         setForcedCapture(true);
@@ -119,11 +160,11 @@ export function LiquidGlassProvider({
         () => ({
             sceneCanvas,
             sceneElement,
-            defaults,
+            defaults: stableDefaults,
             requestSceneCapture,
             refreshCapture,
         }),
-        [sceneCanvas, sceneElement, defaults, requestSceneCapture, refreshCapture],
+        [sceneCanvas, sceneElement, stableDefaults, requestSceneCapture, refreshCapture],
     );
 
     return (

@@ -56,44 +56,62 @@ export function getMediaQueries() {
 }
 
 let isBatteryLow = false;
-let batteryListenerAttached = false;
+let batteryRequest: symbol | null = null;
 let activeBatteryManager: {
     addEventListener(type: string, listener: () => void): void;
     removeEventListener?(type: string, listener: () => void): void;
 } | null = null;
 let activeBatteryListener: (() => void) | null = null;
-let onBatteryChange: (() => void) | null = null;
-
-export function setBatteryRefreshCallback(callback: (() => void) | null): void {
-    onBatteryChange = callback;
-}
+const batterySubscribers = new Set<() => void>();
 
 function attachBatteryListener(): void {
-    if (batteryListenerAttached || typeof navigator === "undefined") return;
+    if (batteryRequest || typeof navigator === "undefined") return;
     const nav = navigator as NavigatorExtended;
     if (typeof nav.getBattery !== "function") return;
-    batteryListenerAttached = true;
+    const request = Symbol();
+    batteryRequest = request;
 
     nav
         .getBattery()
         .then((battery) => {
-            if (!batteryListenerAttached) return;
+            if (batteryRequest !== request) return;
             activeBatteryManager = battery;
             const updateBattery = () => {
                 const wasLow = isBatteryLow;
                 isBatteryLow = battery.level <= 0.2 && !battery.charging;
                 if (wasLow !== isBatteryLow) {
-                    onBatteryChange?.();
+                    for (const listener of batterySubscribers) listener();
                 }
             };
             activeBatteryListener = updateBattery;
-            updateBattery();
             battery.addEventListener("levelchange", updateBattery);
             battery.addEventListener("chargingchange", updateBattery);
+            updateBattery();
         })
         .catch(() => {
-            batteryListenerAttached = false;
+            if (batteryRequest === request) batteryRequest = null;
         });
+}
+
+function detachUnusedBatteryListener(): void {
+    if (listenersAttached || batterySubscribers.size > 0) return;
+    if (activeBatteryManager && activeBatteryListener) {
+        activeBatteryManager.removeEventListener?.("levelchange", activeBatteryListener);
+        activeBatteryManager.removeEventListener?.("chargingchange", activeBatteryListener);
+        activeBatteryManager = null;
+        activeBatteryListener = null;
+    }
+    batteryRequest = null;
+    isBatteryLow = false;
+}
+
+export function subscribeBatteryChanges(listener: () => void): () => void {
+    batterySubscribers.add(listener);
+    attachBatteryListener();
+    return () => {
+        batterySubscribers.delete(listener);
+        detachUnusedBatteryListener();
+    };
 }
 
 export function isConstrainedDevice(): boolean {
@@ -105,12 +123,12 @@ export function isConstrainedDevice(): boolean {
 }
 
 export function canUseSvgGlass(): boolean {
-    initWasmSimdModule();
-    if (!isWasmReady() || isGlassDowngraded || isConstrainedDevice()) return false;
-    if (!checkIsChromium()) return false;
+    if (typeof window === "undefined" || isGlassDowngraded || isConstrainedDevice() || !checkIsChromium()) return false;
 
     const { reducedMotionQuery: rm, mobileOrTouchQuery: mobile } = getMediaQueries();
-    return !rm?.matches && !mobile?.matches;
+    if (rm?.matches || mobile?.matches) return false;
+    initWasmSimdModule();
+    return isWasmReady();
 }
 
 export function canUseWebglRefraction(): boolean {
@@ -195,13 +213,7 @@ export function detachGlobalListeners(): void {
     window.removeEventListener("blur", onBlur);
     window.removeEventListener("resize", onResize);
 
-    if (activeBatteryManager && activeBatteryListener) {
-        activeBatteryManager.removeEventListener?.("levelchange", activeBatteryListener);
-        activeBatteryManager.removeEventListener?.("chargingchange", activeBatteryListener);
-        activeBatteryManager = null;
-        activeBatteryListener = null;
-    }
-    batteryListenerAttached = false;
+    detachUnusedBatteryListener();
 
     disconnectLoafTelemetry();
 }
@@ -213,7 +225,6 @@ export function resetObserverForTesting(): void {
     reducedTransparencyQuery = null;
     highContrastQuery = null;
     isBatteryLow = false;
-    onBatteryChange = null;
     onDprResize = null;
     isDocumentIdle = false;
     lastActivityTick = 0;

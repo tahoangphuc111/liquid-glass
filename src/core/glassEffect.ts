@@ -1,21 +1,33 @@
+import {
+    mergeGlassOptions,
+    parseCssCornerRadiusPx,
+    parseElementGlassAttributes,
+} from "./config.js";
 import { createLiquidGlass } from "./controller.js";
 import { createGlassSlider } from "./slider.js";
 import { createGlassSwitch } from "./switch.js";
 import type {
     LiquidGlassInstance,
     LiquidGlassOptions,
+    LiquidGlassSliderInstance,
+    LiquidGlassSliderOptions,
     LiquidGlassSwitchInstance,
     LiquidGlassSwitchOptions,
 } from "./types.js";
 
 export interface LiquidGlassGroup {
-    readonly instances: (LiquidGlassInstance | LiquidGlassSwitchInstance)[];
-    update(options: Partial<LiquidGlassOptions | LiquidGlassSwitchOptions>): void;
+    readonly instances: (LiquidGlassInstance | LiquidGlassSwitchInstance | LiquidGlassSliderInstance)[];
+    update(options: Partial<LiquidGlassOptions | LiquidGlassSwitchOptions | LiquidGlassSliderOptions>): void;
     refresh(): void;
+    setLightTilt(horizontal: number, vertical: number): void;
+    setSceneCanvas(canvas: HTMLCanvasElement | null, sceneElement?: HTMLElement | null): void;
     destroy(): void;
 }
 
-const activeGlassInstances = new WeakMap<HTMLElement, LiquidGlassInstance | LiquidGlassSwitchInstance>();
+const activeGlassInstances = new WeakMap<
+    HTMLElement,
+    LiquidGlassInstance | LiquidGlassSwitchInstance | LiquidGlassSliderInstance
+>();
 
 function inferMinimalOptions(
     element: HTMLElement,
@@ -40,10 +52,8 @@ function inferMinimalOptions(
         const halfMin = Math.min(rect.width, rect.height) * 0.5;
         if (halfMin > 0) {
             const rawRadius = window.getComputedStyle(element).borderTopLeftRadius;
-            const parsed = rawRadius.endsWith("%")
-                ? (parseFloat(rawRadius) / 100) * Math.min(rect.width, rect.height)
-                : parseFloat(rawRadius);
-            if (Number.isFinite(parsed) && parsed >= halfMin * 0.96) {
+            const parsed = parseCssCornerRadiusPx(rawRadius, rect.width, rect.height);
+            if (parsed !== null && Number.isFinite(parsed) && parsed >= halfMin * 0.96) {
                 resolved.pill = true;
             }
         }
@@ -71,90 +81,108 @@ function isSwitchContainer(
     );
 }
 
+function updateInstanceOptions(
+    instance: LiquidGlassInstance | LiquidGlassSwitchInstance | LiquidGlassSliderInstance,
+    options: Partial<LiquidGlassOptions | LiquidGlassSwitchOptions | LiquidGlassSliderOptions>,
+): void {
+    if ("activeIndex" in instance) {
+        instance.update(options as Partial<LiquidGlassSwitchOptions>);
+    } else if ("value" in instance) {
+        instance.update(options as Partial<LiquidGlassSliderOptions>);
+    } else {
+        instance.update(options as Partial<LiquidGlassOptions>);
+    }
+}
+
 function applyGlassToElement(
     element: HTMLElement,
-    options: LiquidGlassOptions | LiquidGlassSwitchOptions = {},
-): LiquidGlassInstance | LiquidGlassSwitchInstance {
+    options: LiquidGlassOptions | LiquidGlassSwitchOptions | LiquidGlassSliderOptions = {},
+): LiquidGlassInstance | LiquidGlassSwitchInstance | LiquidGlassSliderInstance {
     const existing = activeGlassInstances.get(element);
     if (existing) {
-        existing.update(options as any);
+        updateInstanceOptions(existing, options);
         return existing;
     }
+
+    const attrOverrides = parseElementGlassAttributes(element);
+    const resolvedOptions = attrOverrides
+        ? (mergeGlassOptions(attrOverrides, options as LiquidGlassOptions) as
+              | LiquidGlassOptions
+              | LiquidGlassSwitchOptions
+              | LiquidGlassSliderOptions)
+        : options;
 
     const isRangeInput =
         typeof HTMLInputElement !== "undefined" &&
         element instanceof HTMLInputElement &&
         element.type === "range";
 
-    const isSwitch = isSwitchContainer(element, options);
+    const isSwitch = !isRangeInput && isSwitchContainer(element, resolvedOptions);
     const baseInstance = isRangeInput
-        ? createGlassSlider(element, options)
+        ? createGlassSlider(element, resolvedOptions as LiquidGlassSliderOptions)
         : isSwitch
-          ? createGlassSwitch(element, options as LiquidGlassSwitchOptions)
-          : createLiquidGlass(element, inferMinimalOptions(element, options));
+          ? createGlassSwitch(element, resolvedOptions as LiquidGlassSwitchOptions)
+          : createLiquidGlass(element, inferMinimalOptions(element, resolvedOptions));
 
-    const baseSwitch = "setValue" in baseInstance ? (baseInstance as LiquidGlassSwitchInstance) : null;
+    const wrappedObj: Record<string, unknown> = {
+        get element() {
+            return baseInstance.element;
+        },
+        get engine() {
+            return baseInstance.engine;
+        },
+        update(nextOptions: Partial<LiquidGlassOptions>) {
+            baseInstance.update(nextOptions);
+        },
+        refresh() {
+            baseInstance.refresh();
+        },
+        setLightTilt(horizontal: number, vertical: number) {
+            baseInstance.setLightTilt?.(horizontal, vertical);
+        },
+        setSceneCanvas(canvas: HTMLCanvasElement | null, sceneElement?: HTMLElement | null) {
+            baseInstance.setSceneCanvas(canvas, sceneElement);
+        },
+        destroy() {
+            if (activeGlassInstances.get(element) === wrappedInstance) {
+                activeGlassInstances.delete(element);
+            }
+            baseInstance.destroy();
+        },
+    };
 
-    const wrappedInstance: LiquidGlassInstance | LiquidGlassSwitchInstance = baseSwitch
-        ? {
-              get element() {
-                  return baseInstance.element;
-              },
-              get engine() {
-                  return baseInstance.engine;
-              },
-              get value() {
-                  return baseSwitch.value;
-              },
-              get activeIndex() {
-                  return baseSwitch.activeIndex;
-              },
-              setValue(value: string, animate?: boolean) {
-                  baseSwitch.setValue(value, animate);
-              },
-              setActiveIndex(index: number, animate?: boolean) {
-                  baseSwitch.setActiveIndex(index, animate);
-              },
-              update(nextOptions: Partial<LiquidGlassSwitchOptions>) {
-                  baseInstance.update(nextOptions as any);
-              },
-              refresh() {
-                  baseInstance.refresh();
-              },
-              setSceneCanvas(canvas: HTMLCanvasElement | null, sceneElement?: HTMLElement | null) {
-                  baseInstance.setSceneCanvas(canvas, sceneElement);
-              },
-              destroy() {
-                  activeGlassInstances.delete(element);
-                  baseInstance.destroy();
-              },
-          }
-        : {
-              get element() {
-                  return baseInstance.element;
-              },
-              get engine() {
-                  return baseInstance.engine;
-              },
-              update(nextOptions: Partial<LiquidGlassOptions>) {
-                  baseInstance.update(nextOptions as any);
-              },
-              refresh() {
-                  baseInstance.refresh();
-              },
-              setSceneCanvas(canvas: HTMLCanvasElement | null, sceneElement?: HTMLElement | null) {
-                  baseInstance.setSceneCanvas(canvas, sceneElement);
-              },
-              destroy() {
-                  activeGlassInstances.delete(element);
-                  baseInstance.destroy();
-              },
-          };
+    if (isSwitch) {
+        const baseSwitch = baseInstance as LiquidGlassSwitchInstance;
+        Object.defineProperties(wrappedObj, {
+            value: { get: () => baseSwitch.value, enumerable: true },
+            activeIndex: { get: () => baseSwitch.activeIndex, enumerable: true },
+        });
+        wrappedObj.setValue = (value: string, animate?: boolean) => baseSwitch.setValue(value, animate);
+        wrappedObj.setActiveIndex = (index: number, animate?: boolean) =>
+            baseSwitch.setActiveIndex(index, animate);
+    } else if (isRangeInput) {
+        const baseSlider = baseInstance as LiquidGlassSliderInstance;
+        Object.defineProperty(wrappedObj, "value", { get: () => baseSlider.value, enumerable: true });
+        wrappedObj.setValue = (value: number, animate?: boolean) => baseSlider.setValue(value, animate);
+    } else {
+        const baseGlass = baseInstance as LiquidGlassInstance;
+        wrappedObj.setDragOffset = (offsetX: number, offsetY: number, animate?: boolean) =>
+            baseGlass.setDragOffset?.(offsetX, offsetY, animate);
+    }
+
+    const wrappedInstance = wrappedObj as unknown as
+        | LiquidGlassInstance
+        | LiquidGlassSwitchInstance
+        | LiquidGlassSliderInstance;
 
     activeGlassInstances.set(element, wrappedInstance);
     return wrappedInstance;
 }
 
+export function glassEffect(
+    target: HTMLInputElement,
+    options?: LiquidGlassSliderOptions,
+): LiquidGlassSliderInstance;
 export function glassEffect(
     target: HTMLElement,
     options?: LiquidGlassSwitchOptions,
@@ -165,39 +193,54 @@ export function glassEffect(
 ): LiquidGlassInstance;
 export function glassEffect(
     target: string | Iterable<HTMLElement>,
-    options?: LiquidGlassOptions | LiquidGlassSwitchOptions,
+    options?: LiquidGlassOptions | LiquidGlassSwitchOptions | LiquidGlassSliderOptions,
 ): LiquidGlassGroup;
 export function glassEffect(
-    target: HTMLElement | string | Iterable<HTMLElement>,
-    options: LiquidGlassOptions | LiquidGlassSwitchOptions = {},
-): LiquidGlassInstance | LiquidGlassSwitchInstance | LiquidGlassGroup {
+    target: HTMLElement | HTMLInputElement | string | Iterable<HTMLElement>,
+    options: LiquidGlassOptions | LiquidGlassSwitchOptions | LiquidGlassSliderOptions = {},
+): LiquidGlassInstance | LiquidGlassSwitchInstance | LiquidGlassSliderInstance | LiquidGlassGroup {
     if (typeof HTMLElement !== "undefined" && target instanceof HTMLElement) {
         return applyGlassToElement(target, options);
     }
 
-    const elements =
-        typeof target === "string"
-            ? Array.from(document.querySelectorAll<HTMLElement>(target))
-            : Array.from(target as Iterable<HTMLElement>);
+    const instances: Array<LiquidGlassInstance | LiquidGlassSwitchInstance | LiquidGlassSliderInstance> = [];
+    if (typeof target === "string") {
+        if (typeof document !== "undefined") {
+            const matched = document.querySelectorAll<HTMLElement>(target);
+            for (const element of matched) {
+                if (element instanceof HTMLElement) instances.push(applyGlassToElement(element, options));
+            }
+        }
+    } else {
+        for (const el of new Set(target as Iterable<HTMLElement>)) {
+            instances.push(applyGlassToElement(el, options));
+        }
+    }
 
-    const instances = elements.map((el) => applyGlassToElement(el, options));
+    const forEachInstance = (
+        fn: (inst: LiquidGlassInstance | LiquidGlassSwitchInstance | LiquidGlassSliderInstance) => void,
+    ) => {
+        for (let index = 0; index < instances.length; index += 1) {
+            fn(instances[index]!);
+        }
+    };
 
     return {
         instances,
-        update(nextOptions: Partial<LiquidGlassOptions | LiquidGlassSwitchOptions>) {
-            for (const instance of instances) {
-                instance.update(nextOptions);
-            }
+        update(nextOptions: Partial<LiquidGlassOptions | LiquidGlassSwitchOptions | LiquidGlassSliderOptions>) {
+            forEachInstance((inst) => updateInstanceOptions(inst, nextOptions));
         },
         refresh() {
-            for (const instance of instances) {
-                instance.refresh();
-            }
+            forEachInstance((inst) => inst.refresh());
+        },
+        setLightTilt(horizontal: number, vertical: number) {
+            forEachInstance((inst) => inst.setLightTilt?.(horizontal, vertical));
+        },
+        setSceneCanvas(canvas: HTMLCanvasElement | null, sceneElement?: HTMLElement | null) {
+            forEachInstance((inst) => inst.setSceneCanvas(canvas, sceneElement));
         },
         destroy() {
-            for (const instance of instances) {
-                instance.destroy();
-            }
+            forEachInstance((inst) => inst.destroy());
         },
     };
 }
@@ -205,6 +248,7 @@ export function glassEffect(
 declare global {
     interface HTMLElement {
         glassEffect(options?: LiquidGlassSwitchOptions): LiquidGlassSwitchInstance;
+        glassEffect(options?: LiquidGlassSliderOptions): LiquidGlassSliderInstance;
         glassEffect(options?: LiquidGlassOptions): LiquidGlassInstance;
     }
 }
@@ -213,8 +257,8 @@ if (typeof HTMLElement !== "undefined" && !HTMLElement.prototype.glassEffect) {
     Object.defineProperty(HTMLElement.prototype, "glassEffect", {
         value(
             this: HTMLElement,
-            options: LiquidGlassOptions | LiquidGlassSwitchOptions = {},
-        ): LiquidGlassInstance | LiquidGlassSwitchInstance {
+            options: LiquidGlassOptions | LiquidGlassSwitchOptions | LiquidGlassSliderOptions = {},
+        ): LiquidGlassInstance | LiquidGlassSwitchInstance | LiquidGlassSliderInstance {
             return applyGlassToElement(this, options);
         },
         configurable: true,

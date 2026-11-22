@@ -115,69 +115,183 @@
             </button>
         </nav>
 
-        <aside class="controls" aria-label="glass controls">
+        <aside id="controls-panel" class="controls" aria-label="glass controls">
             <div class="controls-header">
                 <strong>controls</strong>
-                <button id="toggle-theme" type="button">dark wallpaper</button>
+                <div class="controls-actions">
+                    <button id="toggle-theme" type="button" title="Toggle dark/light wallpaper">dark</button>
+                    <button id="copy-config" type="button" title="Copy LiquidGlassOptions JSON">copy</button>
+                    <button id="reset-controls" type="button" title="Reset defaults">reset</button>
+                    <button id="toggle-panel" type="button" title="Collapse/expand controls" aria-expanded="true">−</button>
+                </div>
             </div>
 
-            <label>
-                engine
-                <select id="ctrl-engine">
-                    <option value="auto" selected>auto</option>
-                    <option value="wasm-svg">wasm-svg (desktop chromium)</option>
-                    <option value="webgl">webgl (mobile/safari fallback)</option>
-                    <option value="css">css fallback</option>
-                </select>
-            </label>
+            <div class="controls-body">
+                <label>
+                    engine
+                    <select id="ctrl-engine">
+                        <option value="auto" selected>auto</option>
+                        <option value="wasm-svg">wasm-svg (desktop chromium)</option>
+                        <option value="webgl">webgl (mobile/safari fallback)</option>
+                        <option value="css">css fallback</option>
+                    </select>
+                </label>
 
-            <label>
-                surface
-                <select id="ctrl-surface">
-                    <option value="convex_squircle" selected>convex_squircle</option>
-                    <option value="convex_circle">convex_circle</option>
-                    <option value="linear">linear</option>
-                    <option value="lip">lip</option>
-                </select>
-            </label>
+                <label>
+                    theme
+                    <select id="ctrl-theme">
+                        <option value="auto" selected>auto</option>
+                        <option value="light">light</option>
+                        <option value="dark">dark</option>
+                    </select>
+                </label>
 
-            <label>
-                thickness <span id="val-thickness">52</span>
-                <input id="ctrl-thickness" type="range" min="12" max="120" value="52" />
-            </label>
+                <label>
+                    preset
+                    <select id="ctrl-preset">
+                        <option value="" selected>custom</option>
+                        <option value="apple_liquid">apple_liquid</option>
+                        <option value="frosted">frosted</option>
+                        <option value="crystal">crystal</option>
+                        <option value="water">water</option>
+                        <option value="obsidian">obsidian</option>
+                        <option value="subtle">subtle</option>
+                        <option value="prism">prism</option>
+                        <option value="diamond">diamond</option>
+                        <option value="smoke">smoke</option>
+                        <option value="ice">ice</option>
+                    </select>
+                </label>
 
-            <label>
-                bezel <span id="val-bezel">16</span>
-                <input id="ctrl-bezel" type="range" min="4" max="36" value="16" />
-            </label>
+                <label>
+                    surface
+                    <select id="ctrl-surface">
+                        <option value="convex_squircle" selected>convex_squircle</option>
+                        <option value="convex_circle">convex_circle</option>
+                        <option value="linear">linear</option>
+                        <option value="lip">lip</option>
+                        <option value="concave">concave</option>
+                    </select>
+                </label>
 
-            <label>
-                ior <span id="val-ior">2.15</span>
-                <input id="ctrl-ior" type="range" min="1.1" max="2.5" step="0.05" value="2.15" />
-            </label>
+                <label>
+                    light tilt
+                    <select id="ctrl-light-tilt">
+                        <option value="off" selected>off</option>
+                        <option value="pointer">pointer</option>
+                    </select>
+                </label>
 
-            <label>
-                blur <span id="val-blur">2</span>
-                <input id="ctrl-blur" type="range" min="0" max="12" step="0.2" value="2" />
-            </label>
+                <label>
+                    thickness <span id="val-thickness">52</span>
+                    <input id="ctrl-thickness" type="range" min="12" max="120" value="52" />
+                </label>
 
-            <label>
-                radius <span id="val-radius">22</span>
-                <input id="ctrl-radius" type="range" min="0" max="44" value="22" />
-            </label>
+                <label>
+                    bezel <span id="val-bezel">16</span>
+                    <input id="ctrl-bezel" type="range" min="4" max="36" value="16" />
+                </label>
 
-            <label>
-                highlight <span id="val-highlight">0.4</span>
-                <input id="ctrl-highlight" type="range" min="0" max="1" step="0.05" value="0.4" />
-            </label>
+                <label>
+                    scale ratio <span id="val-scale-ratio">2.35</span>
+                    <input id="ctrl-scale-ratio" type="range" min="0.5" max="4" step="0.05" value="2.35" />
+                </label>
 
-            <div class="toggles">
-                <label><input id="ctrl-pill" type="checkbox" /> pill</label>
-                <label><input id="ctrl-hollow" type="checkbox" /> hollow</label>
-                <label><input id="ctrl-chroma" type="checkbox" /> chroma</label>
+                <label>
+                    ior <span id="val-ior">2.15</span>
+                    <input id="ctrl-ior" type="range" min="1.1" max="2.5" step="0.05" value="2.15" />
+                </label>
+
+                <label>
+                    blur <span id="val-blur">2</span>
+                    <input id="ctrl-blur" type="range" min="0" max="16" step="0.2" value="2" />
+                </label>
+
+                <label>
+                    radius <span id="val-radius">22</span>
+                    <input id="ctrl-radius" type="range" min="0" max="44" value="22" />
+                </label>
+
+                <label>
+                    highlight <span id="val-highlight">0.4</span>
+                    <input id="ctrl-highlight" type="range" min="0" max="1" step="0.05" value="0.4" />
+                </label>
+
+                <label>
+                    saturation <span id="val-saturation">auto</span>
+                    <input id="ctrl-saturation" type="range" min="-0.05" max="4" step="0.05" value="-0.05" />
+                </label>
+
+                <label>
+                    chromatic aberration <span id="val-chroma">off</span>
+                    <input id="ctrl-chroma" type="range" min="0" max="1" step="0.005" value="0" />
+                </label>
+
+                <label>
+                    abbe number <span id="val-abbe">58.5</span>
+                    <input id="ctrl-abbe" type="range" min="20" max="90" step="0.5" value="58.5" />
+                </label>
+
+                <div class="color-row">
+                    <label class="inline-check"><input id="ctrl-tint-enabled" type="checkbox" /> tint</label>
+                    <input id="ctrl-tint-color" type="color" value="#ffffff" />
+                    <span id="val-tint-opacity">0.12</span>
+                </div>
+                <input id="ctrl-tint-opacity" type="range" min="0" max="0.6" step="0.02" value="0.12" aria-label="tint opacity" />
+
+                <div class="toggles">
+                    <label><input id="ctrl-pill" type="checkbox" /> pill</label>
+                    <label><input id="ctrl-squircle" type="checkbox" /> squircle</label>
+                    <label><input id="ctrl-hollow" type="checkbox" /> hollow</label>
+                    <label><input id="ctrl-adaptive" type="checkbox" /> adaptive</label>
+                    <label><input id="ctrl-coalesce" type="checkbox" /> coalesce</label>
+                </div>
+
+                <details class="controls-group" open>
+                    <summary>switch</summary>
+
+                    <label>
+                        refraction
+                        <select id="ctrl-switch-refraction">
+                            <option value="horizontal" selected>left and right caps</option>
+                            <option value="vertical">top and bottom caps</option>
+                            <option value="all">full rim</option>
+                        </select>
+                    </label>
+
+                    <label>
+                        edge fade <span id="val-switch-fade">0.35</span>
+                        <input id="ctrl-switch-fade" type="range" min="0" max="1" step="0.05" value="0.35" />
+                    </label>
+
+                    <label>
+                        glider strength <span id="val-glider-strength">2.1</span>
+                        <input id="ctrl-glider-strength" type="range" min="0" max="6" step="0.1" value="2.1" />
+                    </label>
+
+                    <div class="color-row">
+                        <span>active color</span>
+                        <input id="ctrl-switch-color" type="color" value="#007aff" />
+                        <span id="val-switch-color">#007aff</span>
+                    </div>
+
+                    <div class="color-row">
+                        <span>track bg</span>
+                        <input id="ctrl-switch-track-color" type="color" value="#ffffff" />
+                        <span id="val-switch-track-opacity">0.22</span>
+                    </div>
+                    <input id="ctrl-switch-track-opacity" type="range" min="0" max="0.85" step="0.02" value="0.22" aria-label="switch track opacity" />
+
+                    <div class="color-row">
+                        <span>glider bg</span>
+                        <input id="ctrl-switch-glider-color" type="color" value="#cbd5e1" />
+                        <span id="val-switch-glider-opacity">0.36</span>
+                    </div>
+                    <input id="ctrl-switch-glider-opacity" type="range" min="0" max="0.85" step="0.02" value="0.36" aria-label="switch glider opacity" />
+                </details>
+
+                <pre id="stats-output" class="stats-output"></pre>
             </div>
-
-            <pre id="stats-output" class="stats-output"></pre>
         </aside>
 
         <script type="module" src="./main.ts"></script>

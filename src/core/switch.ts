@@ -1,5 +1,6 @@
-import { DEFAULT_GLASS_CONFIG } from "./config.js";
-import { createLiquidGlass } from "./controller.js";
+import { mergeGlassOptions } from "./config.js";
+import { createLiquidGlass, createLiquidGlassController, observeSharedElementResize } from "./controller.js";
+import { buildSpringPropagator, type SpringPropagator } from "./spring.js";
 import type {
     GlassEngine,
     LiquidGlassInstance,
@@ -28,6 +29,8 @@ const DRAG_THRESHOLD_PX = 4;
 const RUBBER_OVERDRAG_RANGE_PX = 38;
 const CONTAINER_PADDING_PX = 4;
 const FALLBACK_ITEM_WIDTH_PX = 96;
+const FALLBACK_ITEM_HEIGHT_PX = 40;
+const DEFAULT_ITEM_SELECTOR = "[data-switch-item], .lg-switch-item, button, a, [role='tab']";
 
 const LUT_DT_MIN = 0.002;
 const LUT_DT_MAX = 0.034;
@@ -37,57 +40,65 @@ const LUT_INV_STEP = LUT_SLOTS / (LUT_DT_MAX - LUT_DT_MIN);
 const SWITCH_GLASS_OWN_OPTION_KEYS = new Set([
     "value",
     "defaultValue",
+    "orientation",
     "itemSelector",
     "gliderElement",
+    "trackOptions",
+    "gliderOptions",
     "onChange",
 ]);
-
-interface OscillatorPropagator {
-    m00: number;
-    m01: number;
-    m10: number;
-    m11: number;
-}
 
 interface SwitchItemAnchor {
     element: HTMLElement;
     value: string;
     left: number;
     width: number;
+    index: number;
+    labelEl: HTMLElement | null;
+    labelRelLeft: number;
+    labelWidth: number;
+    iconEl: SVGElement | null;
+    iconRelLeft: number;
+    iconWidth: number;
+    lastCoverageQuant: number;
+    lastHitStartQuant: number;
+    lastHitEndQuant: number;
+    lastLabelStartQuant: number;
+    lastLabelEndQuant: number;
+    lastIconCovQuant: number;
+    lastLitState: number;
 }
 
 function buildOscillatorPropagator(
     stiffness: number,
     damping: number,
     dt: number,
-): OscillatorPropagator {
-    const alpha = damping * 0.5;
-    const discriminant = stiffness - alpha * alpha;
-    const decay = Math.exp(-alpha * dt);
+): SpringPropagator {
+    return buildSpringPropagator(dt, { stiffness, gamma: damping * 0.5 });
+}
 
-    if (discriminant > 1e-6) {
-        const omegaD = Math.sqrt(discriminant);
-        const phase = omegaD * dt;
-        const cosPhase = Math.cos(phase);
-        const sinPhase = Math.sin(phase);
-        const invOmegaD = 1 / omegaD;
-        const alphaOverOmega = alpha * invOmegaD;
-        const m01 = decay * (sinPhase * invOmegaD);
-        return {
-            m00: decay * (cosPhase + alphaOverOmega * sinPhase),
-            m01,
-            m10: -stiffness * m01,
-            m11: decay * (cosPhase - alphaOverOmega * sinPhase),
-        };
+type SwitchPropagatorTuple = readonly [SpringPropagator, SpringPropagator, SpringPropagator, number];
+const SHARED_SWITCH_PROPAGATOR_LUT: Array<SwitchPropagatorTuple | undefined> = new Array(LUT_SLOTS + 1);
+const DEFAULT_SWITCH_PROPAGATOR_TUPLE: SwitchPropagatorTuple = [
+    buildOscillatorPropagator(POSITION_STIFFNESS, POSITION_DAMPING, 1 / 60),
+    buildOscillatorPropagator(SWELL_STIFFNESS, SWELL_DAMPING, 1 / 60),
+    buildOscillatorPropagator(WOBBLE_STIFFNESS, WOBBLE_DAMPING, 1 / 60),
+    Math.exp(-12 * (1 / 60)),
+];
+
+function getSharedSwitchPropagator(slot: number): SwitchPropagatorTuple {
+    let entry = SHARED_SWITCH_PROPAGATOR_LUT[slot];
+    if (!entry) {
+        const quantizedDt = LUT_DT_MIN + slot / LUT_INV_STEP;
+        entry = [
+            buildOscillatorPropagator(POSITION_STIFFNESS, POSITION_DAMPING, quantizedDt),
+            buildOscillatorPropagator(SWELL_STIFFNESS, SWELL_DAMPING, quantizedDt),
+            buildOscillatorPropagator(WOBBLE_STIFFNESS, WOBBLE_DAMPING, quantizedDt),
+            Math.exp(-12 * quantizedDt),
+        ];
+        SHARED_SWITCH_PROPAGATOR_LUT[slot] = entry;
     }
-
-    const m01 = decay * dt;
-    return {
-        m00: decay * (1 + alpha * dt),
-        m01,
-        m10: -stiffness * m01,
-        m11: decay * (1 - alpha * dt),
-    };
+    return entry;
 }
 
 function applyRubberResistance(overflow: number, range = RUBBER_OVERDRAG_RANGE_PX): number {
@@ -109,6 +120,19 @@ function stripSwitchOwnOptions(
     return glassOptions as Partial<LiquidGlassOptions>;
 }
 
+function updateGlassPart(
+    instance: LiquidGlassInstance,
+    previous: LiquidGlassOptions,
+    next: LiquidGlassOptions,
+): void {
+    const patch: Partial<LiquidGlassOptions> = {};
+    const keys = new Set([...Object.keys(previous), ...Object.keys(next)] as (keyof LiquidGlassOptions)[]);
+    for (const key of keys) {
+        if (!Object.is(previous[key], next[key])) Object.assign(patch, { [key]: next[key] });
+    }
+    if (Object.keys(patch).length > 0) instance.update(patch);
+}
+
 function resolveItemValue(item: HTMLElement, index: number): string {
     const attrValue =
         item.dataset.switchValue ??
@@ -124,20 +148,35 @@ function resolveItemValue(item: HTMLElement, index: number): string {
     return String(index);
 }
 
-function computeMidpointDetent(rawPos: number, anchors: SwitchItemAnchor[]): number {
-    if (anchors.length < 2) {
+function findSpatialSegmentIndex(posPx: number, spatialAnchors: SwitchItemAnchor[]): number {
+    if (posPx <= spatialAnchors[0]!.left) {
+        return 0;
+    }
+    const maxSegment = spatialAnchors.length - 2;
+    if (posPx >= spatialAnchors[maxSegment]!.left) {
+        return maxSegment;
+    }
+    let low = 0;
+    let high = maxSegment;
+    while (low < high) {
+        const mid = (low + high + 1) >> 1;
+        if (spatialAnchors[mid]!.left <= posPx) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    return low;
+}
+
+function computeMidpointDetent(rawPos: number, spatialAnchors: SwitchItemAnchor[]): number {
+    if (spatialAnchors.length < 2) {
         return rawPos;
     }
 
-    let segmentIndex = 0;
-    for (let idx = 0; idx < anchors.length - 1; idx += 1) {
-        if (rawPos >= anchors[idx]!.left) {
-            segmentIndex = idx;
-        }
-    }
-
-    const segmentStart = anchors[segmentIndex]!.left;
-    const segmentEnd = anchors[segmentIndex + 1]!.left;
+    const segmentIndex = findSpatialSegmentIndex(rawPos, spatialAnchors);
+    const segmentStart = spatialAnchors[segmentIndex]!.left;
+    const segmentEnd = spatialAnchors[segmentIndex + 1]!.left;
     const segmentSpan = segmentEnd - segmentStart;
     if (segmentSpan <= 0) {
         return rawPos;
@@ -145,80 +184,121 @@ function computeMidpointDetent(rawPos: number, anchors: SwitchItemAnchor[]): num
 
     const normSegment = (rawPos - segmentStart) / segmentSpan;
     if (normSegment > 0.35 && normSegment < 0.65) {
-        const x = (normSegment - 0.5) / 0.15;
-        const oneMinusX2 = 1 - x * x;
-        const deflection = segmentSpan * 0.05 * (oneMinusX2 * oneMinusX2) * x;
+        const detentOffset = (normSegment - 0.5) / 0.15;
+        const oneMinusSquared = 1 - detentOffset * detentOffset;
+        const deflection = segmentSpan * 0.05 * (oneMinusSquared * oneMinusSquared) * detentOffset;
         return rawPos + deflection;
     }
 
     return rawPos;
 }
 
-function interpolateGliderWidth(posPx: number, anchors: SwitchItemAnchor[]): number {
-    if (anchors.length === 0) {
+function interpolateGliderWidth(posPx: number, spatialAnchors: SwitchItemAnchor[]): number {
+    if (spatialAnchors.length === 0) {
         return FALLBACK_ITEM_WIDTH_PX;
     }
-    if (anchors.length === 1 || posPx <= anchors[0]!.left) {
-        return anchors[0]!.width;
+    if (spatialAnchors.length === 1 || posPx <= spatialAnchors[0]!.left) {
+        return spatialAnchors[0]!.width;
     }
 
-    const lastAnchor = anchors[anchors.length - 1]!;
+    const lastAnchor = spatialAnchors[spatialAnchors.length - 1]!;
     if (posPx >= lastAnchor.left) {
         return lastAnchor.width;
     }
 
-    for (let idx = 0; idx < anchors.length - 1; idx += 1) {
-        const startAnchor = anchors[idx]!;
-        const endAnchor = anchors[idx + 1]!;
-        if (posPx >= startAnchor.left && posPx <= endAnchor.left) {
-            const span = endAnchor.left - startAnchor.left;
-            const fraction = span > 0 ? (posPx - startAnchor.left) / span : 0;
-            return startAnchor.width + (endAnchor.width - startAnchor.width) * fraction;
-        }
-    }
-
-    return lastAnchor.width;
+    const segmentIndex = findSpatialSegmentIndex(posPx, spatialAnchors);
+    const startAnchor = spatialAnchors[segmentIndex]!;
+    const endAnchor = spatialAnchors[segmentIndex + 1]!;
+    const span = endAnchor.left - startAnchor.left;
+    const fraction = span > 0 ? Math.max(0, Math.min(1, (posPx - startAnchor.left) / span)) : 0;
+    return startAnchor.width + (endAnchor.width - startAnchor.width) * fraction;
 }
 
 function isItemDisabled(el?: HTMLElement | null): boolean {
     if (!el) return false;
-    return (
-        el.hasAttribute("disabled") ||
-        (el as HTMLButtonElement).disabled === true ||
-        el.getAttribute("aria-disabled") === "true" ||
-        el.classList.contains("disabled") ||
-        el.classList.contains("is-disabled")
-    );
+    if ((el as HTMLButtonElement).disabled === true || el.hasAttribute("disabled")) return true;
+    const className = el.className;
+    if (
+        typeof className === "string" &&
+        className.includes("disabled") &&
+        (el.classList.contains("disabled") || el.classList.contains("is-disabled"))
+    ) {
+        return true;
+    }
+    return el.getAttribute("aria-disabled") === "true";
 }
 
-function findClosestAnchorIndex(posPx: number, anchors: SwitchItemAnchor[], fallbackIndex = 0): number {
-    if (anchors.length <= 1) {
-        if (anchors.length === 1 && !isItemDisabled(anchors[0]!.element)) {
-            return 0;
-        }
+function findClosestAnchorIndex(
+    posPx: number,
+    spatialAnchors: SwitchItemAnchor[],
+    anchors: SwitchItemAnchor[],
+    fallbackIndex = 0,
+): number {
+    const count = spatialAnchors.length;
+    if (count === 0) {
         return fallbackIndex;
     }
+    if (count === 1) {
+        const onlyAnchor = spatialAnchors[0]!;
+        return !isItemDisabled(onlyAnchor.element) ? onlyAnchor.index : fallbackIndex;
+    }
 
-    let bestIndex = -1;
-    let bestDistance = Infinity;
-    for (let idx = 0; idx < anchors.length; idx += 1) {
-        if (isItemDisabled(anchors[idx]!.element)) {
-            continue;
-        }
-        const distance = Math.abs(anchors[idx]!.left - posPx);
-        if (distance < bestDistance) {
-            bestDistance = distance;
-            bestIndex = idx;
+    let low = 0;
+    let high = count;
+    while (low < high) {
+        const mid = (low + high) >> 1;
+        if (spatialAnchors[mid]!.left < posPx) {
+            low = mid + 1;
+        } else {
+            high = mid;
         }
     }
-    if (bestIndex >= 0) {
-        return bestIndex;
+
+    let leftAnchor: SwitchItemAnchor | null = null;
+    for (let leftCursor = low - 1; leftCursor >= 0; leftCursor -= 1) {
+        const candidate = spatialAnchors[leftCursor]!;
+        if (!isItemDisabled(candidate.element)) {
+            leftAnchor = candidate;
+            break;
+        }
     }
+
+    let rightAnchor: SwitchItemAnchor | null = null;
+    for (let rightCursor = low; rightCursor < count; rightCursor += 1) {
+        const candidate = spatialAnchors[rightCursor]!;
+        if (!isItemDisabled(candidate.element)) {
+            rightAnchor = candidate;
+            break;
+        }
+    }
+
+    if (leftAnchor && rightAnchor) {
+        const leftDist = Math.abs(leftAnchor.left - posPx);
+        const rightDist = Math.abs(rightAnchor.left - posPx);
+        if (leftDist < rightDist) {
+            return leftAnchor.index;
+        }
+        if (rightDist < leftDist) {
+            return rightAnchor.index;
+        }
+        return leftAnchor.index <= rightAnchor.index ? leftAnchor.index : rightAnchor.index;
+    }
+    if (leftAnchor) {
+        return leftAnchor.index;
+    }
+    if (rightAnchor) {
+        return rightAnchor.index;
+    }
+
     if (fallbackIndex >= 0 && fallbackIndex < anchors.length && !isItemDisabled(anchors[fallbackIndex]!.element)) {
         return fallbackIndex;
     }
-    const firstEnabled = anchors.findIndex((anchor) => !isItemDisabled(anchor.element));
-    return firstEnabled >= 0 ? firstEnabled : fallbackIndex;
+    for (let idx = 0; idx < anchors.length; idx += 1) {
+        if (!isItemDisabled(anchors[idx]!.element)) {
+            return idx;
+        }
+    }
+    return fallbackIndex;
 }
 
 export function createGlassSwitch(
@@ -231,9 +311,27 @@ export function createGlassSwitch(
         element.setAttribute("role", "tablist");
     }
 
-    let itemSelector =
-        options.itemSelector ??
-        "[data-switch-item], .lg-switch-item, button, a, [role='tab']";
+    let itemSelector = options.itemSelector ?? DEFAULT_ITEM_SELECTOR;
+    let isVertical = options.orientation === "vertical";
+    const syncOrientationAttribute = (): void => {
+        if (isVertical) {
+            element.setAttribute("data-lg-switch-orientation", "vertical");
+            element.setAttribute("aria-orientation", "vertical");
+        } else {
+            element.removeAttribute("data-lg-switch-orientation");
+            element.setAttribute("aria-orientation", "horizontal");
+        }
+    };
+    syncOrientationAttribute();
+
+    const existingTrack = element.querySelector<HTMLElement>(":scope > .lg-switch-track");
+    const createdTrack = !existingTrack;
+    const trackEl: HTMLElement = existingTrack ?? document.createElement("span");
+    trackEl.classList.add("lg-switch-track");
+    if (createdTrack) {
+        trackEl.setAttribute("aria-hidden", "true");
+        element.prepend(trackEl);
+    }
 
     const existingGlider =
         options.gliderElement ??
@@ -247,45 +345,81 @@ export function createGlassSwitch(
     }
 
     let onChangeCallback = options.onChange;
-    const baseGlassOptions = stripSwitchOwnOptions(options);
-    const trackGlass: LiquidGlassInstance = createLiquidGlass(element, {
-        blur: DEFAULT_GLASS_CONFIG.blur,
-        ior: 1.42,
-        tintOpacity: 0.08,
-        highlight: 0.32,
-        ...baseGlassOptions,
-        onEngineChange: undefined,
-        pill: true,
-        interactive: false,
-        draggable: false,
-        coalesce: false,
-    });
-    const gliderGlass: LiquidGlassInstance = createLiquidGlass(gliderEl, {
-        blur: DEFAULT_GLASS_CONFIG.blur,
-        ior: 1.66,
-        thickness: 58,
-        scaleRatio: 2.6,
-        tintOpacity: 0.16,
-        highlight: 0.46,
-        ...baseGlassOptions,
-        pill: true,
-        interactive: false,
-        draggable: false,
-        coalesce: false,
-    });
+    let userOnEngineChange = options.onEngineChange;
+    let isSwitchInitialized = false;
+    function syncGlassAttribute(nextEngine: GlassEngine): void {
+        if (nextEngine === "css") {
+            element.removeAttribute("data-lg-switch-glass");
+        } else {
+            element.setAttribute("data-lg-switch-glass", "1");
+        }
+        if (isSwitchInitialized) {
+            renderGliderTransform(true);
+        }
+    }
+
+    let switchOptions = options;
+    const onGliderEngineChange = (nextEngine: GlassEngine): void => {
+        syncGlassAttribute(nextEngine);
+        userOnEngineChange?.(nextEngine);
+    };
+
+    function resolvePartOptions(glider: boolean): LiquidGlassOptions {
+        const base: LiquidGlassOptions = {
+            adaptiveRefraction: true,
+            refractionDirection: isVertical ? "vertical" : "horizontal",
+            ior: glider ? 1.48 : 1.32,
+            bezel: glider ? 10 : 8,
+            thickness: glider ? 28 : 20,
+            scaleRatio: glider ? 2.1 : 1.05,
+            maxScaleMultiplier: glider ? 2.8 : 1.8,
+            tintOpacity: glider ? 0.07 : 0.06,
+            highlight: glider ? 0.46 : 0.34,
+            ...stripSwitchOwnOptions(switchOptions),
+            blur: 0,
+            pill: true,
+        };
+        const overrides = glider ? switchOptions.gliderOptions : switchOptions.trackOptions;
+        const part = mergeGlassOptions(base, overrides ?? {});
+        return {
+            ...part,
+            sceneElement: glider ? (part.sceneElement ?? element) : part.sceneElement,
+            onEngineChange: glider ? onGliderEngineChange : undefined,
+            interactive: false,
+            draggable: false,
+            coalesce: false,
+        };
+    }
+
+    let trackOptions = resolvePartOptions(false);
+    let gliderOptions = resolvePartOptions(true);
+    let isGliderHighlightActive = false;
+    const trackGlass: LiquidGlassInstance = createLiquidGlass(element, trackOptions);
+    const gliderGlass = createLiquidGlassController(gliderEl, gliderOptions);
+    if (gliderGlass.engine === "webgl") {
+        gliderGlass.update({ highlight: 0 });
+    }
+    syncGlassAttribute(gliderGlass.engine);
+
+    function syncGliderWebglHighlight(active: boolean): void {
+        if (isGliderHighlightActive === active) return;
+        isGliderHighlightActive = active;
+        if (gliderGlass.engine === "webgl") {
+            gliderGlass.update({ highlight: active ? (gliderOptions.highlight ?? 0.46) : 0 });
+        }
+    }
 
     const reducedMotionQuery =
         typeof window !== "undefined" && typeof window.matchMedia === "function"
             ? window.matchMedia("(prefers-reduced-motion: reduce)")
             : null;
 
-    const propagatorLut: Array<[OscillatorPropagator, OscillatorPropagator, OscillatorPropagator, number]> =
-        new Array(LUT_SLOTS + 1);
     let lastPropagatorDt = -1;
-    let posProp: OscillatorPropagator = buildOscillatorPropagator(POSITION_STIFFNESS, POSITION_DAMPING, 1 / 60);
-    let swellProp: OscillatorPropagator = buildOscillatorPropagator(SWELL_STIFFNESS, SWELL_DAMPING, 1 / 60);
-    let wobbleProp: OscillatorPropagator = buildOscillatorPropagator(WOBBLE_STIFFNESS, WOBBLE_DAMPING, 1 / 60);
-    let cachedDragDecay = Math.exp(-12 * (1 / 60));
+    let lastPropagatorSlot = -1;
+    let posProp: SpringPropagator = DEFAULT_SWITCH_PROPAGATOR_TUPLE[0];
+    let swellProp: SpringPropagator = DEFAULT_SWITCH_PROPAGATOR_TUPLE[1];
+    let wobbleProp: SpringPropagator = DEFAULT_SWITCH_PROPAGATOR_TUPLE[2];
+    let cachedDragDecay = DEFAULT_SWITCH_PROPAGATOR_TUPLE[3];
 
     function syncPropagator(dt: number): void {
         if (dt === lastPropagatorDt) {
@@ -295,17 +429,11 @@ export function createGlassSwitch(
 
         if (dt >= LUT_DT_MIN && dt <= LUT_DT_MAX) {
             const slot = ((dt - LUT_DT_MIN) * LUT_INV_STEP + 0.5) | 0;
-            let entry = propagatorLut[slot];
-            if (!entry) {
-                const quantizedDt = LUT_DT_MIN + slot / LUT_INV_STEP;
-                entry = [
-                    buildOscillatorPropagator(POSITION_STIFFNESS, POSITION_DAMPING, quantizedDt),
-                    buildOscillatorPropagator(SWELL_STIFFNESS, SWELL_DAMPING, quantizedDt),
-                    buildOscillatorPropagator(WOBBLE_STIFFNESS, WOBBLE_DAMPING, quantizedDt),
-                    Math.exp(-12 * quantizedDt),
-                ];
-                propagatorLut[slot] = entry;
+            if (slot === lastPropagatorSlot) {
+                return;
             }
+            lastPropagatorSlot = slot;
+            const entry = getSharedSwitchPropagator(slot);
             posProp = entry[0];
             swellProp = entry[1];
             wobbleProp = entry[2];
@@ -313,6 +441,7 @@ export function createGlassSwitch(
             return;
         }
 
+        lastPropagatorSlot = -1;
         posProp = buildOscillatorPropagator(POSITION_STIFFNESS, POSITION_DAMPING, dt);
         swellProp = buildOscillatorPropagator(SWELL_STIFFNESS, SWELL_DAMPING, dt);
         wobbleProp = buildOscillatorPropagator(WOBBLE_STIFFNESS, WOBBLE_DAMPING, dt);
@@ -320,6 +449,12 @@ export function createGlassSwitch(
     }
 
     let anchors: SwitchItemAnchor[] = [];
+    let spatialAnchors: SwitchItemAnchor[] = [];
+    const anchorByElement = new Map<HTMLElement, SwitchItemAnchor>();
+    const anchorIndexByValue = new Map<string, number>();
+    const itemResizeSubscriptions = new Map<HTMLElement, () => void>();
+    let layoutRefreshRaf: number | null = null;
+    let layoutChangedWhilePressed = false;
     let currentIndex = 0;
     let pendingWantedValue: string | undefined = options.value ?? options.defaultValue;
     let baseOffsetLeft = CONTAINER_PADDING_PX;
@@ -357,106 +492,294 @@ export function createGlassSwitch(
     let lastSyQuant = -1;
     let lastSweepQuant = -999999;
     let lastHighlightIndex = -1;
+    let coveredStart = 0;
+    let coveredEnd = 0;
+    let rightmostEdges: number[] = [];
+    let maxLeftOverflow = 0;
+    let cachedTravelSpan = FALLBACK_ITEM_WIDTH_PX;
 
     let rafId = 0;
     let lastFrameTime = 0;
     let isDestroyed = false;
 
+    function resolveHitAnchor(target: HTMLElement | null): SwitchItemAnchor | null {
+        let cursor: HTMLElement | null = target;
+        while (cursor && cursor !== element) {
+            const found = anchorByElement.get(cursor);
+            if (found) {
+                return found;
+            }
+            cursor = cursor.parentElement;
+        }
+        return null;
+    }
+
     function measureAnchors(): void {
-        const rawCandidates = Array.from(element.querySelectorAll<HTMLElement>(itemSelector)).filter(
-            (candidate) => candidate !== gliderEl && !gliderEl.contains(candidate),
-        );
-        const candidates = rawCandidates.filter(
-            (candidate) => !rawCandidates.some((other) => other !== candidate && other.contains(candidate)),
-        );
+        const previousSelection = anchors[currentIndex]?.element;
+        const rawNodeList = element.querySelectorAll<HTMLElement>(itemSelector);
+        const candidateSet = new Set<HTMLElement>();
+        const candidates: HTMLElement[] = [];
+        let hasLayoutGeometry = false;
+
+        for (let idx = 0; idx < rawNodeList.length; idx += 1) {
+            const candidate = rawNodeList[idx]!;
+            if (
+                candidate === gliderEl ||
+                candidate === trackEl ||
+                gliderEl.contains(candidate) ||
+                trackEl.contains(candidate)
+            ) {
+                continue;
+            }
+            let ancestor = candidate.parentElement;
+            let isNested = false;
+            while (ancestor && ancestor !== element) {
+                if (candidateSet.has(ancestor)) {
+                    isNested = true;
+                    break;
+                }
+                ancestor = ancestor.parentElement;
+            }
+            if (isNested) continue;
+            candidateSet.add(candidate);
+            candidates.push(candidate);
+            const extent = isVertical ? candidate.offsetHeight : candidate.offsetWidth;
+            const coord = isVertical ? candidate.offsetTop : candidate.offsetLeft;
+            if (!hasLayoutGeometry && (extent > 0 || coord > 0)) {
+                hasLayoutGeometry = true;
+            }
+        }
+
+        for (const [item, unsubscribe] of itemResizeSubscriptions) {
+            if (!candidateSet.has(item)) {
+                unsubscribe();
+                itemResizeSubscriptions.delete(item);
+            }
+        }
+        if (typeof ResizeObserver === "function") {
+            for (const item of candidates) {
+                if (!itemResizeSubscriptions.has(item)) {
+                    itemResizeSubscriptions.set(item, observeSharedElementResize(item, scheduleLayoutRefresh));
+                }
+            }
+        }
+
+        lastHighlightIndex = -1;
+        coveredStart = 0;
+        coveredEnd = candidates.length;
+        rightmostEdges = [];
+        maxLeftOverflow = 0;
+
+        const fallbackItemSpan = isVertical ? FALLBACK_ITEM_HEIGHT_PX : FALLBACK_ITEM_WIDTH_PX;
 
         if (candidates.length === 0) {
+            anchorByElement.clear();
+            anchorIndexByValue.clear();
             anchors = [];
+            spatialAnchors = [];
             currentIndex = 0;
             targetPosX = 0;
             baseOffsetLeft = CONTAINER_PADDING_PX;
-            gliderEl.style.left = `${baseOffsetLeft}px`;
+            if (isVertical) {
+                gliderEl.style.left = "";
+                gliderEl.style.top = `${baseOffsetLeft}px`;
+            } else {
+                gliderEl.style.top = "";
+                gliderEl.style.left = `${baseOffsetLeft}px`;
+            }
             gliderEl.style.opacity = "0";
             return;
         }
 
-        gliderEl.style.opacity = "";
-
-        const firstOffset = candidates[0]!.offsetLeft;
-        const firstWidth = candidates[0]!.offsetWidth;
-        const hasLayoutGeometry = candidates.some(
-            (candidate) => candidate.offsetWidth > 0 || candidate.offsetLeft > 0,
-        );
-
+        const firstOffset = isVertical ? candidates[0]!.offsetTop : candidates[0]!.offsetLeft;
         baseOffsetLeft = hasLayoutGeometry ? firstOffset : CONTAINER_PADDING_PX;
-        gliderEl.style.left = `${baseOffsetLeft}px`;
 
-        anchors = candidates.map((item, index) => {
+        const nextAnchors = new Array<SwitchItemAnchor>(candidates.length);
+        let firstEnabledIndex = -1;
+        let isMonotonicLeft = true;
+        let previousLeft = -Infinity;
+
+        for (let idx = 0; idx < candidates.length; idx += 1) {
+            const item = candidates[idx]!;
+            const rawExtent = isVertical ? item.offsetHeight : item.offsetWidth;
+            const rawCoord = isVertical ? item.offsetTop : item.offsetLeft;
             const width =
-                hasLayoutGeometry && item.offsetWidth > 0
-                    ? item.offsetWidth
-                    : FALLBACK_ITEM_WIDTH_PX;
-            const left = hasLayoutGeometry
-                ? item.offsetLeft - baseOffsetLeft
-                : index * FALLBACK_ITEM_WIDTH_PX;
-            return {
-                element: item,
-                value: resolveItemValue(item, index),
-                left,
-                width,
-            };
-        });
+                hasLayoutGeometry && rawExtent > 0
+                    ? rawExtent
+                    : fallbackItemSpan;
+            const left =
+                hasLayoutGeometry
+                    ? rawCoord - baseOffsetLeft
+                    : idx * fallbackItemSpan;
+            const resolvedLeft = left;
+            const itemValue = resolveItemValue(item, idx);
+            const labelEl = item.querySelector<HTMLElement>(":scope > span, span");
+            const iconEl = item.querySelector<SVGElement>(":scope > svg, svg");
+            let labelRelLeft = 0;
+            let labelWidth = 0;
+            let iconRelLeft = 0;
+            let iconWidth = 0;
 
-        if (!hasLayoutGeometry && firstWidth === 0) {
-            for (let idx = 0; idx < anchors.length; idx += 1) {
-                anchors[idx]!.left = idx * FALLBACK_ITEM_WIDTH_PX;
+            if (hasLayoutGeometry && (labelEl || iconEl)) {
+                const itemRect = item.getBoundingClientRect?.();
+                const rectExtent = itemRect ? (isVertical ? itemRect.height : itemRect.width) : 0;
+                const rectScale = rectExtent > 0 ? width / rectExtent : 1;
+                if (labelEl) {
+                    const labelExtent = isVertical ? labelEl.offsetHeight : labelEl.offsetWidth;
+                    const labelOffsetParent = labelEl.offsetParent;
+                    if (labelExtent > 0 && (labelOffsetParent === item || labelOffsetParent === null)) {
+                        labelRelLeft = isVertical ? labelEl.offsetTop : labelEl.offsetLeft;
+                        labelWidth = labelExtent;
+                    } else if (itemRect && rectExtent > 0) {
+                        const labelRect = labelEl.getBoundingClientRect?.();
+                        const labelRectExtent = labelRect
+                            ? isVertical
+                                ? labelRect.height
+                                : labelRect.width
+                            : 0;
+                        if (labelRect && labelRectExtent > 0) {
+                            const itemOrigin = isVertical ? itemRect.top : itemRect.left;
+                            const labelOrigin = isVertical ? labelRect.top : labelRect.left;
+                            labelRelLeft = (labelOrigin - itemOrigin) * rectScale;
+                            labelWidth = labelRectExtent * rectScale;
+                        }
+                    }
+                }
+                if (iconEl && itemRect && rectExtent > 0) {
+                    const iconRect = iconEl.getBoundingClientRect?.();
+                    const iconRectExtent = iconRect
+                        ? isVertical
+                            ? iconRect.height
+                            : iconRect.width
+                        : 0;
+                    if (iconRect && iconRectExtent > 0) {
+                        const itemOrigin = isVertical ? itemRect.top : itemRect.left;
+                        const iconOrigin = isVertical ? iconRect.top : iconRect.left;
+                        iconRelLeft = (iconOrigin - itemOrigin) * rectScale;
+                        iconWidth = iconRectExtent * rectScale;
+                    }
+                }
+            }
+
+            const prevAnchor = anchorByElement.get(item);
+            const sameLabelEl = prevAnchor !== undefined && prevAnchor.labelEl === labelEl;
+            const sameIconEl = prevAnchor !== undefined && prevAnchor.iconEl === iconEl;
+            const anchor: SwitchItemAnchor = {
+                element: item,
+                value: itemValue,
+                left: resolvedLeft,
+                width,
+                index: idx,
+                labelEl,
+                labelRelLeft,
+                labelWidth,
+                iconEl,
+                iconRelLeft,
+                iconWidth,
+                lastCoverageQuant: prevAnchor ? prevAnchor.lastCoverageQuant : -1,
+                lastHitStartQuant: prevAnchor ? prevAnchor.lastHitStartQuant : -1,
+                lastHitEndQuant: prevAnchor ? prevAnchor.lastHitEndQuant : -1,
+                lastLabelStartQuant: sameLabelEl ? prevAnchor.lastLabelStartQuant : -1,
+                lastLabelEndQuant: sameLabelEl ? prevAnchor.lastLabelEndQuant : -1,
+                lastIconCovQuant: sameIconEl ? prevAnchor.lastIconCovQuant : -1,
+                lastLitState: prevAnchor ? prevAnchor.lastLitState : -1,
+            };
+            nextAnchors[idx] = anchor;
+            if (firstEnabledIndex === -1 && !isItemDisabled(item)) {
+                firstEnabledIndex = idx;
+            }
+            if (resolvedLeft < previousLeft) {
+                isMonotonicLeft = false;
+            }
+            previousLeft = resolvedLeft;
+        }
+
+        gliderEl.style.opacity = "";
+        if (isVertical) {
+            gliderEl.style.left = "";
+            gliderEl.style.top = `${baseOffsetLeft}px`;
+        } else {
+            gliderEl.style.top = "";
+            gliderEl.style.left = `${baseOffsetLeft}px`;
+        }
+
+        anchorByElement.clear();
+        anchorIndexByValue.clear();
+        for (let idx = 0; idx < nextAnchors.length; idx += 1) {
+            const anchor = nextAnchors[idx]!;
+            anchorByElement.set(anchor.element, anchor);
+            if (!anchorIndexByValue.has(anchor.value)) {
+                anchorIndexByValue.set(anchor.value, idx);
             }
         }
 
+        anchors = nextAnchors;
+
+        const previousIndex = previousSelection ? anchorByElement.get(previousSelection)?.index : undefined;
+        currentIndex = previousIndex ?? Math.min(currentIndex, anchors.length - 1);
+
         if (pendingWantedValue !== undefined) {
-            const matchedIndex = anchors.findIndex(
-                (anchor) => anchor.value === pendingWantedValue,
-            );
-            if (matchedIndex >= 0) {
-                if (!isItemDisabled(anchors[matchedIndex]!.element)) {
-                    currentIndex = matchedIndex;
-                }
+            const match = anchorIndexByValue.get(pendingWantedValue);
+            if (match !== undefined && !isItemDisabled(anchors[match]!.element)) {
+                currentIndex = match;
                 pendingWantedValue = undefined;
             }
         }
 
-        if (currentIndex >= anchors.length) {
-            currentIndex = Math.max(0, anchors.length - 1);
+        if (isItemDisabled(anchors[currentIndex]!.element) && firstEnabledIndex >= 0) {
+            currentIndex = firstEnabledIndex;
         }
 
-        if (anchors.length > 0 && isItemDisabled(anchors[currentIndex]?.element)) {
-            const firstEnabled = anchors.findIndex((anchor) => !isItemDisabled(anchor.element));
-            if (firstEnabled >= 0) {
-                currentIndex = firstEnabled;
+        spatialAnchors = isMonotonicLeft
+            ? anchors
+            : [...anchors].sort((first, second) => first.left - second.left);
+        if (spatialAnchors.length < 2) {
+            cachedTravelSpan = spatialAnchors[0]?.width ?? FALLBACK_ITEM_WIDTH_PX;
+        } else {
+            const span = spatialAnchors[spatialAnchors.length - 1]!.left - spatialAnchors[0]!.left;
+            cachedTravelSpan = span > 0 ? span : spatialAnchors[0]!.width;
+        }
+        if (spatialAnchors.length > 8) {
+            let rightmost = -Infinity;
+            for (const anchor of spatialAnchors) {
+                maxLeftOverflow = Math.max(maxLeftOverflow, -anchor.labelRelLeft, -anchor.iconRelLeft);
+                rightmost = Math.max(
+                    rightmost,
+                    anchor.left + Math.max(
+                        anchor.width,
+                        anchor.labelRelLeft + anchor.labelWidth,
+                        anchor.iconRelLeft + anchor.iconWidth,
+                    ),
+                );
+                rightmostEdges.push(rightmost);
             }
         }
     }
 
     function getTravelSpan(): number {
-        if (anchors.length < 2) {
-            return anchors[0]?.width ?? FALLBACK_ITEM_WIDTH_PX;
-        }
-        const span = anchors[anchors.length - 1]!.left - anchors[0]!.left;
-        return span > 0 ? span : anchors[0]!.width;
+        return cachedTravelSpan;
+    }
+
+    function setHighlightSelection(anchor: SwitchItemAnchor | undefined, active: boolean): void {
+        if (!anchor) return;
+        const item = anchor.element;
+        item.classList.toggle("active", active);
+        item.setAttribute("aria-selected", active ? "true" : "false");
+        item.setAttribute("aria-pressed", active ? "true" : "false");
     }
 
     function syncVisualHighlight(
         visualPosX = posX,
-        visualWidth = interpolateGliderWidth(posX, anchors),
+        visualWidth = interpolateGliderWidth(posX, spatialAnchors),
         visualScaleX = 1,
         force = false,
     ): void {
-        if (anchors.length === 0) {
+        if (anchors.length === 0 || spatialAnchors.length === 0) {
             return;
         }
 
         const travelSpan = getTravelSpan();
-        const firstLeft = anchors[0]!.left;
+        const firstLeft = spatialAnchors[0]!.left;
         const normalizedPos = travelSpan > 0 ? (visualPosX - firstLeft) / travelSpan : 0;
         const clampedNorm = Math.max(0, Math.min(1, normalizedPos));
         const sweepRaw = -150 + clampedNorm * 1300;
@@ -467,27 +790,57 @@ export function createGlassSwitch(
             element.style.setProperty("--sweep", `${(sweepQuant * 0.1).toFixed(1)}%`);
         }
 
-        const closestIndex = findClosestAnchorIndex(visualPosX, anchors, currentIndex);
-        if (force || closestIndex !== lastHighlightIndex) {
-            lastHighlightIndex = closestIndex;
+        const closestIndex = findClosestAnchorIndex(visualPosX, spatialAnchors, anchors, currentIndex);
+        if (lastHighlightIndex === -1) {
             for (let idx = 0; idx < anchors.length; idx += 1) {
-                const itemEl = anchors[idx]!.element;
-                const isActive = idx === closestIndex;
-                itemEl.classList.toggle("active", isActive);
-                itemEl.setAttribute("aria-selected", isActive ? "true" : "false");
-                itemEl.setAttribute("aria-pressed", isActive ? "true" : "false");
+                setHighlightSelection(anchors[idx], idx === closestIndex);
             }
+        } else if (closestIndex !== lastHighlightIndex) {
+            setHighlightSelection(anchors[lastHighlightIndex], false);
+            setHighlightSelection(anchors[closestIndex], true);
         }
+        lastHighlightIndex = closestIndex;
 
+        const hasLiquidGlass = gliderGlass.engine !== "css";
         const effectiveScaleX = Math.max(0.5, visualScaleX);
         const gliderCenter = visualPosX + visualWidth * 0.5;
         const halfVisualWidth = visualWidth * effectiveScaleX * 0.5;
         const visualLeft = gliderCenter - halfVisualWidth;
         const visualRight = gliderCenter + halfVisualWidth;
         const fullVisualSpan = Math.max(1, visualRight - visualLeft);
+        const lensCapInset = Math.min(fullVisualSpan * 0.14, 7);
+        const lensLeft = Math.min(gliderCenter, visualLeft + lensCapInset);
+        const lensRight = Math.max(gliderCenter, visualRight - lensCapInset);
 
-        for (let idx = 0; idx < anchors.length; idx += 1) {
-            const anchor = anchors[idx]!;
+        let first = 0;
+        let end = spatialAnchors.length;
+        if (rightmostEdges.length > 0) {
+            let low = 0;
+            let high = rightmostEdges.length;
+            while (low < high) {
+                const mid = (low + high) >> 1;
+                if (rightmostEdges[mid]! <= visualLeft) low = mid + 1;
+                else high = mid;
+            }
+            first = low;
+            high = spatialAnchors.length;
+            while (low < high) {
+                const mid = (low + high) >> 1;
+                if (spatialAnchors[mid]!.left < visualRight + maxLeftOverflow) low = mid + 1;
+                else high = mid;
+            }
+            end = low;
+        }
+        const repaintFirst = force ? 0 : Math.min(first, coveredStart);
+        const repaintEnd = force ? spatialAnchors.length : Math.max(end, coveredEnd);
+        const gapStart = Math.min(end, coveredEnd);
+        const gapEnd = Math.max(first, coveredStart);
+        coveredStart = first;
+        coveredEnd = end;
+        for (let idx = repaintFirst; idx < repaintEnd; idx += 1) {
+            if (!force && idx === gapStart && gapEnd > gapStart) idx = gapEnd;
+            if (idx >= repaintEnd) break;
+            const anchor = spatialAnchors[idx]!;
             const itemLeft = anchor.left;
             const itemRight = anchor.left + anchor.width;
             const itemWidth = Math.max(1, anchor.width);
@@ -511,15 +864,126 @@ export function createGlassSwitch(
                       )
                     : 0;
 
-            anchor.element.style.setProperty("--lg-switch-coverage", coverage.toFixed(3));
-            anchor.element.style.setProperty(
-                "--lg-switch-hit-start",
-                `${hitStartPct.toFixed(1)}%`,
-            );
-            anchor.element.style.setProperty(
-                "--lg-switch-hit-end",
-                `${hitEndPct.toFixed(1)}%`,
-            );
+            const covQuant = (coverage * 1000 + 0.5) | 0;
+            const startQuant = (hitStartPct * 10 + 0.5) | 0;
+            const endQuant = (hitEndPct * 10 + 0.5) | 0;
+            if (force || covQuant !== anchor.lastCoverageQuant) {
+                anchor.lastCoverageQuant = covQuant;
+                anchor.element.style.setProperty("--lg-switch-coverage", (covQuant * 0.001).toFixed(3));
+            }
+            if (force || startQuant !== anchor.lastHitStartQuant) {
+                anchor.lastHitStartQuant = startQuant;
+                anchor.element.style.setProperty(
+                    "--lg-switch-hit-start",
+                    `${(startQuant * 0.1).toFixed(1)}%`,
+                );
+            }
+            if (force || endQuant !== anchor.lastHitEndQuant) {
+                anchor.lastHitEndQuant = endQuant;
+                anchor.element.style.setProperty(
+                    "--lg-switch-hit-end",
+                    `${(endQuant * 0.1).toFixed(1)}%`,
+                );
+            }
+
+            if (anchor.labelEl) {
+                if (hasLiquidGlass && anchor.labelWidth > 0) {
+                    const labelLeft = itemLeft + anchor.labelRelLeft;
+                    const labelRight = labelLeft + anchor.labelWidth;
+                    const labelOverlapStart = Math.max(labelLeft, lensLeft);
+                    const labelOverlapEnd = Math.min(labelRight, lensRight);
+                    const labelOverlap = Math.max(0, labelOverlapEnd - labelOverlapStart);
+                    if (labelOverlap > 0.5) {
+                        const labelStartPct = Math.max(
+                            0,
+                            Math.min(100, ((labelOverlapStart - labelLeft) / anchor.labelWidth) * 100),
+                        );
+                        const labelEndPct = Math.max(
+                            labelStartPct,
+                            Math.min(100, ((labelOverlapEnd - labelLeft) / anchor.labelWidth) * 100),
+                        );
+                        const lStartQuant = (labelStartPct * 10 + 0.5) | 0;
+                        const lEndQuant = (labelEndPct * 10 + 0.5) | 0;
+                        if (force || anchor.lastLitState !== 1) {
+                            anchor.lastLitState = 1;
+                            anchor.labelEl.setAttribute("data-lg-switch-lit", "1");
+                        }
+                        if (force || lStartQuant !== anchor.lastLabelStartQuant) {
+                            anchor.lastLabelStartQuant = lStartQuant;
+                            anchor.labelEl.style.setProperty(
+                                "--lg-switch-label-hit-start",
+                                `${(lStartQuant * 0.1).toFixed(1)}%`,
+                            );
+                        }
+                        if (force || lEndQuant !== anchor.lastLabelEndQuant) {
+                            anchor.lastLabelEndQuant = lEndQuant;
+                            anchor.labelEl.style.setProperty(
+                                "--lg-switch-label-hit-end",
+                                `${(lEndQuant * 0.1).toFixed(1)}%`,
+                            );
+                        }
+                    } else if (force || anchor.lastLitState !== 0) {
+                        anchor.lastLitState = 0;
+                        anchor.lastLabelStartQuant = 0;
+                        anchor.lastLabelEndQuant = 0;
+                        anchor.labelEl.removeAttribute("data-lg-switch-lit");
+                        anchor.labelEl.style.setProperty("--lg-switch-label-hit-start", "0.0%");
+                        anchor.labelEl.style.setProperty("--lg-switch-label-hit-end", "0.0%");
+                    }
+                } else if (
+                    hasLiquidGlass &&
+                    lensRight - lensLeft > 0.5 &&
+                    Math.min(itemRight, lensRight) - Math.max(itemLeft, lensLeft) > 0.5
+                ) {
+                    if (force || anchor.lastLitState !== 2) {
+                        anchor.lastLitState = 2;
+                        anchor.lastLabelStartQuant = -1;
+                        anchor.lastLabelEndQuant = -1;
+                        anchor.labelEl.setAttribute("data-lg-switch-lit", "1");
+                        anchor.labelEl.style.removeProperty("--lg-switch-label-hit-start");
+                        anchor.labelEl.style.removeProperty("--lg-switch-label-hit-end");
+                    }
+                } else if (force || anchor.lastLitState !== 0) {
+                    anchor.lastLitState = 0;
+                    anchor.lastLabelStartQuant = 0;
+                    anchor.lastLabelEndQuant = 0;
+                    anchor.labelEl.removeAttribute("data-lg-switch-lit");
+                    anchor.labelEl.style.setProperty("--lg-switch-label-hit-start", "0.0%");
+                    anchor.labelEl.style.setProperty("--lg-switch-label-hit-end", "0.0%");
+                }
+            }
+
+            if (anchor.iconEl) {
+                let iconCoverage = 0;
+                if (hasLiquidGlass) {
+                    const rawIconRatio =
+                        anchor.iconWidth > 0
+                            ? Math.max(
+                                  0,
+                                  Math.min(
+                                      1,
+                                      Math.max(
+                                          0,
+                                          Math.min(itemLeft + anchor.iconRelLeft + anchor.iconWidth, lensRight) -
+                                              Math.max(itemLeft + anchor.iconRelLeft, lensLeft),
+                                      ) / anchor.iconWidth,
+                                  ),
+                              )
+                            : coverage;
+                    iconCoverage =
+                        rawIconRatio <= 0.35
+                            ? 0
+                            : Math.max(0, Math.min(1, (rawIconRatio - 0.35) / 0.5));
+                }
+                const iconQuant = (iconCoverage * 1000 + 0.5) | 0;
+                if (force || iconQuant !== anchor.lastIconCovQuant) {
+                    anchor.lastIconCovQuant = iconQuant;
+                    anchor.element.style.setProperty(
+                        "--lg-switch-icon-coverage",
+                        (iconQuant * 0.001).toFixed(3),
+                    );
+                }
+            }
         }
     }
 
@@ -528,12 +992,19 @@ export function createGlassSwitch(
             return;
         }
 
-        const widthPx = interpolateGliderWidth(posX, anchors);
+        const widthPx = interpolateGliderWidth(posX, spatialAnchors);
         const widthQuant = (widthPx * 10 + 0.5) | 0;
         const widthChanged = widthQuant !== lastWidthQuant;
         if (forceWidth || widthChanged) {
             lastWidthQuant = widthQuant;
-            gliderEl.style.width = `${(widthQuant * 0.1).toFixed(1)}px`;
+            const extentCss = `${(widthQuant * 0.1).toFixed(1)}px`;
+            if (isVertical) {
+                gliderEl.style.width = "";
+                gliderEl.style.height = extentCss;
+            } else {
+                gliderEl.style.height = "";
+                gliderEl.style.width = extentCss;
+            }
         }
 
         const rawVel = isDragging ? smoothedDragVel : velX * 0.001;
@@ -580,16 +1051,20 @@ export function createGlassSwitch(
             const translatePx = (txQuant * 0.01).toFixed(2);
             const curSx = (sxQuant * 0.0001).toFixed(4);
             const curSy = (syQuant * 0.0001).toFixed(4);
-            gliderEl.style.transform = `translate3d(${translatePx}px, 0, 0) scale(${curSx}, ${curSy})`;
+            gliderEl.style.transform = isVertical
+                ? `translate3d(0, ${translatePx}px, 0) scale(${curSy}, ${curSx})`
+                : `translate3d(${translatePx}px, 0, 0) scale(${curSx}, ${curSy})`;
             syncVisualHighlight(tx, widthPx, scaleX, forceWidth);
-            gliderGlass.refresh();
+            if (gliderGlass.engine === "webgl") {
+                gliderGlass.refreshMotion();
+            } else if (forceWidth || widthChanged) {
+                gliderGlass.refresh();
+            }
         }
     }
 
-    function checkSettled(): boolean {
-        if (isPointerDown || isDragging) {
-            return false;
-        }
+    function checkSettled(restingSwell: number): boolean {
+        if (isDragging && !reducedMotionQuery?.matches && Math.abs(smoothedDragVel) >= 0.005) return false;
         if (performance.now() < holdSwellUntil) {
             return false;
         }
@@ -597,7 +1072,7 @@ export function createGlassSwitch(
         const isPosSettled =
             Math.abs(posX - targetPosX) < 0.2 && Math.abs(velX) < 10;
         const isSwellSettled =
-            Math.abs(swell - 1.0) < 0.005 && Math.abs(velSwell) < 0.05;
+            Math.abs(swell - restingSwell) < 0.005 && Math.abs(velSwell) < 0.05;
         const isWobbleSettled =
             Math.abs(wobble) < 0.004 && Math.abs(velWobble) < 0.04;
         return isPosSettled && isSwellSettled && isWobbleSettled;
@@ -627,8 +1102,8 @@ export function createGlassSwitch(
         if (!isDragging) {
             const dispPos = posX - targetPosX;
             const currentVel = velX;
-            posX = targetPosX + posProp.m00 * dispPos + posProp.m01 * currentVel;
-            velX = posProp.m10 * dispPos + posProp.m11 * currentVel;
+            posX = targetPosX + posProp.c00 * dispPos + posProp.c01 * currentVel;
+            velX = posProp.c10 * dispPos + posProp.c11 * currentVel;
         }
 
         const absVelX = Math.abs(velX);
@@ -643,8 +1118,8 @@ export function createGlassSwitch(
 
         const dispSwell = swell - desiredSwell;
         const currentVelSwell = velSwell;
-        swell = desiredSwell + swellProp.m00 * dispSwell + swellProp.m01 * currentVelSwell;
-        velSwell = swellProp.m10 * dispSwell + swellProp.m11 * currentVelSwell;
+        swell = desiredSwell + swellProp.c00 * dispSwell + swellProp.c01 * currentVelSwell;
+        velSwell = swellProp.c10 * dispSwell + swellProp.c11 * currentVelSwell;
 
         if (isDragging) {
             smoothedDragVel *= cachedDragDecay;
@@ -663,7 +1138,7 @@ export function createGlassSwitch(
                 absVelX > 25 &&
                 (velX * (targetPosX - posX) <= 0 || absVelX < Math.abs(prevVelX))
             ) {
-                velWobble -= WOBBLE_IMPACT_FACTOR * absVelX;
+                velWobble -= WOBBLE_IMPACT_FACTOR * absVelX * (clampedDt * 60);
             }
         }
         prevVelX = velX;
@@ -672,9 +1147,9 @@ export function createGlassSwitch(
         const currentVelWobble = velWobble;
         wobble =
             targetWobble +
-            wobbleProp.m00 * dispWobble +
-            wobbleProp.m01 * currentVelWobble;
-        velWobble = wobbleProp.m10 * dispWobble + wobbleProp.m11 * currentVelWobble;
+            wobbleProp.c00 * dispWobble +
+            wobbleProp.c01 * currentVelWobble;
+        velWobble = wobbleProp.c10 * dispWobble + wobbleProp.c11 * currentVelWobble;
 
         renderGliderTransform();
     }
@@ -701,16 +1176,16 @@ export function createGlassSwitch(
 
         stepPhysics(dt);
 
-        if (checkSettled()) {
+        const restingSwell = reducedMotionQuery?.matches ? 1 : targetSwell;
+        if (checkSettled(restingSwell)) {
             posX = targetPosX;
             velX = 0;
-            swell = 1.0;
+            swell = restingSwell;
             velSwell = 0;
             wobble = 0;
             velWobble = 0;
             prevVelX = 0;
-            lastP = 0;
-            gliderEl.style.setProperty("--p", "0.000");
+            if (isDragging) smoothedDragVel = 0;
             renderGliderTransform(true);
             stopLoop();
             return;
@@ -796,9 +1271,7 @@ export function createGlassSwitch(
 
         const eventTarget = event.target as HTMLElement | null;
         if (eventTarget) {
-            const hitAnchor = anchors.find(
-                (anchor) => anchor.element === eventTarget || anchor.element.contains(eventTarget),
-            );
+            const hitAnchor = resolveHitAnchor(eventTarget);
             if (hitAnchor && isItemDisabled(hitAnchor.element)) {
                 return;
             }
@@ -807,14 +1280,16 @@ export function createGlassSwitch(
         isPointerDown = true;
         isDragging = false;
         activePointerId = event.pointerId;
-        startPointerX = event.clientX;
-        lastPointerX = event.clientX;
+        const pointerCoord = isVertical ? event.clientY : event.clientX;
+        startPointerX = pointerCoord;
+        lastPointerX = pointerCoord;
         dragStartTime = performance.now();
         lastPointerTime = dragStartTime;
         dragAnchorX = posX;
         smoothedDragVel = 0;
 
         element.classList.add("is-pressed");
+        syncGliderWebglHighlight(true);
 
         if (!reducedMotionQuery?.matches) {
             targetSwell = SWELL_PEAK;
@@ -824,7 +1299,7 @@ export function createGlassSwitch(
             startLoop();
         }
 
-        window.addEventListener("pointermove", handlePointerMove);
+        window.addEventListener("pointermove", handlePointerMove, { passive: true });
         window.addEventListener("pointerup", handlePointerEnd);
         window.addEventListener("pointercancel", handlePointerCancel);
         window.addEventListener("blur", handleWindowBlur);
@@ -838,12 +1313,14 @@ export function createGlassSwitch(
             return;
         }
 
-        const deltaX = event.clientX - startPointerX;
+        const pointerCoord = isVertical ? event.clientY : event.clientX;
+        const deltaX = pointerCoord - startPointerX;
         const now = performance.now();
         const elapsedMs = now - lastPointerTime;
 
         if (!isDragging && Math.abs(deltaX) > DRAG_THRESHOLD_PX) {
             isDragging = true;
+            velX = 0;
             element.classList.add("is-dragging");
             if (activePointerId >= 0) {
                 try {
@@ -855,17 +1332,18 @@ export function createGlassSwitch(
         }
 
         if (elapsedMs >= 4) {
-            const rawVel = (event.clientX - lastPointerX) / elapsedMs;
+            const rawVel = (pointerCoord - lastPointerX) / elapsedMs;
             const clampedRawVel = Math.max(-3.0, Math.min(3.0, rawVel));
-            smoothedDragVel = smoothedDragVel * 0.7 + clampedRawVel * 0.3;
-            lastPointerX = event.clientX;
+            const velAlpha = 1 - Math.exp(-elapsedMs / 32);
+            smoothedDragVel = smoothedDragVel + (clampedRawVel - smoothedDragVel) * velAlpha;
+            lastPointerX = pointerCoord;
             lastPointerTime = now;
         }
 
-        if (isDragging && anchors.length > 0) {
+        if (isDragging && spatialAnchors.length > 0) {
             let rawPos = dragAnchorX + deltaX;
-            const minLeft = anchors[0]!.left;
-            const maxLeft = anchors[anchors.length - 1]!.left;
+            const minLeft = spatialAnchors[0]!.left;
+            const maxLeft = spatialAnchors[spatialAnchors.length - 1]!.left;
 
             if (rawPos < minLeft) {
                 rawPos = minLeft - applyRubberResistance(minLeft - rawPos);
@@ -873,10 +1351,11 @@ export function createGlassSwitch(
                 rawPos = maxLeft + applyRubberResistance(rawPos - maxLeft);
             }
 
-            rawPos = computeMidpointDetent(rawPos, anchors);
+            rawPos = computeMidpointDetent(rawPos, spatialAnchors);
             posX = rawPos;
             targetPosX = rawPos;
             renderGliderTransform();
+            if (!rafId && !reducedMotionQuery?.matches) startLoop();
         }
     }
 
@@ -885,7 +1364,11 @@ export function createGlassSwitch(
             return;
         }
         try {
-            if (element.hasPointerCapture?.(activePointerId)) {
+            const hasCaptureFn = element.hasPointerCapture;
+            if (
+                typeof element.releasePointerCapture === "function" &&
+                (typeof hasCaptureFn !== "function" || hasCaptureFn.call(element, activePointerId))
+            ) {
                 element.releasePointerCapture(activePointerId);
             }
         } catch {
@@ -904,6 +1387,11 @@ export function createGlassSwitch(
         cleanupWindowPointerListeners();
         isPointerDown = false;
         element.classList.remove("is-pressed");
+        syncGliderWebglHighlight(false);
+        if (layoutChangedWhilePressed) {
+            layoutChangedWhilePressed = false;
+            measureAnchors();
+        }
 
         if (isDragging) {
             isDragging = false;
@@ -911,16 +1399,21 @@ export function createGlassSwitch(
             element.classList.remove("is-dragging");
             releaseActivePointerCapture();
 
-            const deltaX = event.clientX - startPointerX;
-            const totalElapsedMs = Math.max(1, performance.now() - dragStartTime);
+            const now = performance.now();
+            const pauseMs = Math.max(0, now - lastPointerTime);
+            const pauseDecay = Math.exp(-pauseMs / 55);
+            const decayedSmoothedVel = smoothedDragVel * pauseDecay;
+            const pointerCoord = isVertical ? event.clientY : event.clientX;
+            const deltaX = pointerCoord - startPointerX;
+            const totalElapsedMs = Math.max(1, now - dragStartTime);
             const rawReleaseVel =
-                Math.abs(smoothedDragVel) > 0.05
-                    ? smoothedDragVel
-                    : deltaX / totalElapsedMs;
+                Math.abs(decayedSmoothedVel) > 0.05
+                    ? decayedSmoothedVel
+                    : (deltaX / totalElapsedMs) * pauseDecay;
             const releaseVel = Math.max(-3.0, Math.min(3.0, rawReleaseVel));
 
             const projectedPosX = posX + releaseVel * 1000 * 0.12;
-            const nextIndex = findClosestAnchorIndex(projectedPosX, anchors, currentIndex);
+            const nextIndex = findClosestAnchorIndex(projectedPosX, spatialAnchors, anchors, currentIndex);
 
             velX = releaseVel * 1000;
             targetSwell = 1.0;
@@ -931,6 +1424,7 @@ export function createGlassSwitch(
         } else {
             releaseActivePointerCapture();
             targetSwell = 1.0;
+            targetPosX = anchors[currentIndex]?.left ?? 0;
             startLoop();
         }
     }
@@ -946,7 +1440,12 @@ export function createGlassSwitch(
         isPointerDown = false;
         isDragging = false;
         element.classList.remove("is-pressed", "is-dragging");
+        syncGliderWebglHighlight(false);
         releaseActivePointerCapture();
+        if (layoutChangedWhilePressed) {
+            layoutChangedWhilePressed = false;
+            measureAnchors();
+        }
 
         targetSwell = 1.0;
         holdSwellUntil = 0;
@@ -973,20 +1472,15 @@ export function createGlassSwitch(
             measureAnchors();
         }
 
-        let matchedIndex = anchors.findIndex(
-            (anchor) =>
-                anchor.element === eventTarget || anchor.element.contains(eventTarget),
-        );
-        if (matchedIndex === -1) {
+        let matchedAnchor = resolveHitAnchor(eventTarget);
+        if (!matchedAnchor) {
             measureAnchors();
-            matchedIndex = anchors.findIndex(
-                (anchor) =>
-                    anchor.element === eventTarget || anchor.element.contains(eventTarget),
-            );
+            matchedAnchor = resolveHitAnchor(eventTarget);
         }
-        if (matchedIndex === -1) {
+        if (!matchedAnchor) {
             return;
         }
+        const matchedIndex = matchedAnchor.index;
         if (isItemDisabled(anchors[matchedIndex]!.element)) {
             event.preventDefault();
             return;
@@ -995,39 +1489,45 @@ export function createGlassSwitch(
         commitActiveIndex(matchedIndex, true, true, true);
     }
 
-    function handleKeyDown(event: KeyboardEvent): void {
-        if (anchors.length === 0) {
-            measureAnchors();
+    function findEnabledAnchorIndex(startIndex: number, step: 1 | -1): number {
+        for (let idx = startIndex; idx >= 0 && idx < anchors.length; idx += step) {
+            if (!isItemDisabled(anchors[idx]!.element)) {
+                return idx;
+            }
         }
+        return -1;
+    }
+
+    function handleKeyDown(event: KeyboardEvent): void {
+        measureAnchors();
         if (anchors.length === 0) {
             return;
         }
 
         let targetIndex = -1;
-        if (event.key === "ArrowRight" || event.key === "ArrowDown") {
-            let next = currentIndex + 1;
-            while (next < anchors.length && isItemDisabled(anchors[next]!.element)) {
-                next++;
-            }
-            if (next < anchors.length) targetIndex = next;
-        } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
-            let prev = currentIndex - 1;
-            while (prev >= 0 && isItemDisabled(anchors[prev]!.element)) {
-                prev--;
-            }
-            if (prev >= 0) targetIndex = prev;
+        if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+            const rtl = !isVertical && getComputedStyle(element).direction === "rtl";
+            const step = (event.key === "ArrowRight") !== rtl ? 1 : -1;
+            targetIndex = findEnabledAnchorIndex(currentIndex + step, step);
+        } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            const step = event.key === "ArrowDown" ? 1 : -1;
+            targetIndex = findEnabledAnchorIndex(currentIndex + step, step);
         } else if (event.key === "Home") {
-            let first = 0;
-            while (first < anchors.length && isItemDisabled(anchors[first]!.element)) {
-                first++;
-            }
-            if (first < anchors.length) targetIndex = first;
+            targetIndex = findEnabledAnchorIndex(0, 1);
         } else if (event.key === "End") {
-            let last = anchors.length - 1;
-            while (last >= 0 && isItemDisabled(anchors[last]!.element)) {
-                last--;
+            targetIndex = findEnabledAnchorIndex(anchors.length - 1, -1);
+        } else if (event.key === "Enter" || event.key === " ") {
+            const matched = resolveHitAnchor(event.target as HTMLElement | null);
+            const tagName = (event.target as HTMLElement | null)?.tagName;
+            if (
+                matched &&
+                tagName !== "BUTTON" &&
+                tagName !== "A" &&
+                tagName !== "INPUT" &&
+                !isItemDisabled(matched.element)
+            ) {
+                targetIndex = matched.index;
             }
-            if (last >= 0) targetIndex = last;
         }
 
         if (targetIndex === -1) {
@@ -1035,28 +1535,13 @@ export function createGlassSwitch(
         }
 
         event.preventDefault();
-        measureAnchors();
         commitActiveIndex(targetIndex, true, true, true);
         anchors[targetIndex]?.element.focus();
     }
 
     measureAnchors();
-    const initialWantedValue = options.value ?? options.defaultValue;
-    if (initialWantedValue !== undefined) {
-        const matchedInitial = anchors.findIndex(
-            (anchor) => anchor.value === initialWantedValue,
-        );
-        if (matchedInitial >= 0 && !isItemDisabled(anchors[matchedInitial]!.element)) {
-            currentIndex = matchedInitial;
-        }
-    }
-    if (anchors.length > 0 && isItemDisabled(anchors[currentIndex]?.element)) {
-        const firstEnabled = anchors.findIndex((anchor) => !isItemDisabled(anchor.element));
-        if (firstEnabled >= 0) {
-            currentIndex = firstEnabled;
-        }
-    }
 
+    isSwitchInitialized = true;
     if (anchors.length > 0) {
         posX = anchors[currentIndex]!.left;
         targetPosX = posX;
@@ -1065,26 +1550,78 @@ export function createGlassSwitch(
     }
 
     element.addEventListener("pointerdown", handlePointerDown);
+    element.addEventListener("lostpointercapture", handlePointerCancel);
     element.addEventListener("click", handleContainerClick);
     element.addEventListener("keydown", handleKeyDown);
 
-    const resizeObserver =
-        typeof ResizeObserver !== "undefined"
-            ? new ResizeObserver(() => {
-                  if (isDestroyed || isPointerDown) {
-                      return;
-                  }
-                  measureAnchors();
-                  if (anchors.length > 0) {
-                      targetPosX = anchors[currentIndex]?.left ?? 0;
-                      if (!rafId) {
-                          posX = targetPosX;
-                          renderGliderTransform(true);
-                      }
-                  }
-              })
-            : null;
-    resizeObserver?.observe(element);
+    function refreshAnchorLayout(): void {
+        if (isDestroyed) return;
+        if (isPointerDown) {
+            layoutChangedWhilePressed = true;
+            return;
+        }
+        measureAnchors();
+        if (anchors.length === 0) return;
+        targetPosX = anchors[currentIndex]!.left;
+        if (!rafId) {
+            posX = targetPosX;
+            renderGliderTransform(true);
+        }
+    }
+
+    function scheduleLayoutRefresh(): void {
+        if (isDestroyed || layoutRefreshRaf !== null) return;
+        layoutRefreshRaf = requestAnimationFrame(() => {
+            layoutRefreshRaf = null;
+            refreshAnchorLayout();
+        });
+    }
+
+    const unobserveSwitchResize = observeSharedElementResize(element, scheduleLayoutRefresh);
+
+    let switchMutationObserver: MutationObserver | null = null;
+    if (typeof MutationObserver === "function") {
+        const isInternalNode = (node: Node): boolean => {
+            if (node === gliderEl || node === trackEl) return true;
+            if (node instanceof HTMLElement) {
+                return node.classList.contains("lg-switch-glider") || node.classList.contains("lg-switch-track");
+            }
+            return false;
+        };
+        const hasExternalNode = (nodes: NodeList): boolean => {
+            for (let idx = 0; idx < nodes.length; idx += 1) {
+                if (!isInternalNode(nodes[idx]!)) return true;
+            }
+            return false;
+        };
+        switchMutationObserver = new MutationObserver((records) => {
+            if (isDestroyed) return;
+            let relevant = false;
+            for (const record of records) {
+                if (record.type === "attributes") {
+                    if (record.target !== element && !isInternalNode(record.target)) {
+                        relevant = true;
+                        break;
+                    }
+                    continue;
+                }
+                if (
+                    record.type === "childList" &&
+                    (hasExternalNode(record.addedNodes) || hasExternalNode(record.removedNodes))
+                ) {
+                    relevant = true;
+                    break;
+                }
+            }
+            if (relevant) refreshAnchorLayout();
+        });
+        switchMutationObserver.observe(element, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ["disabled", "aria-disabled", "data-value", "data-switch-value", "value"],
+        });
+    }
 
     return {
         get element(): HTMLElement {
@@ -1100,80 +1637,139 @@ export function createGlassSwitch(
             return currentIndex;
         },
         setValue(value: string, animate = true): void {
-            pendingWantedValue = value;
+            if (isDestroyed) return;
+            pendingWantedValue = undefined;
             measureAnchors();
-            const foundIndex = anchors.findIndex((anchor) => anchor.value === value);
-            if (foundIndex >= 0) {
-                commitActiveIndex(foundIndex, animate, true, true);
+            const foundIndex = anchorIndexByValue.get(value);
+            if (foundIndex !== undefined) {
+                if (!isItemDisabled(anchors[foundIndex]!.element)) {
+                    commitActiveIndex(foundIndex, animate, true, true);
+                }
+            } else {
+                pendingWantedValue = value;
             }
         },
         setActiveIndex(index: number, animate = true): void {
+            if (isDestroyed || !Number.isFinite(index)) return;
             pendingWantedValue = undefined;
             measureAnchors();
-            commitActiveIndex(index, animate, true, true);
+            if (anchors.length === 0) return;
+            const boundedIndex = Math.max(0, Math.min(anchors.length - 1, Math.round(index)));
+            if (isItemDisabled(anchors[boundedIndex]!.element)) return;
+            commitActiveIndex(boundedIndex, animate, true, true);
         },
         update(nextOptions: Partial<LiquidGlassSwitchOptions>): void {
-            if (nextOptions.onChange !== undefined) {
-                onChangeCallback = nextOptions.onChange;
-            }
-            if (nextOptions.itemSelector !== undefined && nextOptions.itemSelector !== itemSelector) {
-                itemSelector = nextOptions.itemSelector;
-                measureAnchors();
-            }
-            if (nextOptions.value !== undefined) {
-                pendingWantedValue = nextOptions.value;
-                measureAnchors();
-                const foundIndex = anchors.findIndex(
-                    (anchor) => anchor.value === nextOptions.value,
-                );
-                if (foundIndex >= 0 && (foundIndex !== currentIndex || posX !== anchors[foundIndex]!.left)) {
-                    commitActiveIndex(foundIndex, true, false, true);
+            if (isDestroyed) return;
+            switchOptions = { ...switchOptions, ...nextOptions };
+            if ("onChange" in nextOptions) onChangeCallback = nextOptions.onChange;
+            if ("onEngineChange" in nextOptions) userOnEngineChange = nextOptions.onEngineChange;
+            if ("orientation" in nextOptions) {
+                const nextVertical = nextOptions.orientation === "vertical";
+                if (nextVertical !== isVertical) {
+                    handlePointerCancel();
+                    stopLoop();
+                    isVertical = nextVertical;
+                    syncOrientationAttribute();
+                    lastWidthQuant = -1;
+                    lastTxQuant = -999999;
+                    measureAnchors();
+                    if (anchors.length > 0) {
+                        posX = anchors[currentIndex]?.left ?? 0;
+                        targetPosX = posX;
+                        velX = 0;
+                        swell = targetSwell = 1;
+                        velSwell = wobble = velWobble = prevVelX = 0;
+                        renderGliderTransform(true);
+                    }
                 }
             }
-            const glassPatch = stripSwitchOwnOptions(nextOptions);
-            if (Object.keys(glassPatch).length > 0) {
-                trackGlass.update({
-                    ...glassPatch,
-                    onEngineChange: undefined,
-                    pill: true,
-                    interactive: false,
-                    draggable: false,
-                    coalesce: false,
-                });
-                gliderGlass.update({
-                    ...glassPatch,
-                    pill: true,
-                    interactive: false,
-                    draggable: false,
-                    coalesce: false,
-                });
+            if ("itemSelector" in nextOptions) {
+                const nextSelector = nextOptions.itemSelector ?? DEFAULT_ITEM_SELECTOR;
+                if (nextSelector !== itemSelector) {
+                    itemSelector = nextSelector;
+                    refreshAnchorLayout();
+                }
+            }
+            if ("value" in nextOptions) pendingWantedValue = undefined;
+            if (nextOptions.value !== undefined) {
+                measureAnchors();
+                const foundIndex = anchorIndexByValue.get(nextOptions.value);
+                if (foundIndex !== undefined) {
+                    if (
+                        !isItemDisabled(anchors[foundIndex]!.element) &&
+                        (foundIndex !== currentIndex || posX !== anchors[foundIndex]!.left)
+                    ) {
+                        commitActiveIndex(foundIndex, true, false, true);
+                    }
+                } else {
+                    pendingWantedValue = nextOptions.value;
+                }
+            }
+            if (
+                "orientation" in nextOptions ||
+                "trackOptions" in nextOptions ||
+                "gliderOptions" in nextOptions ||
+                Object.keys(nextOptions).some((key) => !SWITCH_GLASS_OWN_OPTION_KEYS.has(key) && key !== "onEngineChange")
+            ) {
+                const nextTrack = resolvePartOptions(false);
+                const nextGlider = resolvePartOptions(true);
+                updateGlassPart(trackGlass, trackOptions, nextTrack);
+                updateGlassPart(gliderGlass, gliderOptions, nextGlider);
+                trackOptions = nextTrack;
+                gliderOptions = nextGlider;
+                if (gliderGlass.engine === "webgl" && !isGliderHighlightActive) {
+                    gliderGlass.update({ highlight: 0 });
+                }
+                syncGlassAttribute(gliderGlass.engine);
             }
         },
         refresh(): void {
+            if (isDestroyed) return;
             measureAnchors();
-            if (!isPointerDown && !rafId && anchors.length > 0) {
-                posX = anchors[currentIndex]?.left ?? 0;
-                targetPosX = posX;
-                renderGliderTransform(true);
+            if (!isPointerDown && anchors.length > 0) {
+                targetPosX = anchors[currentIndex]?.left ?? 0;
+                if (!rafId) {
+                    posX = targetPosX;
+                    renderGliderTransform(true);
+                }
             }
             trackGlass.refresh();
             gliderGlass.refresh();
+        },
+        setLightTilt(horizontal: number, vertical: number): void {
+            if (isDestroyed) return;
+            trackGlass.setLightTilt?.(horizontal, vertical);
+            gliderGlass.setLightTilt?.(horizontal, vertical);
         },
         setSceneCanvas(
             canvas: HTMLCanvasElement | null,
             sceneElement?: HTMLElement | null,
         ): void {
+            if (isDestroyed) return;
             trackGlass.setSceneCanvas(canvas, sceneElement);
-            gliderGlass.setSceneCanvas(canvas, sceneElement);
+            gliderGlass.setSceneCanvas(
+                canvas,
+                sceneElement !== undefined ? (sceneElement ?? (canvas ? null : element)) : undefined,
+            );
+            syncGlassAttribute(gliderGlass.engine);
+            renderGliderTransform(true);
         },
         destroy(): void {
+            if (isDestroyed) return;
             isDestroyed = true;
             stopLoop();
             cleanupWindowPointerListeners();
+            releaseActivePointerCapture();
             element.removeEventListener("pointerdown", handlePointerDown);
+            element.removeEventListener("lostpointercapture", handlePointerCancel);
             element.removeEventListener("click", handleContainerClick);
             element.removeEventListener("keydown", handleKeyDown);
-            resizeObserver?.disconnect();
+            unobserveSwitchResize();
+            for (const unsubscribe of itemResizeSubscriptions.values()) unsubscribe();
+            itemResizeSubscriptions.clear();
+            if (layoutRefreshRaf !== null) cancelAnimationFrame(layoutRefreshRaf);
+            switchMutationObserver?.disconnect();
+            switchMutationObserver = null;
             gliderGlass.destroy();
             trackGlass.destroy();
             if (createdGlider) {
@@ -1182,13 +1778,21 @@ export function createGlassSwitch(
                 gliderEl.style.removeProperty("--p");
                 gliderEl.style.removeProperty("transform");
                 gliderEl.style.removeProperty("width");
+                gliderEl.style.removeProperty("height");
                 gliderEl.style.removeProperty("left");
+                gliderEl.style.removeProperty("top");
                 gliderEl.style.removeProperty("opacity");
                 gliderEl.style.removeProperty("will-change");
+            }
+            if (createdTrack) {
+                trackEl.remove();
             }
             if (assignedRole) {
                 element.removeAttribute("role");
             }
+            element.removeAttribute("aria-orientation");
+            element.removeAttribute("data-lg-switch-orientation");
+            element.removeAttribute("data-lg-switch-glass");
             element.classList.remove(
                 "lg-switch",
                 "is-pressed",
@@ -1203,6 +1807,12 @@ export function createGlassSwitch(
                 anchor.element.style.removeProperty("--lg-switch-coverage");
                 anchor.element.style.removeProperty("--lg-switch-hit-start");
                 anchor.element.style.removeProperty("--lg-switch-hit-end");
+                anchor.element.style.removeProperty("--lg-switch-icon-coverage");
+                if (anchor.labelEl) {
+                    anchor.labelEl.removeAttribute("data-lg-switch-lit");
+                    anchor.labelEl.style.removeProperty("--lg-switch-label-hit-start");
+                    anchor.labelEl.style.removeProperty("--lg-switch-label-hit-end");
+                }
             }
         },
     };

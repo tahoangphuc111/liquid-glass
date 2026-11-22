@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { glassEffect } from "../src/index.js";
+import { createGlassSlider, glassEffect } from "../src/index.js";
 
 describe("glassEffect helper and HTMLElement prototype method", () => {
     beforeEach(() => {
@@ -27,6 +27,11 @@ describe("glassEffect helper and HTMLElement prototype method", () => {
 
         first.destroy();
         expect(card.classList.contains("lg-on")).toBe(false);
+
+        const remounted = card.glassEffect({ engine: "css" });
+        first.destroy();
+        expect(card.glassEffect({ blur: 3 })).toBe(remounted);
+        remounted.destroy();
     });
 
     it("supports selector group calls via glassEffect(selector, options)", () => {
@@ -64,6 +69,35 @@ describe("glassEffect helper and HTMLElement prototype method", () => {
         expect(document.getElementById("wrap")?.contains(input)).toBe(true);
     });
 
+    it("follows form reset and native attributes and leaves the input where the wrapper was", async () => {
+        const form = document.body.appendChild(document.createElement("form"));
+        const input = form.appendChild(document.createElement("input"));
+        input.type = "range";
+        input.defaultValue = "25";
+        input.setAttribute("aria-orientation", "horizontal");
+        const slider = createGlassSlider(input, { engine: "css", orientation: "vertical" });
+        const wrapper = input.parentElement!;
+        const sibling = document.createElement("span");
+        wrapper.after(sibling);
+        try {
+            slider.setValue(75, false);
+            expect(wrapper.style.getPropertyValue("--lg-slider-progress")).toBe("0.7500");
+            form.reset();
+            await Promise.resolve();
+            expect(wrapper.style.getPropertyValue("--lg-slider-progress")).toBe("0.2500");
+
+            input.dir = "rtl";
+            input.disabled = true;
+            await Promise.resolve();
+            expect(wrapper.dir).toBe("rtl");
+            expect(wrapper.classList.contains("is-disabled")).toBe(true);
+        } finally {
+            slider.destroy();
+        }
+        expect(input.nextElementSibling).toBe(sibling);
+        expect(input.getAttribute("aria-orientation")).toBe("horizontal");
+    });
+
     it("animates slider visual progress and press spring on click instead of snapping", () => {
         const rafQueue: FrameRequestCallback[] = [];
         vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb) => {
@@ -81,7 +115,6 @@ describe("glassEffect helper and HTMLElement prototype method", () => {
 
         expect(wrapper.style.getPropertyValue("--lg-slider-visual-progress")).toBe("0.2000");
 
-        // Simulate a fast click on the slider track jumping from 20% to 80%.
         input.dispatchEvent(new Event("pointerdown", { bubbles: true }));
         input.value = "80";
         input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -101,12 +134,10 @@ describe("glassEffect helper and HTMLElement prototype method", () => {
             seenScaleX.push(Number(wrapper.style.getPropertyValue("--lg-slider-bounce-scale-x")));
         }
 
-        // Intermediate frames smoothly interpolate instead of teleporting in a single frame.
         expect(seenVisual[0]).toBeGreaterThan(0.2);
         expect(seenVisual[0]).toBeLessThan(0.8);
         expect(seenVisual.at(-1)).toBeCloseTo(0.8, 3);
 
-        // Quick click produces visible press/rebound scale motion and settles back to 1.
         expect(Math.max(...seenScaleX)).toBeGreaterThan(1.015);
         expect(Math.min(...seenScaleX)).toBeLessThan(1.0);
         expect(seenScaleX.at(-1)).toBeCloseTo(1, 3);
@@ -215,27 +246,23 @@ describe("glassEffect helper and HTMLElement prototype method", () => {
         const wrapper = input.parentElement as HTMLElement;
         expect(wrapper.classList.contains("lg-slider")).toBe(true);
 
-        // Pointer 1 down
         const pDown1 = new MouseEvent("pointerdown", { bubbles: true, clientX: 50 });
         Object.defineProperty(pDown1, "pointerId", { value: 1 });
         Object.defineProperty(pDown1, "pointerType", { value: "touch" });
         input.dispatchEvent(pDown1);
         expect(wrapper.classList.contains("is-active")).toBe(true);
 
-        // Secondary pointer down should be ignored
         const pDown2 = new MouseEvent("pointerdown", { bubbles: true, clientX: 90 });
         Object.defineProperty(pDown2, "pointerId", { value: 2 });
         Object.defineProperty(pDown2, "pointerType", { value: "touch" });
         input.dispatchEvent(pDown2);
 
-        // Secondary pointer up should not release the active slider
         const pUp2 = new MouseEvent("pointerup", { bubbles: true, clientX: 90 });
         Object.defineProperty(pUp2, "pointerId", { value: 2 });
         Object.defineProperty(pUp2, "pointerType", { value: "touch" });
         window.dispatchEvent(pUp2);
         expect(wrapper.classList.contains("is-active")).toBe(true);
 
-        // Primary pointer up releases the active slider
         const pUp1 = new MouseEvent("pointerup", { bubbles: true, clientX: 50 });
         Object.defineProperty(pUp1, "pointerId", { value: 1 });
         Object.defineProperty(pUp1, "pointerType", { value: "touch" });
@@ -285,7 +312,6 @@ describe("glassEffect helper and HTMLElement prototype method", () => {
         const wrapper = input.parentElement as HTMLElement;
         expect(wrapper.classList.contains("lg-slider")).toBe(true);
 
-        // Simulate external DOM framework disconnecting wrapper first
         wrapper.remove();
         expect(wrapper.parentNode).toBeNull();
         expect(input.parentElement).toBe(wrapper);
@@ -305,18 +331,15 @@ describe("glassEffect helper and HTMLElement prototype method", () => {
         const instance = glassEffect(input, { engine: "css" });
         const wrapper = input.parentElement as HTMLElement;
 
-        // computeRangeProgress should not produce NaN
         const progressVal = wrapper.style.getPropertyValue("--lg-slider-progress");
         expect(progressVal).not.toBe("NaN");
 
-        // Pointer down to begin drag
         const pDown = new MouseEvent("pointerdown", { bubbles: true, clientX: 50 });
         Object.defineProperty(pDown, "pointerId", { value: 11 });
         Object.defineProperty(pDown, "pointerType", { value: "touch" });
         input.dispatchEvent(pDown);
         expect(wrapper.classList.contains("is-active")).toBe(true);
 
-        // Window pointer move past threshold
         const pMove = new MouseEvent("pointermove", { bubbles: true, clientX: 200 });
         Object.defineProperty(pMove, "pointerId", { value: 11 });
         window.dispatchEvent(pMove);
@@ -326,5 +349,82 @@ describe("glassEffect helper and HTMLElement prototype method", () => {
         expect(wrapper.classList.contains("is-active")).toBe(false);
 
         instance.destroy();
+    });
+
+    it("supports vertical slider orientation, disabled guard, duplicate onChange suppression, preset blur preservation, and ancestor sceneElement", () => {
+        const disabledRange = document.createElement("input");
+        disabledRange.type = "range";
+        disabledRange.disabled = true;
+        document.body.appendChild(disabledRange);
+        const disabledSlider = createGlassSlider(disabledRange, { engine: "css" });
+        const disabledWrap = disabledRange.parentElement!;
+        expect(disabledWrap.classList.contains("is-disabled")).toBe(true);
+        disabledRange.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+        expect(disabledWrap.classList.contains("is-active")).toBe(false);
+        disabledSlider.destroy();
+
+        const sceneHost = document.createElement("div");
+        const range = document.createElement("input");
+        range.type = "range";
+        range.min = "0";
+        range.max = "100";
+        range.value = "30";
+        sceneHost.appendChild(range);
+        document.body.appendChild(sceneHost);
+
+        const changes: number[] = [];
+        const slider = createGlassSlider(range, {
+            engine: "css",
+            preset: "frosted",
+            orientation: "vertical",
+            sceneElement: sceneHost,
+            onChange: (val) => changes.push(val),
+        });
+        const wrap = range.closest(".lg-slider") as HTMLElement;
+        expect(wrap.getAttribute("data-lg-slider-orientation")).toBe("vertical");
+        expect(range.getAttribute("aria-orientation")).toBe("vertical");
+
+        range.value = "65";
+        range.dispatchEvent(new Event("input", { bubbles: true }));
+        range.dispatchEvent(new Event("change", { bubbles: true }));
+        expect(changes).toEqual([65]);
+
+        const thumb = wrap.querySelector<HTMLElement>(".lg-slider-thumb")!;
+        slider.update({ highlight: 0.6 });
+        expect(thumb.style.getPropertyValue("--lg-filter")).not.toBe("blur(0.0px)");
+
+        slider.setValue(80, false);
+        expect(slider.value).toBe(80);
+        expect(wrap.style.getPropertyValue("--lg-slider-progress")).toBe("0.8000");
+        slider.refresh();
+        slider.destroy();
+        slider.setValue(10, false);
+        expect(slider.value).toBe(80);
+    });
+
+    it("attaches slider window pointer drag listeners lazily only while pressed", () => {
+        const addWindowSpy = vi.spyOn(window, "addEventListener");
+        const removeWindowSpy = vi.spyOn(window, "removeEventListener");
+
+        const range = document.createElement("input");
+        range.type = "range";
+        range.min = "0";
+        range.max = "100";
+        range.value = "50";
+        document.body.appendChild(range);
+
+        const slider = createGlassSlider(range, { engine: "css" });
+        const addedWhileIdle = addWindowSpy.mock.calls.filter(([type]) => type === "pointermove");
+        expect(addedWhileIdle).toHaveLength(0);
+
+        range.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+        const addedOnPress = addWindowSpy.mock.calls.filter(([type]) => type === "pointermove");
+        expect(addedOnPress).toHaveLength(1);
+
+        window.dispatchEvent(new Event("pointerup"));
+        const removedOnRelease = removeWindowSpy.mock.calls.filter(([type]) => type === "pointermove");
+        expect(removedOnRelease).toHaveLength(1);
+
+        slider.destroy();
     });
 });

@@ -1,7 +1,51 @@
+import { parseCssCornerRadiusPx } from "./config.js";
+import { automaticRoundedPixelRatio, resizeCanvas, SMALL_SCENE_DIMENSION, useSmallMemoryBudget } from "./renderBudget.js";
+import { parseCssColorToRgbaReadonly } from "./cssColor.js";
 import type { SceneCaptureController } from "./types.js";
 
-const COLOR_TOKEN_PATTERN =
-    /#[0-9a-fA-F]{3,8}|rgba?\([^)]+\)|hsla?\([^)]+\)|\b[a-zA-Z]{3,20}\b/g;
+const MODERN_COLOR_PREFIX_PATTERN = /^(?:oklch|oklab|lch|lab|hwb|color-mix|color)\(/i;
+
+function lruGet<K, V>(cache: Map<K, V>, key: K): V | undefined {
+    const value = cache.get(key);
+    if (value !== undefined) {
+        cache.delete(key);
+        cache.set(key, value);
+    }
+    return value;
+}
+
+function lruSet<K, V>(cache: Map<K, V>, key: K, value: V, maxEntries: number): void {
+    if (cache.has(key)) {
+        cache.delete(key);
+    } else if (cache.size >= maxEntries) {
+        const oldestKey = cache.keys().next().value;
+        if (oldestKey !== undefined) cache.delete(oldestKey);
+    }
+    cache.set(key, value);
+}
+
+type CornerRadii = number | readonly [number, number, number, number];
+
+function toCanvasCssColor(rawColor: string): string {
+    const len = rawColor.length;
+    if (len === 0) return rawColor;
+    const ch0 = rawColor.charCodeAt(0);
+    if ((ch0 === 114 || ch0 === 35) && rawColor.charCodeAt(len - 1) > 32) {
+        return rawColor;
+    }
+    const trimmed = rawColor.trim();
+    if (!MODERN_COLOR_PREFIX_PATTERN.test(trimmed)) {
+        return trimmed;
+    }
+    const parsed = parseCssColorToRgbaReadonly(trimmed);
+    if (!parsed) return trimmed;
+    const red = Math.round(parsed[0] * 255);
+    const green = Math.round(parsed[1] * 255);
+    const blue = Math.round(parsed[2] * 255);
+    return parsed[3] >= 0.999
+        ? `rgb(${red}, ${green}, ${blue})`
+        : `rgba(${red}, ${green}, ${blue}, ${Number(parsed[3].toFixed(4))})`;
+}
 
 interface GradientStopSpec {
     color: string;
@@ -15,10 +59,11 @@ function applyLetterSpacing(ctx: CanvasRenderingContext2D, letterSpacing: string
     target.letterSpacing = letterSpacing === "normal" ? "0px" : letterSpacing;
 }
 
+const MAX_BLUR_CACHE = 200;
 const blurCache = new Map<string, number>();
 function parseCssBlurPx(filterStr: string): number {
     if (!filterStr || filterStr === "none") return 0;
-    const cached = blurCache.get(filterStr);
+    const cached = lruGet(blurCache, filterStr);
     if (cached !== undefined) return cached;
     const match = filterStr.match(/blur\(\s*([\d.]+)px\s*\)/i);
     let value = 0;
@@ -26,8 +71,7 @@ function parseCssBlurPx(filterStr: string): number {
         const parsed = Number.parseFloat(match[1]);
         value = Number.isFinite(parsed) && parsed > 0 ? Math.min(80, parsed) : 0;
     }
-    if (blurCache.size > 200) blurCache.clear();
-    blurCache.set(filterStr, value);
+    lruSet(blurCache, filterStr, value, MAX_BLUR_CACHE);
     return value;
 }
 
@@ -82,6 +126,16 @@ function parseCssGradientAngle(token: string): { dx: number; dy: number } | null
         const rad = (Number.parseFloat(degMatch[1]) * Math.PI) / 180;
         return { dx: Math.sin(rad), dy: -Math.cos(rad) };
     }
+    const radMatch = normalized.match(/^(-?[\d.]+)rad$/);
+    if (radMatch) {
+        const rad = Number.parseFloat(radMatch[1]);
+        return { dx: Math.sin(rad), dy: -Math.cos(rad) };
+    }
+    const gradMatch = normalized.match(/^(-?[\d.]+)grad$/);
+    if (gradMatch) {
+        const rad = (Number.parseFloat(gradMatch[1]) * Math.PI) / 200;
+        return { dx: Math.sin(rad), dy: -Math.cos(rad) };
+    }
     const turnMatch = normalized.match(/^(-?[\d.]+)turn$/);
     if (turnMatch) {
         const rad = Number.parseFloat(turnMatch[1]) * Math.PI * 2;
@@ -98,31 +152,496 @@ function parseCssGradientAngle(token: string): { dx: number; dy: number } | null
     return mag > 0 ? { dx: dx / mag, dy: dy / mag } : null;
 }
 
-function parseGradientStops(args: string[], lineLen: number): GradientStopSpec[] {
-    const stops: GradientStopSpec[] = [];
-    for (const part of args) {
+function parseCssAngleRadians(token: string): number | null {
+    const normalized = token.trim().toLowerCase();
+    const degMatch = normalized.match(/^(-?[\d.]+)deg$/);
+    if (degMatch) return (Number.parseFloat(degMatch[1]) * Math.PI) / 180;
+    const radMatch = normalized.match(/^(-?[\d.]+)rad$/);
+    if (radMatch) return Number.parseFloat(radMatch[1]);
+    const gradMatch = normalized.match(/^(-?[\d.]+)grad$/);
+    if (gradMatch) return (Number.parseFloat(gradMatch[1]) * Math.PI) / 200;
+    const turnMatch = normalized.match(/^(-?[\d.]+)turn$/);
+    if (turnMatch) return Number.parseFloat(turnMatch[1]) * Math.PI * 2;
+    return null;
+}
+
+const MAX_SPLIT_BG_LAYERS_CACHE = 128;
+const splitBgLayersCache = new Map<string, readonly string[]>();
+
+function getCachedBackgroundLayers(backgroundImage: string): readonly string[] {
+    const cached = lruGet(splitBgLayersCache, backgroundImage);
+    if (cached !== undefined) return cached;
+    const layers = splitTopLevelArgs(backgroundImage);
+    lruSet(splitBgLayersCache, backgroundImage, layers, MAX_SPLIT_BG_LAYERS_CACHE);
+    return layers;
+}
+
+interface ParsedStopToken {
+    readonly color: string;
+    readonly kind: "none" | "px" | "frac";
+    readonly value: number;
+}
+
+const MAX_PARSED_STOPS_CACHE = 128;
+const parsedGradientStopsCache = new Map<string, readonly ParsedStopToken[]>();
+
+function getCachedStopTokens(cacheKey: string, args: readonly string[], angleStops: boolean): readonly ParsedStopToken[] {
+    const cached = lruGet(parsedGradientStopsCache, cacheKey);
+    if (cached !== undefined) return cached;
+    const tokens: ParsedStopToken[] = [];
+    for (let idx = 0; idx < args.length; idx++) {
+        const part = args[idx]!;
         const colorMatch = part.match(
-            /^(#[0-9a-fA-F]{3,8}|rgba?\([^)]+\)|hsla?\([^)]+\)|[a-zA-Z]{3,20})(.*)$/,
+            /^(#[0-9a-fA-F]{3,8}|color-mix\((?:[^()]+|\([^()]*\))+\)|(?:rgba?|hsla?|hwb|oklch|oklab|lch|lab|color)\([^)]+\)|[a-zA-Z]{3,20})(.*)$/,
         );
         if (!colorMatch) continue;
-        const color = colorMatch[1];
+        const color = toCanvasCssColor(colorMatch[1]);
         const rest = colorMatch[2].trim();
-        let posPx: number | null = null;
-        let posFrac: number | null = null;
-        if (rest) {
-            const pxMatch = rest.match(/(-?[\d.]+)px/);
-            const pctMatch = rest.match(/(-?[\d.]+)%/);
-            if (pxMatch) {
-                posPx = Number.parseFloat(pxMatch[1]);
-                posFrac = lineLen > 0 ? posPx / lineLen : 0;
-            } else if (pctMatch) {
-                posFrac = Number.parseFloat(pctMatch[1]) / 100;
-                posPx = posFrac * lineLen;
+        if (!rest) {
+            tokens.push({ color, kind: "none", value: 0 });
+            continue;
+        }
+        const positionTokens = rest.match(/-?[\d.]+(?:%|px|deg|rad|grad|turn)/gi) ?? [];
+        if (positionTokens.length === 0) {
+            tokens.push({ color, kind: "none", value: 0 });
+            continue;
+        }
+        const maxPositions = Math.min(2, positionTokens.length);
+        let emitted = false;
+        for (let posIdx = 0; posIdx < maxPositions; posIdx++) {
+            const trimmed = positionTokens[posIdx]!.trim().toLowerCase();
+            if (angleStops) {
+                const angleRad = parseCssAngleRadians(trimmed);
+                if (angleRad !== null) {
+                    tokens.push({ color, kind: "frac", value: angleRad / (Math.PI * 2) });
+                    emitted = true;
+                    continue;
+                }
+            }
+            if (!angleStops && trimmed.endsWith("px")) {
+                const px = Number.parseFloat(trimmed);
+                if (Number.isFinite(px)) {
+                    tokens.push({ color, kind: "px", value: px });
+                    emitted = true;
+                    continue;
+                }
+            }
+            if (trimmed.endsWith("%")) {
+                const pct = Number.parseFloat(trimmed);
+                if (Number.isFinite(pct)) {
+                    tokens.push({ color, kind: "frac", value: pct / 100 });
+                    emitted = true;
+                }
             }
         }
-        stops.push({ color, posPx, posFrac });
+        if (!emitted) {
+            tokens.push({ color, kind: "none", value: 0 });
+        }
+    }
+    lruSet(parsedGradientStopsCache, cacheKey, tokens, MAX_PARSED_STOPS_CACHE);
+    return tokens;
+}
+
+function resolveGradientStopSeries(
+    count: number,
+    readExplicit: (index: number) => number | null,
+    fallbackEnd: number,
+    clampUnit: boolean,
+): number[] {
+    const resolved = new Array<number>(count);
+    if (count === 0) return resolved;
+
+    const firstExplicit = readExplicit(0);
+    let maxExplicit =
+        firstExplicit !== null && Number.isFinite(firstExplicit)
+            ? clampUnit
+                ? Math.min(1, Math.max(0, firstExplicit))
+                : firstExplicit
+            : 0;
+    resolved[0] = maxExplicit;
+    let anchorIndex = 0;
+
+    for (let index = 1; index < count; index++) {
+        const raw = readExplicit(index);
+        let value: number | null = null;
+        if (raw !== null && Number.isFinite(raw)) {
+            const clamped = clampUnit ? Math.min(1, Math.max(0, raw)) : raw;
+            maxExplicit = Math.max(maxExplicit, clamped);
+            value = maxExplicit;
+        } else if (index === count - 1) {
+            value = Math.max(maxExplicit, fallbackEnd);
+        }
+        if (value === null) continue;
+
+        resolved[index] = value;
+        const gapCount = index - anchorIndex;
+        if (gapCount > 1) {
+            const startVal = resolved[anchorIndex]!;
+            const stepDelta = (value - startVal) / gapCount;
+            for (let step = 1; step < gapCount; step++) {
+                resolved[anchorIndex + step] = startVal + stepDelta * step;
+            }
+        }
+        anchorIndex = index;
+    }
+    return resolved;
+}
+
+function interpolateCssColorAt(colorA: string, colorB: string, t: number): string {
+    const rgbaA = parseCssColorToRgbaReadonly(colorA);
+    const rgbaB = parseCssColorToRgbaReadonly(colorB);
+    if (!rgbaA || !rgbaB) return t < 0.5 ? colorA : colorB;
+    const clampedT = Math.min(1, Math.max(0, t));
+    const r = Math.round((rgbaA[0] + (rgbaB[0] - rgbaA[0]) * clampedT) * 255);
+    const g = Math.round((rgbaA[1] + (rgbaB[1] - rgbaA[1]) * clampedT) * 255);
+    const b = Math.round((rgbaA[2] + (rgbaB[2] - rgbaA[2]) * clampedT) * 255);
+    const a = rgbaA[3] + (rgbaB[3] - rgbaA[3]) * clampedT;
+    return a >= 0.999
+        ? `rgb(${r}, ${g}, ${b})`
+        : `rgba(${r}, ${g}, ${b}, ${Number(a.toFixed(4))})`;
+}
+
+function addResolvedGradientStops(
+    gradient: CanvasGradient,
+    stops: GradientStopSpec[],
+    lineLen: number,
+    isRepeating: boolean,
+): boolean {
+    if (!isRepeating) {
+        const fractions = resolveGradientStopFractions(stops);
+        for (let index = 0; index < stops.length; index++) {
+            const pos = fractions[index]!;
+            try {
+                gradient.addColorStop(Math.min(1, Math.max(0, pos)), stops[index]!.color);
+            } catch {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    const safeLineLen = Math.max(1e-4, lineLen);
+    const resolvedPx = resolveGradientStopSeries(
+        stops.length,
+        (idx) => stops[idx]!.posPx,
+        safeLineLen,
+        false,
+    );
+    const firstPx = resolvedPx[0] ?? 0;
+    const lastPx = resolvedPx[stops.length - 1] ?? safeLineLen;
+    const minPeriod = safeLineLen <= 2 ? 0.02 : 4;
+    const period = Math.max(minPeriod, lastPx - firstPx);
+    const firstCycle = Math.floor(-lastPx / period) + 1;
+    const lastCycle = Math.min(firstCycle + 95, Math.floor((safeLineLen - firstPx) / period));
+
+    let prevPos: number | null = null;
+    let prevColor = "";
+    for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
+        const basePx = cycle * period;
+        for (let index = 0; index < stops.length; index++) {
+            const pos = (resolvedPx[index]! + basePx) / safeLineLen;
+            const color = stops[index]!.color;
+            if (prevPos !== null && prevPos < 0 && pos > 0) {
+                const boundaryT = -prevPos / (pos - prevPos);
+                try {
+                    gradient.addColorStop(0, interpolateCssColorAt(prevColor, color, boundaryT));
+                } catch {
+                    return false;
+                }
+            }
+            if (prevPos !== null && prevPos < 1 && pos > 1) {
+                const boundaryT = (1 - prevPos) / (pos - prevPos);
+                try {
+                    gradient.addColorStop(1, interpolateCssColorAt(prevColor, color, boundaryT));
+                } catch {
+                    return false;
+                }
+            }
+            if (pos >= 0 && pos <= 1) {
+                try {
+                    gradient.addColorStop(pos, color);
+                } catch {
+                    return false;
+                }
+            }
+            prevPos = pos;
+            prevColor = color;
+        }
+    }
+    return true;
+}
+
+function resolveGradientStopFractions(stops: GradientStopSpec[]): number[] {
+    return resolveGradientStopSeries(stops.length, (idx) => stops[idx]!.posFrac, 1, true);
+}
+
+function parseStyleCornerRadiusPx(
+    rawRadius: string | undefined,
+    widthPx: number,
+    heightPx: number,
+): number {
+    if (!rawRadius || rawRadius === "0px" || rawRadius === "0") return 0;
+    const parsed = parseCssCornerRadiusPx(rawRadius, widthPx, heightPx);
+    if (parsed === null || !Number.isFinite(parsed) || parsed <= 0) return 0;
+    return Math.min(Math.min(widthPx, heightPx) * 0.5, parsed);
+}
+
+function parseElementCornerRadii(
+    style: CSSStyleDeclaration,
+    widthPx: number,
+    heightPx: number,
+): CornerRadii {
+    const tl = parseStyleCornerRadiusPx(style.borderTopLeftRadius, widthPx, heightPx);
+    if (!style.borderTopRightRadius && !style.borderBottomRightRadius && !style.borderBottomLeftRadius) {
+        return tl;
+    }
+    const tr = parseStyleCornerRadiusPx(style.borderTopRightRadius, widthPx, heightPx);
+    const br = parseStyleCornerRadiusPx(style.borderBottomRightRadius, widthPx, heightPx);
+    const bl = parseStyleCornerRadiusPx(style.borderBottomLeftRadius, widthPx, heightPx);
+    if (tl === tr && tl === br && tl === bl) {
+        return tl;
+    }
+    const topSum = tl + tr;
+    const bottomSum = bl + br;
+    const leftSum = tl + bl;
+    const rightSum = tr + br;
+    const scale = Math.min(
+        1,
+        topSum > 0 ? widthPx / topSum : 1,
+        bottomSum > 0 ? widthPx / bottomSum : 1,
+        leftSum > 0 ? heightPx / leftSum : 1,
+        rightSum > 0 ? heightPx / rightSum : 1,
+    );
+    return [tl * scale, tr * scale, br * scale, bl * scale];
+}
+
+function offsetCornerRadii(radii: CornerRadii, deltaPx: number): CornerRadii {
+    if (typeof radii === "number") {
+        return Math.max(0, radii + deltaPx);
+    }
+    return [
+        Math.max(0, radii[0] + deltaPx),
+        Math.max(0, radii[1] + deltaPx),
+        Math.max(0, radii[2] + deltaPx),
+        Math.max(0, radii[3] + deltaPx),
+    ];
+}
+
+interface CompiledLinearGradient {
+    readonly isRepeating: boolean;
+    readonly dx: number;
+    readonly dy: number;
+    readonly tokens: readonly ParsedStopToken[];
+    readonly preResolvedFractions: readonly number[] | null;
+}
+
+interface CompiledRadialGradient {
+    readonly isRepeating: boolean;
+    readonly atXToken: string | null;
+    readonly atYToken: string | null;
+    readonly sizeKeyword: "closest-side" | "farthest-side" | "closest-corner" | "farthest-corner";
+    readonly tokens: readonly ParsedStopToken[];
+    readonly preResolvedFractions: readonly number[] | null;
+}
+
+interface CompiledConicGradient {
+    readonly isRepeating: boolean;
+    readonly startAngleRad: number;
+    readonly atXToken: string | null;
+    readonly atYToken: string | null;
+    readonly tokens: readonly ParsedStopToken[];
+    readonly preResolvedFractions: readonly number[] | null;
+}
+
+const MAX_COMPILED_GRADIENTS = 128;
+const compiledLinearGradientCache = new Map<string, CompiledLinearGradient | null>();
+const compiledRadialGradientCache = new Map<string, CompiledRadialGradient | null>();
+const compiledConicGradientCache = new Map<string, CompiledConicGradient | null>();
+
+function preResolveUnitFractions(
+    tokens: readonly ParsedStopToken[],
+    isRepeating: boolean,
+): readonly number[] | null {
+    if (isRepeating) return null;
+    for (let idx = 0; idx < tokens.length; idx++) {
+        if (tokens[idx]!.kind === "px") return null;
+    }
+    return resolveGradientStopSeries(
+        tokens.length,
+        (idx) => {
+            const tok = tokens[idx]!;
+            return tok.kind === "frac" ? tok.value : null;
+        },
+        1,
+        true,
+    );
+}
+
+function buildGradientStopSpecs(
+    tokens: readonly ParsedStopToken[],
+    lineLen: number,
+): GradientStopSpec[] {
+    const stops = new Array<GradientStopSpec>(tokens.length);
+    for (let idx = 0; idx < tokens.length; idx++) {
+        const tok = tokens[idx]!;
+        if (tok.kind === "px") {
+            stops[idx] = {
+                color: tok.color,
+                posPx: tok.value,
+                posFrac: lineLen > 0 ? tok.value / lineLen : 0,
+            };
+        } else if (tok.kind === "frac") {
+            stops[idx] = {
+                color: tok.color,
+                posPx: tok.value * lineLen,
+                posFrac: tok.value,
+            };
+        } else {
+            stops[idx] = { color: tok.color, posPx: null, posFrac: null };
+        }
     }
     return stops;
+}
+
+function applyCompiledGradientStops(
+    gradient: CanvasGradient,
+    tokens: readonly ParsedStopToken[],
+    preResolvedFractions: readonly number[] | null,
+    lineLen: number,
+    isRepeating: boolean,
+): boolean {
+    if (preResolvedFractions) {
+        for (let idx = 0; idx < tokens.length; idx++) {
+            const pos = preResolvedFractions[idx]!;
+            try {
+                gradient.addColorStop(Math.min(1, Math.max(0, pos)), tokens[idx]!.color);
+            } catch {
+                return false;
+            }
+        }
+        return true;
+    }
+    const stops = buildGradientStopSpecs(tokens, lineLen);
+    return addResolvedGradientStops(gradient, stops, lineLen, isRepeating);
+}
+
+function getCompiledLinearGradient(backgroundImage: string): CompiledLinearGradient | null {
+    const cached = lruGet(compiledLinearGradientCache, backgroundImage);
+    if (cached !== undefined) return cached;
+    let compiled: CompiledLinearGradient | null = null;
+    const parsed = extractFunctionInner(backgroundImage, "linear-gradient");
+    if (parsed) {
+        const args = splitTopLevelArgs(parsed.inner);
+        if (args.length >= 2) {
+            const angleVec = parseCssGradientAngle(args[0]!);
+            const dx = angleVec ? angleVec.dx : 0;
+            const dy = angleVec ? angleVec.dy : 1;
+            const stopArgs = angleVec ? args.slice(1) : args;
+            const tokens = getCachedStopTokens(`l:${stopArgs.join("|")}`, stopArgs, false);
+            if (tokens.length >= 2) {
+                compiled = {
+                    isRepeating: parsed.isRepeating,
+                    dx,
+                    dy,
+                    tokens,
+                    preResolvedFractions: preResolveUnitFractions(tokens, parsed.isRepeating),
+                };
+            }
+        }
+    }
+    lruSet(compiledLinearGradientCache, backgroundImage, compiled, MAX_COMPILED_GRADIENTS);
+    return compiled;
+}
+
+function getCompiledRadialGradient(backgroundImage: string): CompiledRadialGradient | null {
+    const cached = lruGet(compiledRadialGradientCache, backgroundImage);
+    if (cached !== undefined) return cached;
+    let compiled: CompiledRadialGradient | null = null;
+    const parsed = extractFunctionInner(backgroundImage, "radial-gradient");
+    if (parsed) {
+        const args = splitTopLevelArgs(parsed.inner);
+        if (args.length >= 2) {
+            const firstIsShape = /\b(circle|ellipse|at|closest|farthest)\b/i.test(args[0]!);
+            const stopArgs = firstIsShape ? args.slice(1) : args;
+            let atXToken: string | null = null;
+            let atYToken: string | null = null;
+            let sizeKeyword: CompiledRadialGradient["sizeKeyword"] = "farthest-corner";
+            if (firstIsShape) {
+                const shapeSpec = args[0]!;
+                const atMatch = shapeSpec.match(
+                    /\bat\s+(-?[\d.]+%|-?[\d.]+px|left|right|center)(?:\s+(-?[\d.]+%|-?[\d.]+px|top|bottom|center))?/i,
+                );
+                if (atMatch) {
+                    atXToken = atMatch[1]!;
+                    atYToken = atMatch[2] ?? "center";
+                }
+                const sizeMatch = shapeSpec.match(
+                    /\b(closest-side|farthest-side|closest-corner|farthest-corner)\b/i,
+                );
+                if (sizeMatch) {
+                    sizeKeyword = sizeMatch[1]!.toLowerCase() as CompiledRadialGradient["sizeKeyword"];
+                }
+            }
+            const tokens = getCachedStopTokens(`l:${stopArgs.join("|")}`, stopArgs, false);
+            if (tokens.length >= 2) {
+                compiled = {
+                    isRepeating: parsed.isRepeating,
+                    atXToken,
+                    atYToken,
+                    sizeKeyword,
+                    tokens,
+                    preResolvedFractions: preResolveUnitFractions(tokens, parsed.isRepeating),
+                };
+            }
+        }
+    }
+    lruSet(compiledRadialGradientCache, backgroundImage, compiled, MAX_COMPILED_GRADIENTS);
+    return compiled;
+}
+
+function getCompiledConicGradient(backgroundImage: string): CompiledConicGradient | null {
+    const cached = lruGet(compiledConicGradientCache, backgroundImage);
+    if (cached !== undefined) return cached;
+    let compiled: CompiledConicGradient | null = null;
+    const parsed = extractFunctionInner(backgroundImage, "conic-gradient");
+    if (parsed) {
+        const args = splitTopLevelArgs(parsed.inner);
+        if (args.length >= 2) {
+            let startAngleRad = -Math.PI * 0.5;
+            let atXToken: string | null = null;
+            let atYToken: string | null = null;
+            let stopArgs = args;
+            const firstArg = args[0]!;
+            if (/^\s*(from\b|at\b)/i.test(firstArg)) {
+                const fromMatch = firstArg.match(/\bfrom\s+(-?[\d.]+(?:deg|rad|grad|turn))/i);
+                if (fromMatch) {
+                    const parsedAngle = parseCssAngleRadians(fromMatch[1]!);
+                    if (parsedAngle !== null) startAngleRad = parsedAngle - Math.PI * 0.5;
+                }
+                const atMatch = firstArg.match(
+                    /\bat\s+(-?[\d.]+%|-?[\d.]+px|left|right|center)(?:\s+(-?[\d.]+%|-?[\d.]+px|top|bottom|center))?/i,
+                );
+                if (atMatch) {
+                    atXToken = atMatch[1]!;
+                    atYToken = atMatch[2] ?? "center";
+                }
+                stopArgs = args.slice(1);
+            }
+            const tokens = getCachedStopTokens(`a:${stopArgs.join("|")}`, stopArgs, true);
+            if (tokens.length >= 2) {
+                compiled = {
+                    isRepeating: parsed.isRepeating,
+                    startAngleRad,
+                    atXToken,
+                    atYToken,
+                    tokens,
+                    preResolvedFractions: preResolveUnitFractions(tokens, parsed.isRepeating),
+                };
+            }
+        }
+    }
+    lruSet(compiledConicGradientCache, backgroundImage, compiled, MAX_COMPILED_GRADIENTS);
+    return compiled;
 }
 
 function drawLinearGradientBox(
@@ -132,55 +651,31 @@ function drawLinearGradientBox(
     y: number,
     width: number,
     height: number,
-    radius: number,
+    radius: CornerRadii,
 ): boolean {
-    const parsed = extractFunctionInner(backgroundImage, "linear-gradient");
-    if (!parsed) return false;
-    const args = splitTopLevelArgs(parsed.inner);
-    if (args.length < 2) return false;
+    const compiled = getCompiledLinearGradient(backgroundImage);
+    if (!compiled) return false;
 
-    const angleVec = parseCssGradientAngle(args[0]);
-    const dir = angleVec ?? { dx: 0, dy: 1 };
-    const stopArgs = angleVec ? args.slice(1) : args;
-    const lineLen = Math.max(1, Math.abs(width * dir.dx) + Math.abs(height * dir.dy));
+    const lineLen = Math.max(1, Math.abs(width * compiled.dx) + Math.abs(height * compiled.dy));
+    const halfLen = lineLen * 0.5;
     const cx = x + width * 0.5;
     const cy = y + height * 0.5;
-    const x0 = cx - dir.dx * lineLen * 0.5;
-    const y0 = cy - dir.dy * lineLen * 0.5;
-    const x1 = cx + dir.dx * lineLen * 0.5;
-    const y1 = cy + dir.dy * lineLen * 0.5;
-
-    const stops = parseGradientStops(stopArgs, lineLen);
-    if (stops.length < 2) return false;
+    const x0 = cx - compiled.dx * halfLen;
+    const y0 = cy - compiled.dy * halfLen;
+    const x1 = cx + compiled.dx * halfLen;
+    const y1 = cy + compiled.dy * halfLen;
 
     const gradient = ctx.createLinearGradient(x0, y0, x1, y1);
-    if (parsed.isRepeating) {
-        const firstPx = stops[0].posPx ?? 0;
-        const lastPx = stops[stops.length - 1].posPx ?? firstPx + 1;
-        const period = Math.max(4, lastPx - firstPx);
-        const cycles = Math.min(96, Math.ceil((lineLen + period) / period) + 1);
-        for (let cycle = -1; cycle < cycles; cycle++) {
-            const basePx = cycle * period - firstPx;
-            for (const stop of stops) {
-                const pos = ((stop.posPx ?? 0) + basePx) / lineLen;
-                if (pos < 0 || pos > 1) continue;
-                try {
-                    gradient.addColorStop(pos, stop.color);
-                } catch {
-                    return false;
-                }
-            }
-        }
-    } else {
-        const denominator = Math.max(1, stops.length - 1);
-        for (let index = 0; index < stops.length; index++) {
-            const pos = stops[index].posFrac ?? index / denominator;
-            try {
-                gradient.addColorStop(Math.min(1, Math.max(0, pos)), stops[index].color);
-            } catch {
-                return false;
-            }
-        }
+    if (
+        !applyCompiledGradientStops(
+            gradient,
+            compiled.tokens,
+            compiled.preResolvedFractions,
+            lineLen,
+            compiled.isRepeating,
+        )
+    ) {
+        return false;
     }
 
     ctx.fillStyle = gradient;
@@ -195,56 +690,300 @@ function drawRadialGradientBox(
     y: number,
     width: number,
     height: number,
-    radius: number,
+    radius: CornerRadii,
 ): boolean {
-    const parsed = extractFunctionInner(backgroundImage, "radial-gradient");
-    if (!parsed) return false;
-    const args = splitTopLevelArgs(parsed.inner);
-    if (args.length < 2) return false;
-    const firstIsShape = /\b(circle|ellipse|at|closest|farthest)\b/i.test(args[0]);
-    const stopArgs = firstIsShape ? args.slice(1) : args;
-    const rad = Math.max(width, height) * 0.6;
-    const stops = parseGradientStops(stopArgs, rad);
-    if (stops.length < 2) return false;
+    const compiled = getCompiledRadialGradient(backgroundImage);
+    if (!compiled) return false;
 
-    const cx = x + width * 0.5;
-    const cy = y + height * 0.5;
+    const cx = compiled.atXToken
+        ? x + width * parseObjectPositionFraction(compiled.atXToken, width, 0)
+        : x + width * 0.5;
+    const cy = compiled.atYToken
+        ? y + height * parseObjectPositionFraction(compiled.atYToken, height, 0)
+        : y + height * 0.5;
+
+    const dxLeft = Math.abs(cx - x);
+    const dxRight = Math.abs(x + width - cx);
+    const dyTop = Math.abs(cy - y);
+    const dyBottom = Math.abs(y + height - cy);
+    let rad: number;
+    if (compiled.sizeKeyword === "closest-side") {
+        rad = Math.min(dxLeft, dxRight, dyTop, dyBottom);
+    } else if (compiled.sizeKeyword === "farthest-side") {
+        rad = Math.max(dxLeft, dxRight, dyTop, dyBottom);
+    } else if (compiled.sizeKeyword === "closest-corner") {
+        const minDx = dxLeft < dxRight ? dxLeft : dxRight;
+        const minDy = dyTop < dyBottom ? dyTop : dyBottom;
+        rad = Math.sqrt(minDx * minDx + minDy * minDy);
+    } else {
+        const maxDx = dxLeft > dxRight ? dxLeft : dxRight;
+        const maxDy = dyTop > dyBottom ? dyTop : dyBottom;
+        rad = Math.sqrt(maxDx * maxDx + maxDy * maxDy);
+    }
+    rad = Math.max(1, rad);
+
     const gradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, rad);
-    const denominator = Math.max(1, stops.length - 1);
-    for (let index = 0; index < stops.length; index++) {
-        const pos = stops[index].posFrac ?? index / denominator;
-        try {
-            gradient.addColorStop(Math.min(1, Math.max(0, pos)), stops[index].color);
-        } catch {
-            return false;
-        }
+    if (
+        !applyCompiledGradientStops(
+            gradient,
+            compiled.tokens,
+            compiled.preResolvedFractions,
+            rad,
+            compiled.isRepeating,
+        )
+    ) {
+        return false;
     }
     ctx.fillStyle = gradient;
     fillRoundedOrRect(ctx, x, y, width, height, radius);
     return true;
 }
 
-const gradientColorsCache = new Map<string, string[]>();
-function parseLinearGradientColors(backgroundImage: string): string[] {
-    const cached = gradientColorsCache.get(backgroundImage);
-    if (cached !== undefined) return cached;
-    const startIdx = backgroundImage.indexOf("linear-gradient(");
-    if (startIdx < 0) {
-        if (gradientColorsCache.size > 200) gradientColorsCache.clear();
-        gradientColorsCache.set(backgroundImage, []);
-        return [];
+function drawConicGradientBox(
+    ctx: CanvasRenderingContext2D,
+    backgroundImage: string,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    radius: CornerRadii,
+): boolean {
+    if (
+        typeof (ctx as CanvasRenderingContext2D & { createConicGradient?: unknown })
+            .createConicGradient !== "function"
+    ) {
+        return false;
     }
-    const inner = backgroundImage.slice(startIdx + 16);
-    const tokens = inner.match(COLOR_TOKEN_PATTERN) ?? [];
-    const result = tokens.filter(
-        (token) =>
-            !["to", "top", "bottom", "left", "right", "deg", "rad", "turn", "from", "at"].includes(
-                token.toLowerCase(),
-            ),
-    );
-    if (gradientColorsCache.size > 200) gradientColorsCache.clear();
-    gradientColorsCache.set(backgroundImage, result);
-    return result;
+    const compiled = getCompiledConicGradient(backgroundImage);
+    if (!compiled) return false;
+
+    const cx = compiled.atXToken
+        ? x + width * parseObjectPositionFraction(compiled.atXToken, width, 0)
+        : x + width * 0.5;
+    const cy = compiled.atYToken
+        ? y + height * parseObjectPositionFraction(compiled.atYToken, height, 0)
+        : y + height * 0.5;
+
+    const gradient = ctx.createConicGradient(compiled.startAngleRad, cx, cy);
+    if (
+        !applyCompiledGradientStops(
+            gradient,
+            compiled.tokens,
+            compiled.preResolvedFractions,
+            1,
+            compiled.isRepeating,
+        )
+    ) {
+        return false;
+    }
+    ctx.fillStyle = gradient;
+    fillRoundedOrRect(ctx, x, y, width, height, radius);
+    return true;
+}
+
+interface BackgroundUrlCacheEntry {
+    image: HTMLImageElement | null;
+    status: "loading" | "ready" | "error";
+    listeners: Set<() => void>;
+}
+
+const MAX_BG_URL_CACHE_ENTRIES = 64;
+const backgroundUrlCache = new Map<string, BackgroundUrlCacheEntry>();
+
+function extractCssUrl(layer: string): string | null {
+    const match = layer.match(/url\(\s*(?:"([^"]+)"|'([^']+)'|([^)\s]+))\s*\)/i);
+    if (!match) return null;
+    const raw = (match[1] ?? match[2] ?? match[3] ?? "").trim();
+    return raw.length > 0 ? raw : null;
+}
+
+function pickCssLayerValue(raw: string | undefined, layerIndex: number, fallback: string): string {
+    if (!raw) return fallback;
+    const trimmed = raw.trim();
+    if (!trimmed) return fallback;
+    if (!trimmed.includes(",")) return trimmed;
+    const parts = splitTopLevelArgs(trimmed);
+    if (parts.length === 0) return fallback;
+    return parts[layerIndex % parts.length] || fallback;
+}
+
+function drawBackgroundUrlLayer(
+    ctx: CanvasRenderingContext2D,
+    layer: string,
+    style: CSSStyleDeclaration | null,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    radius: CornerRadii,
+    onAsyncAssetReady?: () => void,
+    layerIndex = 0,
+): boolean {
+    if (typeof Image === "undefined" || typeof ctx.drawImage !== "function") return false;
+    const imageUrl = extractCssUrl(layer);
+    if (!imageUrl) return false;
+
+    let entry = backgroundUrlCache.get(imageUrl);
+    if (!entry) {
+        if (backgroundUrlCache.size >= MAX_BG_URL_CACHE_ENTRIES) {
+            const oldestKey = backgroundUrlCache.keys().next().value;
+            if (oldestKey !== undefined) {
+                backgroundUrlCache.delete(oldestKey);
+            }
+        }
+        const createdEntry: BackgroundUrlCacheEntry = {
+            image: null,
+            status: "loading",
+            listeners: new Set(),
+        };
+        entry = createdEntry;
+        if (onAsyncAssetReady) createdEntry.listeners.add(onAsyncAssetReady);
+        backgroundUrlCache.set(imageUrl, createdEntry);
+
+        const img = new Image();
+        if (
+            typeof window !== "undefined" &&
+            window.location &&
+            /^https?:/i.test(imageUrl) &&
+            !imageUrl.startsWith(window.location.origin)
+        ) {
+            img.crossOrigin = "anonymous";
+        }
+        const finalize = (success: boolean) => {
+            if (backgroundUrlCache.get(imageUrl) !== createdEntry) return;
+            if (success && img.naturalWidth > 0 && img.naturalHeight > 0) {
+                createdEntry.image = img;
+                createdEntry.status = "ready";
+            } else {
+                createdEntry.status = "error";
+            }
+            const callbacks = Array.from(createdEntry.listeners);
+            createdEntry.listeners.clear();
+            if (createdEntry.status === "ready") {
+                for (let idx = 0; idx < callbacks.length; idx++) {
+                    callbacks[idx]!();
+                }
+            }
+        };
+        img.onload = () => finalize(true);
+        img.onerror = () => finalize(false);
+        img.src = imageUrl;
+        if (img.complete && img.naturalWidth > 0 && img.naturalHeight > 0) {
+            createdEntry.image = img;
+            createdEntry.status = "ready";
+            createdEntry.listeners.clear();
+        }
+    } else if (entry.status === "loading" && onAsyncAssetReady) {
+        entry.listeners.add(onAsyncAssetReady);
+    }
+
+    if (entry.status !== "ready" || !entry.image) {
+        return false;
+    }
+
+    const img = entry.image;
+    const natW = img.naturalWidth;
+    const natH = img.naturalHeight;
+    if (natW <= 0 || natH <= 0 || width <= 0 || height <= 0) return false;
+
+    const bgSizeRaw = pickCssLayerValue(style?.backgroundSize, layerIndex, "auto").toLowerCase();
+    const bgPosParts = pickCssLayerValue(style?.backgroundPosition, layerIndex, "0% 0%").split(/\s+/);
+    const natAspect = natW / natH;
+    const boxAspect = width / height;
+
+    let drawW = width;
+    let drawH = height;
+    if (bgSizeRaw === "cover") {
+        if (natAspect > boxAspect) {
+            drawH = height;
+            drawW = height * natAspect;
+        } else {
+            drawW = width;
+            drawH = width / natAspect;
+        }
+    } else if (bgSizeRaw === "contain") {
+        if (natAspect > boxAspect) {
+            drawW = width;
+            drawH = width / natAspect;
+        } else {
+            drawH = height;
+            drawW = height * natAspect;
+        }
+    } else if (bgSizeRaw && bgSizeRaw !== "auto") {
+        const sizeParts = bgSizeRaw.split(/\s+/);
+        const parseDim = (tok: string | undefined, ref: number): number | null => {
+            if (!tok || tok === "auto") return null;
+            const n = Number.parseFloat(tok);
+            if (!Number.isFinite(n) || n <= 0) return null;
+            return tok.endsWith("%") ? (n / 100) * ref : n;
+        };
+        const parsedW = parseDim(sizeParts[0], width);
+        const parsedH = parseDim(sizeParts[1], height);
+        if (parsedW !== null && parsedH !== null) {
+            drawW = parsedW;
+            drawH = parsedH;
+        } else if (parsedW !== null) {
+            drawW = parsedW;
+            drawH = parsedW / natAspect;
+        } else if (parsedH !== null) {
+            drawH = parsedH;
+            drawW = parsedH * natAspect;
+        }
+    }
+
+    const posFracX = parseObjectPositionFraction(bgPosParts[0] ?? "50%", width, drawW);
+    const posFracY = parseObjectPositionFraction(bgPosParts[1] ?? bgPosParts[0] ?? "50%", height, drawH);
+    const drawX = x + (width - drawW) * posFracX;
+    const drawY = y + (height - drawH) * posFracY;
+
+    if (typeof ctx.save === "function" && typeof ctx.restore === "function" && typeof ctx.clip === "function") {
+        ctx.save();
+        if (!traceRoundedOrRectPath(ctx, x, y, width, height, radius)) {
+            if (typeof ctx.beginPath === "function" && typeof ctx.rect === "function") {
+                ctx.beginPath();
+                ctx.rect(x, y, width, height);
+            }
+        }
+        ctx.clip();
+        try {
+            ctx.drawImage(img, drawX, drawY, drawW, drawH);
+        } catch {
+        }
+        ctx.restore();
+    } else {
+        try {
+            ctx.drawImage(img, drawX, drawY, drawW, drawH);
+        } catch {
+        }
+    }
+    return true;
+}
+
+function drawBackgroundImageLayers(
+    ctx: CanvasRenderingContext2D,
+    backgroundImage: string,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    radius: CornerRadii,
+    style: CSSStyleDeclaration | null = null,
+    onAsyncAssetReady?: () => void,
+): void {
+    const layers = getCachedBackgroundLayers(backgroundImage);
+    for (let index = layers.length - 1; index >= 0; index--) {
+        const layer = layers[index]!.trim();
+        if (!layer || layer === "none") continue;
+        if (layer.includes("linear-gradient(")) {
+            drawLinearGradientBox(ctx, layer, x, y, width, height, radius);
+        } else if (layer.includes("radial-gradient(")) {
+            drawRadialGradientBox(ctx, layer, x, y, width, height, radius);
+        } else if (layer.includes("conic-gradient(")) {
+            drawConicGradientBox(ctx, layer, x, y, width, height, radius);
+        } else if (layer.includes("url(")) {
+            drawBackgroundUrlLayer(ctx, layer, style, x, y, width, height, radius, onAsyncAssetReady, index);
+        }
+    }
 }
 
 function resolveTextFill(
@@ -256,24 +995,37 @@ function resolveTextFill(
     const clip =
         style.backgroundClip ||
         (style as CSSStyleDeclaration & { webkitBackgroundClip?: string }).webkitBackgroundClip;
-    if (clip === "text" && style.backgroundImage.includes("gradient")) {
-        const colors = parseLinearGradientColors(style.backgroundImage);
-        if (colors.length >= 2) {
+    if (clip === "text" && style.backgroundImage.includes("linear-gradient(")) {
+        const compiled = getCompiledLinearGradient(style.backgroundImage);
+        if (compiled) {
             const left = rect.left - sourceRect.left;
             const top = rect.top - sourceRect.top;
-            const gradient = ctx.createLinearGradient(left, top, left + rect.width, top + rect.height);
-            const denominator = Math.max(1, colors.length - 1);
-            for (let index = 0; index < colors.length; index++) {
-                try {
-                    gradient.addColorStop(index / denominator, colors[index]);
-                } catch {
-                    return style.color;
-                }
+            const width = rect.width;
+            const height = rect.height;
+            const lineLen = Math.max(1, Math.abs(width * compiled.dx) + Math.abs(height * compiled.dy));
+            const halfLen = lineLen * 0.5;
+            const cx = left + width * 0.5;
+            const cy = top + height * 0.5;
+            const gradient = ctx.createLinearGradient(
+                cx - compiled.dx * halfLen,
+                cy - compiled.dy * halfLen,
+                cx + compiled.dx * halfLen,
+                cy + compiled.dy * halfLen,
+            );
+            if (
+                applyCompiledGradientStops(
+                    gradient,
+                    compiled.tokens,
+                    compiled.preResolvedFractions,
+                    lineLen,
+                    compiled.isRepeating,
+                )
+            ) {
+                return gradient;
             }
-            return gradient;
         }
     }
-    return style.color;
+    return toCanvasCssColor(style.color);
 }
 
 function traceRoundedOrRectPath(
@@ -282,20 +1034,29 @@ function traceRoundedOrRectPath(
     topPx: number,
     widthPx: number,
     heightPx: number,
-    radiusPx: number,
+    radiusPx: CornerRadii,
 ): boolean {
-    if (radiusPx > 0.5 && typeof ctx.roundRect === "function") {
+    if (typeof ctx.roundRect !== "function") {
+        return false;
+    }
+    const maxRadius = Math.min(widthPx, heightPx) * 0.5;
+    if (typeof radiusPx === "number") {
+        if (radiusPx <= 0.5) return false;
         ctx.beginPath();
-        ctx.roundRect(
-            leftPx,
-            topPx,
-            widthPx,
-            heightPx,
-            Math.min(radiusPx, Math.min(widthPx, heightPx) * 0.5),
-        );
+        ctx.roundRect(leftPx, topPx, widthPx, heightPx, Math.min(radiusPx, maxRadius));
         return true;
     }
-    return false;
+    if (Math.max(radiusPx[0], radiusPx[1], radiusPx[2], radiusPx[3]) <= 0.5) {
+        return false;
+    }
+    ctx.beginPath();
+    ctx.roundRect(leftPx, topPx, widthPx, heightPx, [
+        Math.min(radiusPx[0], maxRadius),
+        Math.min(radiusPx[1], maxRadius),
+        Math.min(radiusPx[2], maxRadius),
+        Math.min(radiusPx[3], maxRadius),
+    ]);
+    return true;
 }
 
 function fillRoundedOrRect(
@@ -304,7 +1065,7 @@ function fillRoundedOrRect(
     y: number,
     width: number,
     height: number,
-    radius: number,
+    radius: CornerRadii,
 ): void {
     if (traceRoundedOrRectPath(ctx, x, y, width, height, radius)) {
         ctx.fill();
@@ -322,11 +1083,12 @@ interface ParsedBoxShadow {
     color: string;
 }
 
+const MAX_BOX_SHADOW_CACHE = 200;
 const boxShadowCache = new Map<string, ParsedBoxShadow[]>();
 
 function parseCssBoxShadows(boxShadowStr: string): ParsedBoxShadow[] {
     if (!boxShadowStr || boxShadowStr === "none") return [];
-    const cached = boxShadowCache.get(boxShadowStr);
+    const cached = lruGet(boxShadowCache, boxShadowStr);
     if (cached) return cached;
 
     const layers = splitTopLevelArgs(boxShadowStr);
@@ -340,7 +1102,10 @@ function parseCssBoxShadows(boxShadowStr: string): ParsedBoxShadow[] {
         const lengths: number[] = [];
         let color = "rgba(0, 0, 0, 0.25)";
 
-        const tokens = layer.match(/(?:rgba?|hsla?|oklch|oklab|lab|lch|color)\([^)]+\)|#[0-9a-fA-F]+|\S+/g) ?? [];
+        const tokens =
+            layer.match(
+                /color-mix\((?:[^()]+|\([^()]*\))+\)|(?:rgba?|hsla?|hwb|oklch|oklab|lab|lch|color)\([^)]+\)|#[0-9a-fA-F]+|\S+/g,
+            ) ?? [];
         for (let tokenIndex = 0; tokenIndex < tokens.length; tokenIndex++) {
             const token = tokens[tokenIndex];
             if (token.toLowerCase() === "inset") {
@@ -349,7 +1114,7 @@ function parseCssBoxShadows(boxShadowStr: string): ParsedBoxShadow[] {
                 const value = Number.parseFloat(token);
                 if (Number.isFinite(value)) lengths.push(value);
             } else {
-                color = token;
+                color = toCanvasCssColor(token);
             }
         }
 
@@ -365,8 +1130,7 @@ function parseCssBoxShadows(boxShadowStr: string): ParsedBoxShadow[] {
         }
     }
 
-    if (boxShadowCache.size > 200) boxShadowCache.clear();
-    boxShadowCache.set(boxShadowStr, parsed);
+    lruSet(boxShadowCache, boxShadowStr, parsed, MAX_BOX_SHADOW_CACHE);
     return parsed;
 }
 
@@ -377,7 +1141,7 @@ function drawBoxShadows(
     topPx: number,
     widthPx: number,
     heightPx: number,
-    radiusPx: number,
+    radiusPx: CornerRadii,
     insetPass: boolean,
 ): void {
     if (typeof ctx.save !== "function" || typeof ctx.restore !== "function") return;
@@ -393,7 +1157,7 @@ function drawBoxShadows(
                 ctx.restore();
                 continue;
             }
-            const spreadRadius = Math.max(0, radiusPx + shadow.spread);
+            const spreadRadius = offsetCornerRadii(radiusPx, shadow.spread);
             const farOffset = Math.max(widthPx, heightPx, 4096) + 1024;
             ctx.shadowColor = shadow.color;
             ctx.shadowBlur = shadow.blur;
@@ -421,12 +1185,24 @@ function drawBoxShadows(
             const innerTop = topPx + shadow.spread;
             const innerW = Math.max(0, widthPx - shadow.spread * 2);
             const innerH = Math.max(0, heightPx - shadow.spread * 2);
-            const innerRadius = Math.max(0, radiusPx - shadow.spread);
+            const innerRadius = offsetCornerRadii(radiusPx, -shadow.spread);
             ctx.beginPath();
             ctx.rect(leftPx - pad, topPx - pad, widthPx + pad * 2, heightPx + pad * 2);
             if (innerW > 0 && innerH > 0) {
-                if (innerRadius > 0.5 && typeof ctx.roundRect === "function") {
-                    ctx.roundRect(innerLeft, innerTop, innerW, innerH, Math.min(innerRadius, Math.min(innerW, innerH) * 0.5));
+                const maxInnerR = Math.min(innerW, innerH) * 0.5;
+                if (typeof innerRadius === "number") {
+                    if (innerRadius > 0.5 && typeof ctx.roundRect === "function") {
+                        ctx.roundRect(innerLeft, innerTop, innerW, innerH, Math.min(innerRadius, maxInnerR));
+                    } else {
+                        ctx.rect(innerLeft, innerTop, innerW, innerH);
+                    }
+                } else if (Math.max(...innerRadius) > 0.5 && typeof ctx.roundRect === "function") {
+                    ctx.roundRect(innerLeft, innerTop, innerW, innerH, [
+                        Math.min(innerRadius[0], maxInnerR),
+                        Math.min(innerRadius[1], maxInnerR),
+                        Math.min(innerRadius[2], maxInnerR),
+                        Math.min(innerRadius[3], maxInnerR),
+                    ]);
                 } else {
                     ctx.rect(innerLeft, innerTop, innerW, innerH);
                 }
@@ -449,7 +1225,7 @@ function drawElementBorder(
     topPx: number,
     widthPx: number,
     heightPx: number,
-    radiusPx: number,
+    radiusPx: CornerRadii,
 ): void {
     if (typeof ctx.stroke !== "function") return;
     const hasBorderStyle = (value: string) => Boolean(value && value !== "none" && value !== "hidden");
@@ -478,9 +1254,9 @@ function drawElementBorder(
         const strokeW = Math.max(0, widthPx - topW);
         const strokeH = Math.max(0, heightPx - topW);
         if (strokeW <= 0 || strokeH <= 0) return;
-        ctx.strokeStyle = topColor;
+        ctx.strokeStyle = toCanvasCssColor(topColor);
         ctx.lineWidth = topW;
-        if (traceRoundedOrRectPath(ctx, leftPx + inset, topPx + inset, strokeW, strokeH, Math.max(0, radiusPx - inset))) {
+        if (traceRoundedOrRectPath(ctx, leftPx + inset, topPx + inset, strokeW, strokeH, offsetCornerRadii(radiusPx, -inset))) {
             ctx.stroke();
         } else if (typeof ctx.strokeRect === "function") {
             ctx.strokeRect(leftPx + inset, topPx + inset, strokeW, strokeH);
@@ -498,7 +1274,7 @@ function drawElementBorder(
     const drawSide = (edgeW: number, color: string, x1: number, y1: number, x2: number, y2: number) => {
         if (edgeW <= 0 || !color || color === "transparent" || color === "rgba(0, 0, 0, 0)") return;
         ctx.beginPath();
-        ctx.strokeStyle = color;
+        ctx.strokeStyle = toCanvasCssColor(color);
         ctx.lineWidth = edgeW;
         ctx.moveTo(x1, y1);
         ctx.lineTo(x2, y2);
@@ -526,18 +1302,18 @@ function parseObjectPositionFraction(token: string, axisSize: number, contentSiz
     return 0.5;
 }
 
-function drawImageElementFitted(
+function drawMediaElementFitted(
     ctx: CanvasRenderingContext2D,
-    image: HTMLImageElement,
+    media: HTMLImageElement | HTMLVideoElement,
+    natW: number,
+    natH: number,
     style: CSSStyleDeclaration,
     drawW: number,
     drawH: number,
 ): void {
-    const natW = image.naturalWidth;
-    const natH = image.naturalHeight;
     const fit = (style.objectFit || "fill").toLowerCase();
     if (fit === "fill" || natW <= 0 || natH <= 0 || drawW <= 0 || drawH <= 0) {
-        ctx.drawImage(image, -drawW * 0.5, -drawH * 0.5, drawW, drawH);
+        ctx.drawImage(media, -drawW * 0.5, -drawH * 0.5, drawW, drawH);
         return;
     }
 
@@ -581,16 +1357,19 @@ function drawImageElementFitted(
         ctx.rect(-drawW * 0.5, -drawH * 0.5, drawW, drawH);
         ctx.clip();
     }
-    ctx.drawImage(image, -drawW * 0.5 + offsetLeft, -drawH * 0.5 + offsetTop, renderedW, renderedH);
+    ctx.drawImage(media, -drawW * 0.5 + offsetLeft, -drawH * 0.5 + offsetTop, renderedW, renderedH);
 }
 
 interface SvgRasterEntry {
     hash: string;
+    rawKey: string | null;
     image: HTMLImageElement | null;
     status: "loading" | "ready" | "error";
+    listeners: Set<() => void>;
 }
 
 const svgRasterCache = new WeakMap<SVGSVGElement, SvgRasterEntry>();
+let sharedXmlSerializer: XMLSerializer | null = null;
 
 function drawInlineSvgElement(
     ctx: CanvasRenderingContext2D,
@@ -610,6 +1389,19 @@ function drawInlineSvgElement(
     ) {
         return;
     }
+
+    const existing = svgRasterCache.get(svgEl);
+    const rawHtml = typeof svgEl.outerHTML === "string" ? svgEl.outerHTML : null;
+    const rawKey = rawHtml !== null ? `${widthPx}x${heightPx}|${style.color || ""}|${rawHtml}` : null;
+    if (existing && rawKey !== null && existing.rawKey === rawKey) {
+        if (existing.status === "ready" && existing.image) {
+            ctx.drawImage(existing.image, leftPx, topPx, widthPx, heightPx);
+        } else if (existing.status === "loading" && onAsyncReady) {
+            existing.listeners.add(onAsyncReady);
+        }
+        return;
+    }
+
     let serialized: string;
     try {
         const clone = svgEl.cloneNode(true) as SVGSVGElement;
@@ -621,24 +1413,31 @@ function drawInlineSvgElement(
         if (style.color && !clone.style.color) {
             clone.style.color = style.color;
         }
-        serialized = new XMLSerializer().serializeToString(clone);
+        sharedXmlSerializer ??= new XMLSerializer();
+        serialized = sharedXmlSerializer.serializeToString(clone);
     } catch {
         return;
     }
 
     const hash = `${widthPx}x${heightPx}|${serialized}`;
-    const existing = svgRasterCache.get(svgEl);
     if (existing && existing.hash === hash) {
+        existing.rawKey = rawKey;
         if (existing.status === "ready" && existing.image) {
             ctx.drawImage(existing.image, leftPx, topPx, widthPx, heightPx);
+        } else if (existing.status === "loading" && onAsyncReady) {
+            existing.listeners.add(onAsyncReady);
         }
         return;
     }
 
+    const listeners = new Set<() => void>();
+    if (onAsyncReady) listeners.add(onAsyncReady);
     const entry: SvgRasterEntry = {
         hash,
+        rawKey,
         image: null,
         status: "loading",
+        listeners,
     };
     svgRasterCache.set(svgEl, entry);
 
@@ -653,10 +1452,14 @@ function drawInlineSvgElement(
             }
         }
         if (svgRasterCache.get(svgEl) !== entry) return;
+        const pendingListeners = Array.from(entry.listeners);
+        entry.listeners.clear();
         if (success) {
             entry.image = img;
             entry.status = "ready";
-            onAsyncReady?.();
+            for (let idx = 0; idx < pendingListeners.length; idx++) {
+                pendingListeners[idx]!();
+            }
         } else {
             entry.status = "error";
         }
@@ -666,22 +1469,24 @@ function drawInlineSvgElement(
     img.src = blobUrl;
 }
 
-function intersectsSourceBounds(
+function intersectsClipBounds(
     left: number,
     top: number,
     width: number,
     height: number,
-    sourceWidth: number,
-    sourceHeight: number,
+    clipMinX: number,
+    clipMinY: number,
+    clipMaxX: number,
+    clipMaxY: number,
     marginPx = 0,
 ): boolean {
     return (
         width > 0 &&
         height > 0 &&
-        left + width + marginPx > 0 &&
-        left - marginPx < sourceWidth &&
-        top + height + marginPx > 0 &&
-        top - marginPx < sourceHeight
+        left + width + marginPx > clipMinX &&
+        left - marginPx < clipMaxX &&
+        top + height + marginPx > clipMinY &&
+        top - marginPx < clipMaxY
     );
 }
 
@@ -705,10 +1510,9 @@ function extractWordOffsets(normalizedText: string): { starts: number[]; ends: n
 const MAX_CAPTURE_DIM = 3072;
 const MAX_CAPTURE_AREA = 8_388_608;
 const ROUNDED_MIN_CAPTURE_SCALE = 2;
-const ROUNDED_MAX_CAPTURE_SCALE = 2.5;
-const UNROUNDED_MAX_CAPTURE_DIM = 448;
-const UNROUNDED_CAPTURE_SCALE = 0.2;
-const ROUNDED_RADIUS_THRESHOLD = 2;
+const ROUNDED_MAX_CAPTURE_SCALE = 3;
+const UNROUNDED_MAX_CAPTURE_DIM = 320;
+const UNROUNDED_CAPTURE_SCALE = 0.125;
 
 export interface SceneCaptureQualityOptions {
     pixelRatio?: number;
@@ -729,7 +1533,7 @@ export function resolveCaptureDimensions(
         !hasExplicitPixelRatio &&
         typeof radius === "number" &&
         Number.isFinite(radius) &&
-        radius <= ROUNDED_RADIUS_THRESHOLD;
+        radius <= 0;
 
     if (isUnrounded) {
         const desiredW = Math.max(64, Math.round(sourceWidth * UNROUNDED_CAPTURE_SCALE));
@@ -742,20 +1546,14 @@ export function resolveCaptureDimensions(
         };
     }
 
-    const deviceDpr =
-        typeof window !== "undefined" &&
-        typeof window.devicePixelRatio === "number" &&
-        Number.isFinite(window.devicePixelRatio) &&
-        window.devicePixelRatio > 0
-            ? window.devicePixelRatio
-            : 1;
     const dprScale = hasExplicitPixelRatio
         ? Math.min(4, Math.max(0.5, requestedPixelRatio!))
-        : Math.min(ROUNDED_MAX_CAPTURE_SCALE, Math.max(ROUNDED_MIN_CAPTURE_SCALE, deviceDpr));
-    const maxDim = hasExplicitPixelRatio ? 4096 : MAX_CAPTURE_DIM;
+        : automaticRoundedPixelRatio(ROUNDED_MIN_CAPTURE_SCALE, ROUNDED_MAX_CAPTURE_SCALE);
+    const smallMemory = useSmallMemoryBudget();
+    const maxDim = smallMemory ? SMALL_SCENE_DIMENSION : hasExplicitPixelRatio ? 4096 : MAX_CAPTURE_DIM;
     const maxArea = hasExplicitPixelRatio ? 16_000_000 : MAX_CAPTURE_AREA;
-    const desiredW = Math.max(256, Math.round(sourceWidth * dprScale));
-    const desiredH = Math.max(256, Math.round(sourceHeight * dprScale));
+    const desiredW = Math.max(2, Math.round(sourceWidth * dprScale));
+    const desiredH = Math.max(2, Math.round(sourceHeight * dprScale));
     const dimScale = maxDim / Math.max(desiredW, desiredH);
     const areaScale = Math.sqrt(maxArea / Math.max(1, desiredW * desiredH));
     const fitScale = Math.min(1, dimScale, areaScale);
@@ -766,18 +1564,26 @@ export function resolveCaptureDimensions(
 }
 
 function isOpaqueBackground(color: string | undefined): boolean {
-    if (!color) return false;
+    if (!color || color === "rgba(0, 0, 0, 0)" || color === "transparent") return false;
     const trimmed = color.trim().toLowerCase();
     if (!trimmed || trimmed === "transparent") return false;
+    const parsed = parseCssColorToRgbaReadonly(trimmed);
+    if (parsed) {
+        return parsed[3] >= 0.99;
+    }
     const rgbaMatch = trimmed.match(
         /^rgba\(\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*,\s*([\d.]+)\s*\)$/,
     );
-    if (rgbaMatch && Number.parseFloat(rgbaMatch[1]) <= 0.001) return false;
+    if (rgbaMatch && Number.parseFloat(rgbaMatch[1]) < 0.99) return false;
     return true;
 }
 
 function getCssColorLuminance(color: string | undefined): number | null {
     if (!color) return null;
+    const parsed = parseCssColorToRgbaReadonly(color);
+    if (parsed) {
+        return 0.299 * parsed[0] + 0.587 * parsed[1] + 0.114 * parsed[2];
+    }
     const match = color.trim().match(/^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)/i);
     if (!match) return null;
     const red = Number.parseFloat(match[1]) / 255;
@@ -842,8 +1648,7 @@ export function captureDomToCanvas(
         pixelRatio,
         radius,
     );
-    if (canvas.width !== texWidth) canvas.width = texWidth;
-    if (canvas.height !== texHeight) canvas.height = texHeight;
+    resizeCanvas(canvas, texWidth, texHeight);
 
     const ctx = canvas.getContext("2d");
     if (!ctx) return false;
@@ -851,7 +1656,7 @@ export function captureDomToCanvas(
     ctx.imageSmoothingQuality = "high";
 
     const rootStyle = window.getComputedStyle(source);
-    const backdropLayers: Array<{ bgColor: string; bgImage: string }> = [];
+    const backdropLayers: Array<{ bgColor: string; bgImage: string; style: CSSStyleDeclaration }> = [];
     let cursor: HTMLElement | null = source;
     let foundOpaque = false;
     while (cursor) {
@@ -866,6 +1671,7 @@ export function captureDomToCanvas(
             backdropLayers.push({
                 bgColor: hasBgColor ? bgColor : "",
                 bgImage: hasBgImage ? bgImage : "",
+                style,
             });
         }
         if (isOpaqueBackground(bgColor)) {
@@ -875,21 +1681,33 @@ export function captureDomToCanvas(
         cursor = cursor.parentElement;
     }
 
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    const scaleX = texWidth / sourceRect.width;
+    const scaleY = texHeight / sourceRect.height;
+
+    ctx.setTransform(scaleX, 0, 0, scaleY, 0, 0);
     ctx.globalAlpha = 1;
     if (!foundOpaque) {
         ctx.fillStyle = isDarkColorScheme(source, rootStyle) ? "#0b0f19" : "#f3f2f6";
-        ctx.fillRect(0, 0, texWidth, texHeight);
+        ctx.fillRect(0, 0, sourceRect.width, sourceRect.height);
     }
     for (let index = backdropLayers.length - 1; index >= 0; index--) {
         const layer = backdropLayers[index];
         if (layer.bgColor) {
-            ctx.fillStyle = layer.bgColor;
-            ctx.fillRect(0, 0, texWidth, texHeight);
+            ctx.fillStyle = toCanvasCssColor(layer.bgColor);
+            ctx.fillRect(0, 0, sourceRect.width, sourceRect.height);
         }
         if (layer.bgImage) {
-            drawRadialGradientBox(ctx, layer.bgImage, 0, 0, texWidth, texHeight, 0);
-            drawLinearGradientBox(ctx, layer.bgImage, 0, 0, texWidth, texHeight, 0);
+            drawBackgroundImageLayers(
+                ctx,
+                layer.bgImage,
+                0,
+                0,
+                sourceRect.width,
+                sourceRect.height,
+                0,
+                layer.style,
+                onAsyncAssetReady,
+            );
         }
     }
 
@@ -898,6 +1716,7 @@ export function captureDomToCanvas(
         backdropOverride.canvas.width > 0 &&
         backdropOverride.canvas.height > 0
     ) {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
         const overrideCanvas = backdropOverride.canvas;
         const overrideElement = backdropOverride.element;
         if (overrideElement && overrideElement.isConnected) {
@@ -926,52 +1745,99 @@ export function captureDomToCanvas(
         } else {
             ctx.drawImage(overrideCanvas, 0, 0, texWidth, texHeight);
         }
+        ctx.setTransform(scaleX, 0, 0, scaleY, 0, 0);
     }
 
-    const scaleX = texWidth / sourceRect.width;
-    const scaleY = texHeight / sourceRect.height;
-    ctx.setTransform(scaleX, 0, 0, scaleY, 0, 0);
+    let clipMinX = 0;
+    let clipMinY = 0;
+    let clipMaxX = sourceRect.width;
+    let clipMaxY = sourceRect.height;
 
-    const stack: Element[] = [source];
+    const stack: Array<
+        | Element
+        | {
+              readonly popClip: true;
+              readonly prevMinX: number;
+              readonly prevMinY: number;
+              readonly prevMaxX: number;
+              readonly prevMaxY: number;
+          }
+    > = [source];
     while (stack.length > 0) {
-        const element = stack.pop()!;
-        if (element !== source && element.hasAttribute("data-lg-surface")) {
+        const entry = stack.pop()!;
+        if ("popClip" in entry) {
+            ctx.restore();
+            clipMinX = entry.prevMinX;
+            clipMinY = entry.prevMinY;
+            clipMaxX = entry.prevMaxX;
+            clipMaxY = entry.prevMaxY;
             continue;
         }
-
-        const style = window.getComputedStyle(element);
-        if (style.display === "none") continue;
+        const element = entry;
         if (element !== source) {
-            if (style.visibility === "hidden") continue;
-            const elementOpacity = Number.parseFloat(style.opacity || "1");
-            if (!(elementOpacity > 0.01)) continue;
+            const tagName = element.tagName;
+            if (
+                tagName === "SCRIPT" ||
+                tagName === "STYLE" ||
+                tagName === "NOSCRIPT" ||
+                tagName === "TEMPLATE" ||
+                tagName === "LINK" ||
+                tagName === "META" ||
+                tagName === "HEAD" ||
+                element.hasAttribute("data-lg-surface") ||
+                element.hasAttribute("hidden")
+            ) {
+                continue;
+            }
         }
+
+        const style = element === source ? rootStyle : window.getComputedStyle(element);
+        if (style.display === "none") continue;
         const opacity = element === source ? 1 : Number.parseFloat(style.opacity || "1");
-        const blurPx = element === source ? 0 : parseCssBlurPx(style.filter);
+        if (element !== source && (style.visibility === "hidden" || !(opacity > 0.01))) continue;
+
+        let elementRect = element === source ? sourceRect : undefined;
 
         if (element !== source) {
-            const clip =
-                style.backgroundClip ||
-                (style as CSSStyleDeclaration & { webkitBackgroundClip?: string }).webkitBackgroundClip;
             const bgColor = style.backgroundColor;
             const bgImage = style.backgroundImage;
-            const hasLinearBg =
-                clip !== "text" && Boolean(bgImage && bgImage.includes("linear-gradient("));
-            const hasRadialBg =
-                clip !== "text" && Boolean(bgImage && bgImage.includes("radial-gradient("));
-            const hasSolidBg =
-                clip !== "text" && bgColor && bgColor !== "rgba(0, 0, 0, 0)" && bgColor !== "transparent";
-            const parsedShadows = parseCssBoxShadows(style.boxShadow || "");
-            const hasBorder =
-                (style.borderTopStyle !== "none" && (Number.parseFloat(style.borderTopWidth || "0") || 0) > 0) ||
-                (style.borderRightStyle !== "none" && (Number.parseFloat(style.borderRightWidth || "0") || 0) > 0) ||
-                (style.borderBottomStyle !== "none" && (Number.parseFloat(style.borderBottomWidth || "0") || 0) > 0) ||
-                (style.borderLeftStyle !== "none" && (Number.parseFloat(style.borderLeftWidth || "0") || 0) > 0);
+            const boxShadowRaw = style.boxShadow;
+            const hasSolidColor = Boolean(
+                bgColor && bgColor !== "rgba(0, 0, 0, 0)" && bgColor !== "transparent",
+            );
+            const hasBgImage = Boolean(bgImage && bgImage !== "none");
+            const hasGradientCandidate =
+                hasBgImage && (bgImage.includes("gradient(") || bgImage.includes("url("));
 
-            if (hasSolidBg || hasLinearBg || hasRadialBg || parsedShadows.length > 0 || hasBorder) {
-                const bgRect = element.getBoundingClientRect();
+            let hasSolidBg = hasSolidColor;
+            let hasGradientBg = hasGradientCandidate;
+            if (hasSolidColor || hasGradientCandidate) {
+                const clip =
+                    style.backgroundClip ||
+                    (style as CSSStyleDeclaration & { webkitBackgroundClip?: string }).webkitBackgroundClip;
+                if (clip === "text") {
+                    hasSolidBg = false;
+                    hasGradientBg = false;
+                }
+            }
+
+            const parsedShadows =
+                boxShadowRaw && boxShadowRaw !== "none" ? parseCssBoxShadows(boxShadowRaw) : [];
+            const btW = style.borderTopWidth;
+            const brW = style.borderRightWidth;
+            const bbW = style.borderBottomWidth;
+            const blW = style.borderLeftWidth;
+            const hasBorder =
+                (btW !== "0px" && btW !== "" && btW !== "0" && style.borderTopStyle !== "none" && (Number.parseFloat(btW) || 0) > 0) ||
+                (brW !== "0px" && brW !== "" && brW !== "0" && style.borderRightStyle !== "none" && (Number.parseFloat(brW) || 0) > 0) ||
+                (bbW !== "0px" && bbW !== "" && bbW !== "0" && style.borderBottomStyle !== "none" && (Number.parseFloat(bbW) || 0) > 0) ||
+                (blW !== "0px" && blW !== "" && blW !== "0" && style.borderLeftStyle !== "none" && (Number.parseFloat(blW) || 0) > 0);
+
+            if (hasSolidBg || hasGradientBg || parsedShadows.length > 0 || hasBorder) {
+                const bgRect = elementRect ??= element.getBoundingClientRect();
                 const left = bgRect.left - sourceRect.left;
                 const top = bgRect.top - sourceRect.top;
+                const blurPx = parseCssBlurPx(style.filter);
                 let shadowMargin = blurPx * 2;
                 for (let index = 0; index < parsedShadows.length; index++) {
                     const shadowItem = parsedShadows[index];
@@ -983,92 +1849,182 @@ export function captureDomToCanvas(
                     }
                 }
                 if (
-                    intersectsSourceBounds(
+                    intersectsClipBounds(
                         left,
                         top,
                         bgRect.width,
                         bgRect.height,
-                        sourceRect.width,
-                        sourceRect.height,
+                        clipMinX,
+                        clipMinY,
+                        clipMaxX,
+                        clipMaxY,
                         shadowMargin,
                     )
                 ) {
-                    const cornerRadius = Number.parseFloat(style.borderTopLeftRadius || "0") || 0;
+                    const cornerRadii = parseElementCornerRadii(
+                        style,
+                        bgRect.width,
+                        bgRect.height,
+                    );
                     ctx.save();
                     ctx.globalAlpha = opacity;
                     if (blurPx > 0 && "filter" in ctx) {
                         ctx.filter = `blur(${blurPx}px)`;
                     }
                     if (parsedShadows.length > 0) {
-                        drawBoxShadows(ctx, parsedShadows, left, top, bgRect.width, bgRect.height, cornerRadius, false);
+                        drawBoxShadows(ctx, parsedShadows, left, top, bgRect.width, bgRect.height, cornerRadii, false);
                     }
                     if (hasSolidBg) {
-                        ctx.fillStyle = bgColor;
-                        fillRoundedOrRect(ctx, left, top, bgRect.width, bgRect.height, cornerRadius);
+                        ctx.fillStyle = toCanvasCssColor(bgColor);
+                        fillRoundedOrRect(ctx, left, top, bgRect.width, bgRect.height, cornerRadii);
                     }
-                    if (hasRadialBg) {
-                        drawRadialGradientBox(ctx, bgImage, left, top, bgRect.width, bgRect.height, cornerRadius);
-                    }
-                    if (hasLinearBg) {
-                        drawLinearGradientBox(ctx, bgImage, left, top, bgRect.width, bgRect.height, cornerRadius);
+                    if (hasGradientBg) {
+                        drawBackgroundImageLayers(
+                            ctx,
+                            bgImage,
+                            left,
+                            top,
+                            bgRect.width,
+                            bgRect.height,
+                            cornerRadii,
+                            style,
+                            onAsyncAssetReady,
+                        );
                     }
                     if (parsedShadows.length > 0) {
-                        drawBoxShadows(ctx, parsedShadows, left, top, bgRect.width, bgRect.height, cornerRadius, true);
+                        drawBoxShadows(ctx, parsedShadows, left, top, bgRect.width, bgRect.height, cornerRadii, true);
                     }
                     if (hasBorder) {
-                        drawElementBorder(ctx, style, left, top, bgRect.width, bgRect.height, cornerRadius);
+                        drawElementBorder(ctx, style, left, top, bgRect.width, bgRect.height, cornerRadii);
                     }
                     ctx.restore();
                 }
             }
         }
 
-        if (element instanceof HTMLImageElement) {
-            if (element.complete && element.naturalWidth > 0) {
-                const imgRect = element.getBoundingClientRect();
-                const imgLeft = imgRect.left - sourceRect.left;
-                const imgTop = imgRect.top - sourceRect.top;
-                if (
-                    intersectsSourceBounds(
-                        imgLeft,
-                        imgTop,
-                        imgRect.width,
-                        imgRect.height,
-                        sourceRect.width,
-                        sourceRect.height,
-                    )
-                ) {
-                    const baseW = element.offsetWidth || imgRect.width;
-                    const baseH = element.offsetHeight || imgRect.height;
-                    const cx = imgLeft + imgRect.width * 0.5;
-                    const cy = imgTop + imgRect.height * 0.5;
-                    const imgCornerRadius = Number.parseFloat(style.borderTopLeftRadius || "0") || 0;
-                    ctx.save();
-                    ctx.globalAlpha = opacity;
-                    ctx.translate(cx, cy);
-                    if (style.transform && style.transform !== "none" && typeof DOMMatrixReadOnly === "function") {
-                        const matrix = new DOMMatrixReadOnly(style.transform);
-                        ctx.transform(matrix.a, matrix.b, matrix.c, matrix.d, 0, 0);
+        const isOverflowClipped = (value: string): boolean =>
+            value === "hidden" || value === "clip" || value === "auto" || value === "scroll";
+        const clipsOverflow =
+            element !== source &&
+            (isOverflowClipped(style.overflow) ||
+                isOverflowClipped(style.overflowX) ||
+                isOverflowClipped(style.overflowY));
+        let clippedNextMinX = clipMinX;
+        let clippedNextMinY = clipMinY;
+        let clippedNextMaxX = clipMaxX;
+        let clippedNextMaxY = clipMaxY;
+        if (clipsOverflow) {
+            const clipRect = elementRect ??= element.getBoundingClientRect();
+            const clipLeft = clipRect.left - sourceRect.left;
+            const clipTop = clipRect.top - sourceRect.top;
+            clippedNextMinX = clipLeft > clipMinX ? clipLeft : clipMinX;
+            clippedNextMinY = clipTop > clipMinY ? clipTop : clipMinY;
+            const clipRight = clipLeft + clipRect.width;
+            const clipBottom = clipTop + clipRect.height;
+            clippedNextMaxX = clipRight < clipMaxX ? clipRight : clipMaxX;
+            clippedNextMaxY = clipBottom < clipMaxY ? clipBottom : clipMaxY;
+            if (clippedNextMaxX <= clippedNextMinX || clippedNextMaxY <= clippedNextMinY) {
+                continue;
+            }
+        }
+
+        const readyImg =
+            element instanceof HTMLImageElement && element.complete && element.naturalWidth > 0
+                ? element
+                : null;
+        const readyVideo =
+            !readyImg &&
+            typeof HTMLVideoElement !== "undefined" &&
+            element instanceof HTMLVideoElement &&
+            element.readyState >= 2 &&
+            element.videoWidth > 0 &&
+            element.videoHeight > 0
+                ? element
+                : null;
+        const readyMedia = readyImg ?? readyVideo;
+
+        if (readyMedia) {
+            const natW = readyImg ? readyImg.naturalWidth : readyVideo!.videoWidth;
+            const natH = readyImg ? readyImg.naturalHeight : readyVideo!.videoHeight;
+            const mediaRect = elementRect ??= element.getBoundingClientRect();
+            const mediaLeft = mediaRect.left - sourceRect.left;
+            const mediaTop = mediaRect.top - sourceRect.top;
+            if (
+                intersectsClipBounds(
+                    mediaLeft,
+                    mediaTop,
+                    mediaRect.width,
+                    mediaRect.height,
+                    clipMinX,
+                    clipMinY,
+                    clipMaxX,
+                    clipMaxY,
+                )
+            ) {
+                const baseW = (element as HTMLElement).offsetWidth || mediaRect.width;
+                const baseH = (element as HTMLElement).offsetHeight || mediaRect.height;
+                const cx = mediaLeft + mediaRect.width * 0.5;
+                const cy = mediaTop + mediaRect.height * 0.5;
+                const mediaCornerRadii = parseElementCornerRadii(style, baseW, baseH);
+                const hasMediaCornerRadius =
+                    typeof mediaCornerRadii === "number"
+                        ? mediaCornerRadii > 0.5
+                        : Math.max(
+                              mediaCornerRadii[0],
+                              mediaCornerRadii[1],
+                              mediaCornerRadii[2],
+                              mediaCornerRadii[3],
+                          ) > 0.5;
+                ctx.save();
+                ctx.globalAlpha = opacity;
+                ctx.translate(cx, cy);
+                const transformStr = style.transform;
+                if (transformStr && transformStr !== "none") {
+                    if (transformStr.startsWith("matrix(") && transformStr.endsWith(")")) {
+                        const comma1 = transformStr.indexOf(",", 7);
+                        const comma2 = comma1 >= 0 ? transformStr.indexOf(",", comma1 + 1) : -1;
+                        const comma3 = comma2 >= 0 ? transformStr.indexOf(",", comma2 + 1) : -1;
+                        const comma4 = comma3 >= 0 ? transformStr.indexOf(",", comma3 + 1) : -1;
+                        if (comma4 >= 0) {
+                            const ma = Number.parseFloat(transformStr.slice(7, comma1));
+                            const mb = Number.parseFloat(transformStr.slice(comma1 + 1, comma2));
+                            const mc = Number.parseFloat(transformStr.slice(comma2 + 1, comma3));
+                            const md = Number.parseFloat(transformStr.slice(comma3 + 1, comma4));
+                            if (Number.isFinite(ma) && Number.isFinite(mb) && Number.isFinite(mc) && Number.isFinite(md)) {
+                                ctx.transform(ma, mb, mc, md, 0, 0);
+                            }
+                        }
+                    } else if (typeof DOMMatrixReadOnly === "function") {
+                        try {
+                            const matrix = new DOMMatrixReadOnly(transformStr);
+                            ctx.transform(matrix.a, matrix.b, matrix.c, matrix.d, 0, 0);
+                        } catch {
+                        }
                     }
-                    if (imgCornerRadius > 0.5 && traceRoundedOrRectPath(ctx, -baseW * 0.5, -baseH * 0.5, baseW, baseH, imgCornerRadius)) {
-                        ctx.clip();
-                    }
-                    drawImageElementFitted(ctx, element, style, baseW, baseH);
-                    ctx.restore();
                 }
+                if (
+                    hasMediaCornerRadius &&
+                    traceRoundedOrRectPath(ctx, -baseW * 0.5, -baseH * 0.5, baseW, baseH, mediaCornerRadii)
+                ) {
+                    ctx.clip();
+                }
+                drawMediaElementFitted(ctx, element as HTMLImageElement | HTMLVideoElement, natW, natH, style, baseW, baseH);
+                ctx.restore();
             }
         } else if (typeof SVGSVGElement !== "undefined" && element instanceof SVGSVGElement) {
-            const svgRect = element.getBoundingClientRect();
+            const svgRect = elementRect ??= element.getBoundingClientRect();
             const svgLeft = svgRect.left - sourceRect.left;
             const svgTop = svgRect.top - sourceRect.top;
             if (
-                intersectsSourceBounds(
+                intersectsClipBounds(
                     svgLeft,
                     svgTop,
                     svgRect.width,
                     svgRect.height,
-                    sourceRect.width,
-                    sourceRect.height,
+                    clipMinX,
+                    clipMinY,
+                    clipMaxX,
+                    clipMaxY,
                 )
             ) {
                 ctx.save();
@@ -1091,17 +2047,19 @@ export function captureDomToCanvas(
             !element.classList.contains("lg-webgl-canvas")
         ) {
             if (element.width > 0 && element.height > 0) {
-                const canvasRect = element.getBoundingClientRect();
+                const canvasRect = elementRect ??= element.getBoundingClientRect();
                 const canvasLeft = canvasRect.left - sourceRect.left;
                 const canvasTop = canvasRect.top - sourceRect.top;
                 if (
-                    intersectsSourceBounds(
+                    intersectsClipBounds(
                         canvasLeft,
                         canvasTop,
                         canvasRect.width,
                         canvasRect.height,
-                        sourceRect.width,
-                        sourceRect.height,
+                        clipMinX,
+                        clipMinY,
+                        clipMaxX,
+                        clipMaxY,
                     )
                 ) {
                     ctx.save();
@@ -1117,29 +2075,129 @@ export function captureDomToCanvas(
                 }
             }
         } else {
+            if (clipsOverflow && element.firstChild !== null) {
+                const clipRect = elementRect ?? element.getBoundingClientRect();
+                const clipLeft = clipRect.left - sourceRect.left;
+                const clipTop = clipRect.top - sourceRect.top;
+                if (
+                    typeof ctx.save === "function" &&
+                    typeof ctx.restore === "function" &&
+                    typeof ctx.clip === "function"
+                ) {
+                    const clipRadii = parseElementCornerRadii(style, clipRect.width, clipRect.height);
+                    ctx.save();
+                    if (
+                        !traceRoundedOrRectPath(
+                            ctx,
+                            clipLeft,
+                            clipTop,
+                            clipRect.width,
+                            clipRect.height,
+                            clipRadii,
+                        )
+                    ) {
+                        if (typeof ctx.beginPath === "function" && typeof ctx.rect === "function") {
+                            ctx.beginPath();
+                            ctx.rect(clipLeft, clipTop, clipRect.width, clipRect.height);
+                        }
+                    }
+                    ctx.clip();
+                    stack.push({
+                        popClip: true,
+                        prevMinX: clipMinX,
+                        prevMinY: clipMinY,
+                        prevMaxX: clipMaxX,
+                        prevMaxY: clipMaxY,
+                    });
+                    clipMinX = clippedNextMinX;
+                    clipMinY = clippedNextMinY;
+                    clipMaxX = clippedNextMaxX;
+                    clipMaxY = clippedNextMaxY;
+                }
+            }
             let node = element.firstChild;
             while (node) {
                 if (node.nodeType === Node.TEXT_NODE) {
                     const rawText = node.textContent;
-                    const trimmed = rawText ? rawText.trim() : "";
-                    if (rawText && trimmed.length > 0) {
-                        const startOffset = rawText.indexOf(trimmed);
-                        range.setStart(node, startOffset);
-                        range.setEnd(node, startOffset + trimmed.length);
-                        const rects = range.getClientRects();
-                        const textRect = range.getBoundingClientRect();
+                    if (rawText) {
+                        const rawLen = rawText.length;
+                        let startOffset = 0;
+                        while (startOffset < rawLen && rawText.charCodeAt(startOffset) <= 32) {
+                            startOffset++;
+                        }
+                        if (startOffset < rawLen) {
+                            let endOffset = rawLen;
+                            while (endOffset > startOffset && rawText.charCodeAt(endOffset - 1) <= 32) {
+                                endOffset--;
+                            }
+                            const trimmed =
+                                startOffset === 0 && endOffset === rawLen
+                                    ? rawText
+                                    : rawText.slice(startOffset, endOffset);
+                            range.setStart(node, startOffset);
+                            range.setEnd(node, endOffset);
+                        const rects =
+                            typeof range.getClientRects === "function" ? range.getClientRects() : null;
+                        let textRect: DOMRect;
+                        if (rects) {
+                            if (rects.length === 0) {
+                                node = node.nextSibling;
+                                continue;
+                            }
+                            if (rects.length === 1) {
+                                textRect = rects[0]!;
+                            } else {
+                                let minL = rects[0]!.left;
+                                let minT = rects[0]!.top;
+                                let maxR = rects[0]!.right;
+                                let maxB = rects[0]!.bottom;
+                                for (let rIdx = 1; rIdx < rects.length; rIdx++) {
+                                    const line = rects[rIdx]!;
+                                    if (line.left < minL) minL = line.left;
+                                    if (line.top < minT) minT = line.top;
+                                    if (line.right > maxR) maxR = line.right;
+                                    if (line.bottom > maxB) maxB = line.bottom;
+                                }
+                                textRect = {
+                                    left: minL,
+                                    top: minT,
+                                    right: maxR,
+                                    bottom: maxB,
+                                    width: maxR - minL,
+                                    height: maxB - minT,
+                                    x: minL,
+                                    y: minT,
+                                    toJSON() {
+                                        return this;
+                                    },
+                                };
+                            }
+                        } else if (typeof range.getBoundingClientRect === "function") {
+                            textRect = range.getBoundingClientRect();
+                        } else {
+                            node = node.nextSibling;
+                            continue;
+                        }
                         if (
-                            intersectsSourceBounds(
+                            intersectsClipBounds(
                                 textRect.left - sourceRect.left,
                                 textRect.top - sourceRect.top,
                                 textRect.width,
                                 textRect.height,
-                                sourceRect.width,
-                                sourceRect.height,
+                                clipMinX,
+                                clipMinY,
+                                clipMaxX,
+                                clipMaxY,
                             )
                         ) {
-                            const content =
-                                style.textTransform === "uppercase" ? trimmed.toUpperCase() : trimmed;
+                            let content = trimmed;
+                            if (style.textTransform === "uppercase") {
+                                content = trimmed.toUpperCase();
+                            } else if (style.textTransform === "lowercase") {
+                                content = trimmed.toLowerCase();
+                            } else if (style.textTransform === "capitalize") {
+                                content = trimmed.replace(/\b\w/g, (ch) => ch.toUpperCase());
+                            }
                             ctx.save();
                             ctx.globalAlpha = opacity;
                             ctx.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
@@ -1147,121 +2205,262 @@ export function captureDomToCanvas(
                             ctx.fillStyle = resolveTextFill(ctx, style, textRect, sourceRect);
                             ctx.textBaseline = "middle";
                             ctx.textAlign = "left";
-                            if (rects.length <= 1) {
-                                const box = rects.length === 1 ? rects[0] : textRect;
+                            if (!rects || rects.length <= 1) {
                                 ctx.fillText(
                                     content,
-                                    box.left - sourceRect.left,
-                                    box.top - sourceRect.top + box.height * 0.5,
+                                    textRect.left - sourceRect.left,
+                                    textRect.top - sourceRect.top + textRect.height * 0.5,
                                 );
                             } else {
-                                const normalizedText = content.replace(/\s+/g, " ");
-                                const { starts: wordStarts, ends: wordEnds } =
-                                    extractWordOffsets(normalizedText);
-                                const wordCount = wordStarts.length;
-                                const totalMeasuredWidth = ctx.measureText(normalizedText).width;
-                                let charDensity =
-                                    totalMeasuredWidth > 0 && normalizedText.length > 0
-                                        ? totalMeasuredWidth / normalizedText.length
-                                        : 8;
-                                let wordIdx = 0;
-                                for (
-                                    let lineIdx = 0;
-                                    lineIdx < rects.length && wordIdx < wordCount;
-                                    lineIdx++
-                                ) {
-                                    const lineRect = rects[lineIdx];
-                                    const maxLineWidth = lineRect.width + 4;
-                                    const lineCharStart = wordStarts[wordIdx];
-                                    let low = wordIdx;
-                                    let high = wordCount - 1;
-                                    if (low < high) {
-                                        const targetEndChar =
-                                            lineCharStart +
-                                            Math.max(1, Math.floor(maxLineWidth / charDensity));
-                                        let searchLow = low;
-                                        let searchHigh = high;
-                                        while (searchLow < searchHigh) {
-                                            const mid = (searchLow + searchHigh + 1) >> 1;
-                                            if (wordEnds[mid] <= targetEndChar) {
-                                                searchLow = mid;
-                                            } else {
-                                                searchHigh = mid - 1;
-                                            }
+                                const whiteSpace = style.whiteSpace;
+                                const preservesNewlines =
+                                    whiteSpace === "pre" ||
+                                    whiteSpace === "pre-wrap" ||
+                                    whiteSpace === "pre-line" ||
+                                    whiteSpace === "break-spaces";
+                                const preservesSpaces =
+                                    whiteSpace === "pre" ||
+                                    whiteSpace === "pre-wrap" ||
+                                    whiteSpace === "break-spaces";
+                                const segments =
+                                    preservesNewlines && content.includes("\n")
+                                        ? content.split(/\r?\n/)
+                                        : [content];
+                                let lineIdx = 0;
+                                for (let segIdx = 0; segIdx < segments.length && lineIdx < rects.length; segIdx++) {
+                                    const rawSegment = segments[segIdx]!;
+                                    const normalizedText = preservesSpaces
+                                        ? rawSegment
+                                        : rawSegment.replace(/\s+/g, " ").trim();
+                                    const isLastSegment = segIdx === segments.length - 1;
+                                    if (normalizedText.length === 0) {
+                                        if (rects[lineIdx] && rects[lineIdx]!.width <= 1) {
+                                            lineIdx++;
                                         }
-                                        const guessIdx = searchLow;
-                                        const guessSlice = normalizedText.slice(
-                                            lineCharStart,
-                                            wordEnds[guessIdx],
+                                        continue;
+                                    }
+                                    if (whiteSpace === "pre") {
+                                        const lineRect = rects[lineIdx]!;
+                                        ctx.fillText(
+                                            normalizedText,
+                                            lineRect.left - sourceRect.left,
+                                            lineRect.top - sourceRect.top + lineRect.height * 0.5,
                                         );
-                                        const guessWidth = ctx.measureText(guessSlice).width;
-                                        if (guessWidth > 0 && guessSlice.length > 0) {
-                                            charDensity = guessWidth / guessSlice.length;
-                                        }
-                                        if (guessWidth <= maxLineWidth) {
-                                            low = guessIdx;
-                                            let step = 1;
+                                        lineIdx++;
+                                        continue;
+                                    }
+                                    const { starts: wordStarts, ends: wordEnds } =
+                                        extractWordOffsets(normalizedText);
+                                    const wordCount = wordStarts.length;
+                                    const totalMeasuredWidth = ctx.measureText(normalizedText).width;
+                                    let charDensity =
+                                        totalMeasuredWidth > 0 && normalizedText.length > 0
+                                            ? totalMeasuredWidth / normalizedText.length
+                                            : 8;
+                                    let charCursor = 0;
+                                    let wordIdx = 0;
+                                    while (lineIdx < rects.length && charCursor < normalizedText.length) {
+                                        if (!preservesSpaces || charCursor > 0) {
                                             while (
-                                                low + step <= high &&
-                                                ctx.measureText(
-                                                    normalizedText.slice(
-                                                        lineCharStart,
-                                                        wordEnds[low + step],
-                                                    ),
-                                                ).width <= maxLineWidth
+                                                charCursor < normalizedText.length &&
+                                                normalizedText.charCodeAt(charCursor) === 32
                                             ) {
-                                                low += step;
-                                                step <<= 1;
+                                                charCursor++;
                                             }
-                                            high = Math.min(high, low + step - 1);
-                                        } else {
-                                            high = guessIdx - 1;
-                                            let step = 1;
-                                            while (high - step >= low) {
-                                                if (
+                                        }
+                                        if (charCursor >= normalizedText.length) break;
+                                        const lineRect = rects[lineIdx]!;
+                                        if (isLastSegment && lineIdx === rects.length - 1) {
+                                            ctx.fillText(
+                                                normalizedText.slice(charCursor),
+                                                lineRect.left - sourceRect.left,
+                                                lineRect.top - sourceRect.top + lineRect.height * 0.5,
+                                            );
+                                            lineIdx++;
+                                            break;
+                                        }
+                                        while (wordIdx < wordCount && wordEnds[wordIdx]! <= charCursor) {
+                                            wordIdx++;
+                                        }
+                                        const maxLineWidth = lineRect.width + 4;
+                                        const lineCharStart = charCursor;
+                                        if (wordIdx >= wordCount) {
+                                            ctx.fillText(
+                                                normalizedText.slice(lineCharStart),
+                                                lineRect.left - sourceRect.left,
+                                                lineRect.top - sourceRect.top + lineRect.height * 0.5,
+                                            );
+                                            lineIdx++;
+                                            break;
+                                        }
+                                        const nextWordEnd = wordEnds[wordIdx]!;
+                                        const firstTokenWidth = ctx.measureText(
+                                            normalizedText.slice(lineCharStart, nextWordEnd),
+                                        ).width;
+                                        if (firstTokenWidth > maxLineWidth && nextWordEnd - lineCharStart > 1) {
+                                            let charLow = lineCharStart + 1;
+                                            let charHigh = nextWordEnd;
+                                            const guessEnd = Math.min(
+                                                charHigh,
+                                                Math.max(
+                                                    charLow,
+                                                    lineCharStart + Math.max(1, Math.floor(maxLineWidth / charDensity)),
+                                                ),
+                                            );
+                                            const guessWidth = ctx.measureText(
+                                                normalizedText.slice(lineCharStart, guessEnd),
+                                            ).width;
+                                            const guessLen = guessEnd - lineCharStart;
+                                            if (guessWidth > 0 && guessLen > 0) {
+                                                charDensity = guessWidth / guessLen;
+                                            }
+                                            if (guessWidth <= maxLineWidth) {
+                                                charLow = guessEnd;
+                                                let step = 1;
+                                                while (
+                                                    charLow + step <= charHigh &&
+                                                    ctx.measureText(
+                                                        normalizedText.slice(lineCharStart, charLow + step),
+                                                    ).width <= maxLineWidth
+                                                ) {
+                                                    charLow += step;
+                                                    step <<= 1;
+                                                }
+                                                charHigh = Math.min(charHigh, charLow + step - 1);
+                                            } else {
+                                                charHigh = Math.max(charLow, guessEnd - 1);
+                                                let step = 1;
+                                                while (charHigh - step >= charLow) {
+                                                    if (
+                                                        ctx.measureText(
+                                                            normalizedText.slice(lineCharStart, charHigh - step),
+                                                        ).width > maxLineWidth
+                                                    ) {
+                                                        charHigh -= step;
+                                                        step <<= 1;
+                                                    } else {
+                                                        charLow = charHigh - step;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            while (charLow < charHigh) {
+                                                const mid = (charLow + charHigh + 1) >> 1;
+                                                if (ctx.measureText(normalizedText.slice(lineCharStart, mid)).width <= maxLineWidth) {
+                                                    charLow = mid;
+                                                } else {
+                                                    charHigh = mid - 1;
+                                                }
+                                            }
+                                            const lineText = normalizedText.slice(lineCharStart, charLow);
+                                            charCursor = charLow;
+                                            ctx.fillText(
+                                                lineText,
+                                                lineRect.left - sourceRect.left,
+                                                lineRect.top - sourceRect.top + lineRect.height * 0.5,
+                                            );
+                                            lineIdx++;
+                                            continue;
+                                        }
+                                        let low = wordIdx;
+                                        let high = wordCount - 1;
+                                        if (low < high) {
+                                            const targetEndChar =
+                                                lineCharStart +
+                                                Math.max(1, Math.floor(maxLineWidth / charDensity));
+                                            let searchLow = low;
+                                            let searchHigh = high;
+                                            while (searchLow < searchHigh) {
+                                                const mid = (searchLow + searchHigh + 1) >> 1;
+                                                if (wordEnds[mid] <= targetEndChar) {
+                                                    searchLow = mid;
+                                                } else {
+                                                    searchHigh = mid - 1;
+                                                }
+                                            }
+                                            const guessIdx = searchLow;
+                                            const guessSlice = normalizedText.slice(
+                                                lineCharStart,
+                                                wordEnds[guessIdx],
+                                            );
+                                            const guessWidth = ctx.measureText(guessSlice).width;
+                                            if (guessWidth > 0 && guessSlice.length > 0) {
+                                                charDensity = guessWidth / guessSlice.length;
+                                            }
+                                            if (guessWidth <= maxLineWidth) {
+                                                low = guessIdx;
+                                                let step = 1;
+                                                while (
+                                                    low + step <= high &&
                                                     ctx.measureText(
                                                         normalizedText.slice(
                                                             lineCharStart,
-                                                            wordEnds[high - step],
+                                                            wordEnds[low + step],
                                                         ),
-                                                    ).width > maxLineWidth
+                                                    ).width <= maxLineWidth
                                                 ) {
-                                                    high -= step;
+                                                    low += step;
                                                     step <<= 1;
+                                                }
+                                                high = Math.min(high, low + step - 1);
+                                            } else {
+                                                high = guessIdx - 1;
+                                                let step = 1;
+                                                while (high - step >= low) {
+                                                    if (
+                                                        ctx.measureText(
+                                                            normalizedText.slice(
+                                                                lineCharStart,
+                                                                wordEnds[high - step],
+                                                            ),
+                                                        ).width > maxLineWidth
+                                                    ) {
+                                                        high -= step;
+                                                        step <<= 1;
+                                                    } else {
+                                                        low = high - step;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            while (low < high) {
+                                                const mid = (low + high + 1) >> 1;
+                                                if (
+                                                    ctx.measureText(
+                                                        normalizedText.slice(lineCharStart, wordEnds[mid]),
+                                                    ).width <= maxLineWidth
+                                                ) {
+                                                    low = mid;
                                                 } else {
-                                                    low = high - step;
-                                                    break;
+                                                    high = mid - 1;
                                                 }
                                             }
                                         }
-                                        while (low < high) {
-                                            const mid = (low + high + 1) >> 1;
-                                            if (
-                                                ctx.measureText(
-                                                    normalizedText.slice(lineCharStart, wordEnds[mid]),
-                                                ).width <= maxLineWidth
-                                            ) {
-                                                low = mid;
-                                            } else {
-                                                high = mid - 1;
-                                            }
-                                        }
+                                        const lineText = normalizedText.slice(lineCharStart, wordEnds[low]);
+                                        charCursor = wordEnds[low]!;
+                                        wordIdx = low + 1;
+                                        ctx.fillText(
+                                            lineText,
+                                            lineRect.left - sourceRect.left,
+                                            lineRect.top - sourceRect.top + lineRect.height * 0.5,
+                                        );
+                                        lineIdx++;
                                     }
-                                    const lineText = normalizedText.slice(lineCharStart, wordEnds[low]);
-                                    wordIdx = low + 1;
-                                    ctx.fillText(
-                                        lineText,
-                                        lineRect.left - sourceRect.left,
-                                        lineRect.top - sourceRect.top + lineRect.height * 0.5,
-                                    );
                                 }
                             }
                             ctx.restore();
+                            }
                         }
                     }
                 }
                 node = node.nextSibling;
             }
+        }
+
+        const isInlineSvg =
+            typeof SVGSVGElement !== "undefined" && element instanceof SVGSVGElement;
+        if (isInlineSvg) {
+            continue;
         }
 
         let child = element.lastElementChild;
@@ -1285,21 +2484,39 @@ export function createSceneCaptureController(
         captureCanvas.width = 0;
         captureCanvas.height = 0;
     }
+    const minObserverDelayMs = 100;
+    const maxObserverDelayMs = 500;
+    let observerDelayMs = minObserverDelayMs;
+    const now = () => typeof performance !== "undefined" ? performance.now() : Date.now();
     let hasCaptured = false;
     let captureFrame: number | null = null;
+    let recaptureTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastCaptureAt = -Infinity;
     let isActive = true;
     let pendingWhileInactive = false;
     let disposed = false;
 
     const range = typeof document !== "undefined" ? document.createRange() : null;
 
+    const clearPendingSchedule = () => {
+        if (captureFrame !== null && typeof cancelAnimationFrame === "function") {
+            cancelAnimationFrame(captureFrame);
+            captureFrame = null;
+        }
+        if (recaptureTimer !== null) {
+            clearTimeout(recaptureTimer);
+            recaptureTimer = null;
+        }
+    };
+
     const performCapture = () => {
         captureFrame = null;
         if (disposed || !captureCanvas || !range || !sourceElement.isConnected) return;
-        if (!isActive) {
+        if (!isActive || (typeof document !== "undefined" && document.hidden)) {
             pendingWhileInactive = true;
             return;
         }
+        const startedAt = now();
         const resolved = getQualityOptions?.();
         const pixelRatio = typeof resolved === "number" ? resolved : resolved?.pixelRatio;
         const radius = typeof resolved === "number" ? undefined : resolved?.radius;
@@ -1315,6 +2532,10 @@ export function createSceneCaptureController(
             )
         ) {
             hasCaptured = true;
+            lastCaptureAt = now();
+            observerDelayMs = Math.min(maxObserverDelayMs, Math.max(
+                minObserverDelayMs, (lastCaptureAt - startedAt) * 9, observerDelayMs * 0.5,
+            ));
             for (const listener of listeners) {
                 listener(captureCanvas, sourceElement);
             }
@@ -1323,21 +2544,61 @@ export function createSceneCaptureController(
 
     const scheduleCapture = () => {
         if (disposed) return;
-        if (!isActive) {
+        if (!isActive || (typeof document !== "undefined" && document.hidden)) {
             pendingWhileInactive = true;
             return;
         }
+        if (recaptureTimer !== null) {
+            clearTimeout(recaptureTimer);
+            recaptureTimer = null;
+        }
         if (captureFrame !== null || typeof requestAnimationFrame !== "function") return;
         captureFrame = requestAnimationFrame(performCapture);
+    };
+
+    const scheduleObserverCapture = () => {
+        if (disposed) return;
+        if (!isActive || (typeof document !== "undefined" && document.hidden)) {
+            pendingWhileInactive = true;
+            return;
+        }
+        if (!hasCaptured) {
+            scheduleCapture();
+            return;
+        }
+        if (captureFrame !== null || recaptureTimer !== null) return;
+        const elapsed = now() - lastCaptureAt;
+        if (elapsed >= observerDelayMs) {
+            scheduleCapture();
+            return;
+        }
+        recaptureTimer = setTimeout(() => {
+            recaptureTimer = null;
+            scheduleCapture();
+        }, observerDelayMs - elapsed);
+    };
+
+    const handleVisibilityChange = () => {
+        if (disposed || typeof document === "undefined") return;
+        if (document.hidden) {
+            if (captureFrame !== null || recaptureTimer !== null) {
+                clearPendingSchedule();
+                pendingWhileInactive = true;
+            }
+            return;
+        }
+        if (isActive && (pendingWhileInactive || !hasCaptured)) {
+            pendingWhileInactive = false;
+            scheduleCapture();
+        }
     };
 
     const setActive = (active: boolean) => {
         if (disposed || isActive === active) return;
         isActive = active;
         if (!active) {
-            if (captureFrame !== null && typeof cancelAnimationFrame === "function") {
-                cancelAnimationFrame(captureFrame);
-                captureFrame = null;
+            if (captureFrame !== null || recaptureTimer !== null) {
+                clearPendingSchedule();
                 pendingWhileInactive = true;
             }
             return;
@@ -1352,14 +2613,44 @@ export function createSceneCaptureController(
     let themeObserver: MutationObserver | null = null;
     if (typeof MutationObserver === "function") {
         mutationObserver = new MutationObserver((records) => {
+            const isSliderRoot = sourceElement.classList.contains("lg-slider");
             for (let index = 0; index < records.length; index++) {
-                const target = records[index].target as HTMLElement | Node;
+                const record = records[index]!;
+                const target = record.target as HTMLElement | Node;
                 const parentEl =
                     target instanceof HTMLElement ? target : target.parentElement;
-                if (parentEl && parentEl !== sourceElement && parentEl.closest("[data-lg-surface]")) {
+                if (
+                    parentEl &&
+                    (parentEl.closest("#svg-defs") ||
+                        (parentEl !== sourceElement &&
+                            parentEl.closest(isSliderRoot ? "[data-lg-surface]" : "[data-lg-surface], .lg-slider")))
+                ) {
                     continue;
                 }
-                scheduleCapture();
+                if (
+                    record.type === "childList" &&
+                    record.addedNodes.length > 0 &&
+                    Array.prototype.every.call(
+                        record.addedNodes,
+                        (node: Node) =>
+                            typeof Element !== "undefined" &&
+                            node instanceof Element &&
+                            Boolean(node.id === "svg-defs" || node.querySelector?.("#svg-defs")),
+                    )
+                ) {
+                    continue;
+                }
+                if (
+                    parentEl === sourceElement &&
+                    record.type === "attributes" &&
+                    sourceElement.classList.contains("lg-switch") &&
+                    (sourceElement.classList.contains("is-dragging") ||
+                        sourceElement.classList.contains("is-animating") ||
+                        sourceElement.classList.contains("is-pressed"))
+                ) {
+                    continue;
+                }
+                scheduleObserverCapture();
                 break;
             }
         });
@@ -1396,13 +2687,17 @@ export function createSceneCaptureController(
 
     let resizeObserver: ResizeObserver | null = null;
     if (typeof ResizeObserver === "function") {
-        resizeObserver = new ResizeObserver(scheduleCapture);
+        resizeObserver = new ResizeObserver(scheduleObserverCapture);
         resizeObserver.observe(sourceElement);
     }
 
-    sourceElement.addEventListener("load", scheduleCapture, true);
+    sourceElement.addEventListener("load", scheduleObserverCapture, true);
+    sourceElement.addEventListener("scroll", scheduleObserverCapture, { capture: true, passive: true });
     if (typeof window !== "undefined") {
-        window.addEventListener("resize", scheduleCapture, { passive: true });
+        window.addEventListener("resize", scheduleObserverCapture, { passive: true });
+    }
+    if (typeof document !== "undefined") {
+        document.addEventListener("visibilitychange", handleVisibilityChange, { passive: true });
     }
     if (typeof document !== "undefined" && "fonts" in document && document.fonts?.ready) {
         void document.fonts.ready.then(() => {
@@ -1420,6 +2715,7 @@ export function createSceneCaptureController(
             return sourceElement;
         },
         subscribe(listener) {
+            if (disposed) return () => {};
             listeners.add(listener);
             if (hasCaptured && captureCanvas && captureCanvas.width > 0 && sourceElement.isConnected) {
                 listener(captureCanvas, sourceElement);
@@ -1438,18 +2734,163 @@ export function createSceneCaptureController(
             themeObserver?.disconnect();
             colorSchemeQuery?.removeEventListener?.("change", scheduleCapture);
             resizeObserver?.disconnect();
-            sourceElement.removeEventListener("load", scheduleCapture, true);
+            sourceElement.removeEventListener("load", scheduleObserverCapture, true);
+            sourceElement.removeEventListener("scroll", scheduleObserverCapture, true);
             if (typeof window !== "undefined") {
-                window.removeEventListener("resize", scheduleCapture);
+                window.removeEventListener("resize", scheduleObserverCapture);
             }
-            if (captureFrame !== null && typeof cancelAnimationFrame === "function") {
-                cancelAnimationFrame(captureFrame);
-                captureFrame = null;
+            if (typeof document !== "undefined") {
+                document.removeEventListener("visibilitychange", handleVisibilityChange);
             }
+            clearPendingSchedule();
+            range?.collapse(true);
             if (captureCanvas) {
                 captureCanvas.width = 0;
                 captureCanvas.height = 0;
                 captureCanvas = null;
+            }
+        },
+    };
+}
+
+interface SharedCaptureLease {
+    getQuality?: () => number | undefined | { pixelRatio?: number; radius?: number };
+    active: boolean;
+}
+
+interface SharedSceneCaptureEntry {
+    controller: SceneCaptureController;
+    leases: Map<symbol, SharedCaptureLease>;
+    lastMaxPixelRatio: number;
+    lastHasRounded: boolean;
+}
+
+const sharedSceneCaptures = new WeakMap<HTMLElement, SharedSceneCaptureEntry>();
+
+function evaluateLeaseQuality(lease: SharedCaptureLease): { pixelRatio?: number; radius: number } {
+    const raw = lease.getQuality?.();
+    if (typeof raw === "number") {
+        return { pixelRatio: raw, radius: 9999 };
+    }
+    return {
+        pixelRatio: raw?.pixelRatio,
+        radius: raw?.radius ?? 9999,
+    };
+}
+
+function activeCaptureQuality(leases: Map<symbol, SharedCaptureLease>): SceneCaptureQualityOptions | undefined {
+    let radius = 0;
+    let pixelRatio: number | undefined;
+    let active = false;
+    for (const lease of leases.values()) {
+        if (!lease.active) continue;
+        active = true;
+        const quality = evaluateLeaseQuality(lease);
+        radius = Math.max(radius, quality.radius);
+        if (quality.pixelRatio !== undefined) pixelRatio = Math.max(pixelRatio ?? 0, quality.pixelRatio);
+    }
+    return active ? { radius, pixelRatio } : undefined;
+}
+
+export function acquireSharedSceneCapture(
+    sourceElement: HTMLElement,
+    getQualityOptions?: () => number | undefined | { pixelRatio?: number; radius?: number },
+): SceneCaptureController {
+    let entry = sharedSceneCaptures.get(sourceElement);
+    const leaseToken = Symbol("lg-scene-lease");
+    const lease: SharedCaptureLease = {
+        getQuality: getQualityOptions,
+        active: true,
+    };
+
+    if (!entry) {
+        const leases = new Map<symbol, SharedCaptureLease>();
+        leases.set(leaseToken, lease);
+        const newEntry: SharedSceneCaptureEntry = {
+            controller: null as unknown as SceneCaptureController,
+            leases,
+            lastMaxPixelRatio: 0,
+            lastHasRounded: false,
+        };
+        newEntry.controller = createSceneCaptureController(sourceElement, () => {
+            const quality = activeCaptureQuality(leases);
+            newEntry.lastMaxPixelRatio = quality?.pixelRatio ?? 0;
+            newEntry.lastHasRounded = (quality?.radius ?? 0) > 0;
+            return quality;
+        });
+        sharedSceneCaptures.set(sourceElement, newEntry);
+        entry = newEntry;
+    } else {
+        entry.leases.set(leaseToken, lease);
+        entry.controller.setActive?.(true);
+        const newQuality = evaluateLeaseQuality(lease);
+        const needsUpgrade =
+            (newQuality.radius > 0 && !entry.lastHasRounded) ||
+            (newQuality.pixelRatio !== undefined && newQuality.pixelRatio > entry.lastMaxPixelRatio);
+        if (needsUpgrade) {
+            entry.controller.scheduleCapture();
+        }
+    }
+
+    const currentEntry = entry;
+    let leaseDestroyed = false;
+    const leaseUnsubscribes = new Set<() => void>();
+
+    const syncSharedActiveState = () => {
+        const quality = activeCaptureQuality(currentEntry.leases);
+        currentEntry.controller.setActive?.(quality !== undefined);
+        if (quality && ((quality.pixelRatio ?? 0) !== currentEntry.lastMaxPixelRatio ||
+            ((quality.radius ?? 0) > 0) !== currentEntry.lastHasRounded)) {
+            currentEntry.controller.scheduleCapture();
+        }
+    };
+
+    return {
+        get canvas() {
+            return currentEntry.controller.canvas;
+        },
+        get source() {
+            return currentEntry.controller.source;
+        },
+        subscribe(listener) {
+            if (leaseDestroyed) return () => {};
+            const innerUnsub = currentEntry.controller.subscribe((canvas, source) => {
+                if (!leaseDestroyed) listener(canvas, source);
+            });
+            if (leaseDestroyed) {
+                innerUnsub();
+                return () => {};
+            }
+            const scopedUnsub = () => {
+                if (leaseUnsubscribes.delete(scopedUnsub)) {
+                    innerUnsub();
+                }
+            };
+            leaseUnsubscribes.add(scopedUnsub);
+            return scopedUnsub;
+        },
+        scheduleCapture() {
+            if (leaseDestroyed) return;
+            currentEntry.controller.scheduleCapture();
+        },
+        setActive(active: boolean) {
+            if (leaseDestroyed || lease.active === active) return;
+            lease.active = active;
+            syncSharedActiveState();
+        },
+        destroy() {
+            if (leaseDestroyed) return;
+            leaseDestroyed = true;
+            for (const unsub of [...leaseUnsubscribes]) {
+                unsub();
+            }
+            leaseUnsubscribes.clear();
+            currentEntry.leases.delete(leaseToken);
+            if (currentEntry.leases.size === 0) {
+                sharedSceneCaptures.delete(sourceElement);
+                currentEntry.controller.destroy();
+            } else {
+                syncSharedActiveState();
             }
         },
     };

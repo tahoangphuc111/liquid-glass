@@ -1,14 +1,16 @@
-import { createLiquidGlass } from "./controller.js";
+import { createLiquidGlassController, observeSharedElementResize } from "./controller.js";
 import { getMediaQueries } from "./observer.js";
 import {
+    acquireSharedSceneCapture,
     captureDomToCanvas,
-    createSceneCaptureController,
     type CaptureBackdropSource,
 } from "./sceneCapture.js";
-import { stepSpring, type DampedSpringParams } from "./spring.js";
+import { quantizeSpringDtSeconds, stepSpring, type DampedSpringParams } from "./spring.js";
 import type {
-    LiquidGlassInstance,
+    GlassOrientation,
     LiquidGlassOptions,
+    LiquidGlassSliderInstance,
+    LiquidGlassSliderOptions,
     SceneCaptureController,
 } from "./types.js";
 
@@ -54,12 +56,34 @@ function computeRangeProgress(input: HTMLInputElement): number {
     return Number.isFinite(progress) ? Math.min(1, Math.max(0, progress)) : 0;
 }
 
+const SLIDER_OWN_OPTION_KEYS = new Set(["orientation", "onChange", "onEngineChange"]);
+
+function stripSliderOwnOptions(
+    options: Partial<LiquidGlassSliderOptions>,
+): Partial<LiquidGlassOptions> {
+    const patch: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(options)) {
+        if (!SLIDER_OWN_OPTION_KEYS.has(key)) {
+            patch[key] = value;
+        }
+    }
+    return patch as Partial<LiquidGlassOptions>;
+}
+
+function readNumericInputValue(input: HTMLInputElement): number {
+    const raw = Number(input.value);
+    if (Number.isFinite(raw)) return raw;
+    const min = Number(input.min);
+    return Number.isFinite(min) ? min : 0;
+}
+
 export function createGlassSlider(
     input: HTMLInputElement,
-    options: LiquidGlassOptions = {},
-): LiquidGlassInstance {
+    options: LiquidGlassSliderOptions = {},
+): LiquidGlassSliderInstance {
     const parent = input.parentNode;
-    const nextSibling = input.nextSibling;
+    const originalAriaOrientation = input.getAttribute("aria-orientation");
+    const hadNativeClass = input.classList.contains("lg-slider-native");
 
     const wrapper = document.createElement("div");
     wrapper.className = "lg-slider";
@@ -87,6 +111,10 @@ export function createGlassSlider(
     let requestedSceneCanvas: HTMLCanvasElement | null = options.sceneCanvas ?? null;
     let requestedPixelRatio: number | undefined = options.pixelRatio;
     let interactiveEnabled = options.interactive !== false;
+    let orientation: GlassOrientation = options.orientation === "vertical" ? "vertical" : "horizontal";
+    let onChangeCallback = options.onChange;
+    let onEngineChangeCallback = options.onEngineChange;
+    let syncCaptureOnEngineChange: (() => void) | null = null;
     let compositeCanvas: HTMLCanvasElement | null = null;
     const compositeRange: Range | null =
         typeof document !== "undefined" ? document.createRange() : null;
@@ -96,8 +124,24 @@ export function createGlassSlider(
     let externalCapturedSource: HTMLElement | null = null;
     let sliderDestroyed = false;
 
+    const restoreAriaOrientation = (): void => {
+        if (originalAriaOrientation === null) input.removeAttribute("aria-orientation");
+        else input.setAttribute("aria-orientation", originalAriaOrientation);
+    };
+
+    const syncOrientationAttr = (): void => {
+        if (orientation === "vertical") {
+            wrapper.setAttribute("data-lg-slider-orientation", "vertical");
+            input.setAttribute("aria-orientation", "vertical");
+        } else {
+            wrapper.removeAttribute("data-lg-slider-orientation");
+            restoreAriaOrientation();
+        }
+    };
+    syncOrientationAttr();
+
     const needsCompositeScene = (): boolean =>
-        Boolean(requestedSceneCanvas || (requestedSceneElement && !requestedSceneElement.contains(wrapper)));
+        Boolean(requestedSceneCanvas || requestedSceneElement);
 
     const ensureCompositeCanvas = (): HTMLCanvasElement => {
         if (!compositeCanvas) {
@@ -109,20 +153,24 @@ export function createGlassSlider(
     };
 
     const initialComposite = needsCompositeScene();
+    const baseGlassOptions = stripSliderOwnOptions(options);
+    const hasInitialPreset = baseGlassOptions.preset !== undefined;
     const thumbOptions: LiquidGlassOptions = {
         pill: true,
-        blur: 0,
-        bezel: 10,
-        thickness: 36,
-        ...options,
-        // Pointer events hit the transparent native input above the thumb, so slider.ts drives press spring motion.
+        ...(hasInitialPreset ? {} : { blur: 0, bezel: 10, thickness: 36 }),
+        ...baseGlassOptions,
         interactive: false,
         sceneElement: initialComposite ? wrapper : (requestedSceneElement ?? wrapper),
         sceneCanvas: initialComposite ? ensureCompositeCanvas() : null,
+        onEngineChange(engine) {
+            syncCaptureOnEngineChange?.();
+            onEngineChangeCallback?.(engine);
+        },
     };
 
-    const thumbGlass = createLiquidGlass(thumb, thumbOptions);
-    let dragRefreshRaf: number | null = null;
+    const thumbGlass = createLiquidGlassController(thumb, thumbOptions);
+    let thumbRefreshRaf: number | null = null;
+    let forceThumbRefresh = false;
     let motionRaf: number | null = null;
     let lastMotionTime = 0;
     let targetProgress = computeRangeProgress(input);
@@ -134,16 +182,53 @@ export function createGlassSlider(
     let hasPointerDragged = false;
     let pointerDownX: number | null = null;
     let activePointerId: number | null = null;
+    let isHorizontalRtl = false;
     let bouncePos = 0;
     let bounceVel = 0;
     let lastBounceEdge: -1 | 0 | 1 = 0;
+    let lastVisualQuant = -999999;
+    let lastBounceQuant = -999999;
+    let lastBounceIsVert = false;
+    let lastScaleXQuant = -999999;
+    let lastScaleYQuant = -999999;
+    let lastGlowQuant = -999999;
+    let lastCompositeVisualProgress = -999999;
+    let hasLastBackdropMapping = false;
+    let lastBackdropRelX = 0;
+    let lastBackdropRelY = 0;
+    let lastBackdropWidth = 0;
+    let lastBackdropHeight = 0;
+    let lastBackdropSourceWidth = 0;
+    let lastBackdropSourceHeight = 0;
 
     const isMotionReduced = (): boolean => Boolean(getMediaQueries().reducedMotionQuery?.matches);
+    const syncDisabledState = (): void => {
+        wrapper.classList.toggle("is-disabled", Boolean(input.disabled));
+    };
 
-    const applyMotionVars = (): void => {
+    const applyMotionVars = (): boolean => {
         const clampedVisual = Math.min(1, Math.max(0, visualProgress));
-        wrapper.style.setProperty("--lg-slider-visual-progress", clampedVisual.toFixed(4));
-        wrapper.style.setProperty("--lg-slider-bounce-x", `${bouncePos.toFixed(2)}px`);
+        const visualQuant = Math.round(clampedVisual * 10000);
+        const positionChanged = visualQuant !== lastVisualQuant;
+        if (positionChanged) {
+            lastVisualQuant = visualQuant;
+            wrapper.style.setProperty("--lg-slider-visual-progress", clampedVisual.toFixed(4));
+        }
+        const isVert = orientation === "vertical";
+        const bounceQuant = Math.round(bouncePos * 100);
+        const bounceChanged = bounceQuant !== lastBounceQuant || isVert !== lastBounceIsVert;
+        if (bounceChanged) {
+            lastBounceQuant = bounceQuant;
+            if (isVert !== lastBounceIsVert) {
+                lastBounceIsVert = isVert;
+                wrapper.style.removeProperty(isVert ? "--lg-slider-bounce-x" : "--lg-slider-bounce-y");
+            }
+            if (isVert) {
+                wrapper.style.setProperty("--lg-slider-bounce-y", `${(-bouncePos).toFixed(2)}px`);
+            } else {
+                wrapper.style.setProperty("--lg-slider-bounce-x", `${bouncePos.toFixed(2)}px`);
+            }
+        }
 
         const pressScaleX = 1 + pressAmount * 0.06;
         const pressScaleY = 1 - pressAmount * 0.04;
@@ -152,16 +237,33 @@ export function createGlassSlider(
         const totalStretch = Math.min(0.075, bounceStretch + glideStretch);
         const scaleX = Math.max(0.85, Math.min(1.18, pressScaleX + totalStretch));
         const scaleY = Math.max(0.85, Math.min(1.18, pressScaleY - totalStretch * 0.6));
+        const outScaleX = isVert ? scaleY : scaleX;
+        const outScaleY = isVert ? scaleX : scaleY;
+        const sxQuant = Math.round(outScaleX * 10000);
+        const syQuant = Math.round(outScaleY * 10000);
 
-        wrapper.style.setProperty("--lg-slider-bounce-scale-x", scaleX.toFixed(4));
-        wrapper.style.setProperty("--lg-slider-bounce-scale-y", scaleY.toFixed(4));
+        const scaleXChanged = sxQuant !== lastScaleXQuant;
+        const scaleYChanged = syQuant !== lastScaleYQuant;
+        if (scaleXChanged) {
+            lastScaleXQuant = sxQuant;
+            wrapper.style.setProperty("--lg-slider-bounce-scale-x", outScaleX.toFixed(4));
+        }
+        if (scaleYChanged) {
+            lastScaleYQuant = syQuant;
+            wrapper.style.setProperty("--lg-slider-bounce-scale-y", outScaleY.toFixed(4));
+        }
 
         const pressGlow = Math.min(0.18, Math.max(0, pressAmount) * 0.12 + totalStretch * 0.8);
-        if (pressGlow > 0.002) {
-            thumb.style.setProperty("--lg-press-glow", pressGlow.toFixed(3));
-        } else {
-            thumb.style.removeProperty("--lg-press-glow");
+        const glowQuant = pressGlow > 0.002 ? Math.round(pressGlow * 1000) : 0;
+        if (glowQuant !== lastGlowQuant) {
+            lastGlowQuant = glowQuant;
+            if (glowQuant > 0) {
+                thumb.style.setProperty("--lg-press-glow", pressGlow.toFixed(3));
+            } else {
+                thumb.style.removeProperty("--lg-press-glow");
+            }
         }
+        return positionChanged || bounceChanged || scaleXChanged || scaleYChanged;
     };
 
     const stopMotionLoop = (): void => {
@@ -191,7 +293,7 @@ export function createGlassSlider(
 
         const dtMs = lastMotionTime > 0 ? now - lastMotionTime : 16;
         lastMotionTime = now;
-        const dt = Math.min(0.032, Math.max(0.001, dtMs * 0.001));
+        const dt = quantizeSpringDtSeconds(dtMs);
 
         const posStep = stepSpring(
             visualProgress,
@@ -226,13 +328,13 @@ export function createGlassSlider(
         bouncePos = bounceStep.value;
         bounceVel = bounceStep.velocity;
 
-        applyMotionVars();
-        if (thumbGlass.engine === "webgl") {
+        const allSettled = posStep.settled && pressStep.settled && bounceStep.settled;
+        if (applyMotionVars() && thumbGlass.engine === "webgl") thumbGlass.refreshMotion();
+        const compositeThreshold = allSettled ? 0.0001 : 0.004;
+        if (needsCompositeScene() && Math.abs(visualProgress - lastCompositeVisualProgress) >= compositeThreshold) {
             paintCompositeScene();
-            thumbGlass.refresh();
         }
 
-        const allSettled = posStep.settled && pressStep.settled && bounceStep.settled;
         if (!allSettled && typeof requestAnimationFrame === "function") {
             motionRaf = requestAnimationFrame(tickMotion);
         } else {
@@ -274,7 +376,7 @@ export function createGlassSlider(
         externalCapturedSource = null;
     };
 
-    const paintCompositeScene = (): void => {
+    const paintCompositeScene = (onlyIfBackdropMoved = false): void => {
         if (
             sliderDestroyed ||
             !needsCompositeScene() ||
@@ -293,6 +395,42 @@ export function createGlassSlider(
                     element: externalCapturedSource ?? requestedSceneElement,
                 }
               : null;
+        const source = backdropSource?.element;
+        let hasBackdropMapping = false;
+        let nextRelX = 0;
+        let nextRelY = 0;
+        let nextWidth = 0;
+        let nextHeight = 0;
+        let nextSourceWidth = 0;
+        let nextSourceHeight = 0;
+        if (source && source !== wrapper && source.isConnected && backdropSource.canvas.width > 0 &&
+            backdropSource.canvas.height > 0) {
+            const wrapperRect = wrapper.getBoundingClientRect();
+            const sourceRect = source.getBoundingClientRect();
+            hasBackdropMapping = true;
+            nextRelX = wrapperRect.left - sourceRect.left;
+            nextRelY = wrapperRect.top - sourceRect.top;
+            nextWidth = wrapperRect.width;
+            nextHeight = wrapperRect.height;
+            nextSourceWidth = sourceRect.width;
+            nextSourceHeight = sourceRect.height;
+        }
+        if (onlyIfBackdropMoved) {
+            if (!hasBackdropMapping && !hasLastBackdropMapping) return;
+            if (
+                hasBackdropMapping &&
+                hasLastBackdropMapping &&
+                Math.abs(nextRelX - lastBackdropRelX) < 0.01 &&
+                Math.abs(nextRelY - lastBackdropRelY) < 0.01 &&
+                Math.abs(nextWidth - lastBackdropWidth) < 0.01 &&
+                Math.abs(nextHeight - lastBackdropHeight) < 0.01 &&
+                Math.abs(nextSourceWidth - lastBackdropSourceWidth) < 0.01 &&
+                Math.abs(nextSourceHeight - lastBackdropSourceHeight) < 0.01
+            ) {
+                return;
+            }
+        }
+
         if (
             captureDomToCanvas(
                 wrapper,
@@ -303,7 +441,15 @@ export function createGlassSlider(
                 backdropSource,
             )
         ) {
-            thumbGlass.setSceneCanvas(compositeCanvas, wrapper);
+            hasLastBackdropMapping = hasBackdropMapping;
+            lastBackdropRelX = nextRelX;
+            lastBackdropRelY = nextRelY;
+            lastBackdropWidth = nextWidth;
+            lastBackdropHeight = nextHeight;
+            lastBackdropSourceWidth = nextSourceWidth;
+            lastBackdropSourceHeight = nextSourceHeight;
+            lastCompositeVisualProgress = visualProgress;
+            thumbGlass.refreshMotion(true);
         }
     };
 
@@ -312,17 +458,14 @@ export function createGlassSlider(
             detachExternalCapture();
             return;
         }
-        if (requestedSceneCanvas || !requestedSceneElement) {
-            unsubscribeExternal?.();
-            unsubscribeExternal = null;
-            externalCapture?.destroy();
-            externalCapture = null;
+        if (requestedSceneCanvas || !requestedSceneElement || requestedSceneElement === wrapper) {
+            detachExternalCapture();
             paintCompositeScene();
             return;
         }
         if (externalCapture?.source !== requestedSceneElement) {
             detachExternalCapture();
-            externalCapture = createSceneCaptureController(requestedSceneElement, () => ({
+            externalCapture = acquireSharedSceneCapture(requestedSceneElement, () => ({
                 pixelRatio: requestedPixelRatio,
                 radius: 9999,
             }));
@@ -334,21 +477,29 @@ export function createGlassSlider(
         }
         paintCompositeScene();
     };
+    syncCaptureOnEngineChange = syncExternalCapture;
 
-    const scheduleThumbRefresh = (): void => {
-        if (sliderDestroyed || dragRefreshRaf !== null || typeof requestAnimationFrame !== "function") return;
-        dragRefreshRaf = requestAnimationFrame(() => {
-            dragRefreshRaf = null;
+    const scheduleThumbRefresh = (force = true): void => {
+        if (sliderDestroyed || typeof requestAnimationFrame !== "function") return;
+        forceThumbRefresh ||= force;
+        if (thumbRefreshRaf !== null) return;
+        thumbRefreshRaf = requestAnimationFrame(() => {
+            thumbRefreshRaf = null;
+            const force = forceThumbRefresh;
+            forceThumbRefresh = false;
             if (sliderDestroyed) return;
-            paintCompositeScene();
-            thumbGlass.refresh();
+            paintCompositeScene(!force);
+            if (force) thumbGlass.refresh();
         });
     };
 
     const syncProgress = (): void => {
+        syncDisabledState();
+        if (input.disabled && isPressed) onPointerUp();
         const progress = computeRangeProgress(input);
+        const needsProgressWrite = progress !== targetProgress || !wrapper.style.getPropertyValue("--lg-slider-progress");
         targetProgress = progress;
-        wrapper.style.setProperty("--lg-slider-progress", progress.toFixed(4));
+        if (needsProgressWrite) wrapper.style.setProperty("--lg-slider-progress", progress.toFixed(4));
 
         if (progress > 0 && progress < 1) {
             lastBounceEdge = 0;
@@ -363,6 +514,7 @@ export function createGlassSlider(
             bounceVel = 0;
             stopMotionLoop();
             applyMotionVars();
+            scheduleThumbRefresh();
             return;
         }
 
@@ -379,15 +531,45 @@ export function createGlassSlider(
         }
     };
 
-    const onInput = (): void => {
+    let lastEmittedValue = readNumericInputValue(input);
+    let lastEventWasInput = false;
+
+    const onInput = (event: Event): void => {
+        if (sliderDestroyed) return;
         syncProgress();
-        if (motionRaf === null) {
-            paintCompositeScene();
-            scheduleThumbRefresh();
+        const numericValue = readNumericInputValue(input);
+        const isChangeEvent = event.type === "change";
+        if (!isChangeEvent || !lastEventWasInput || numericValue !== lastEmittedValue) {
+            lastEmittedValue = numericValue;
+            onChangeCallback?.(numericValue, input);
         }
+        lastEventWasInput = !isChangeEvent;
+        if (motionRaf === null) scheduleThumbRefresh();
+    };
+
+    let cachedDragRect: DOMRect | null = null;
+    let dragWindowListenersAttached = false;
+
+    const attachDragWindowListeners = (): void => {
+        if (dragWindowListenersAttached || typeof window === "undefined") return;
+        dragWindowListenersAttached = true;
+        window.addEventListener("pointermove", onPointerMove, { passive: true });
+        window.addEventListener("pointerup", onPointerUp);
+        window.addEventListener("pointercancel", onPointerUp);
+        window.addEventListener("blur", onPointerUp);
+    };
+
+    const detachDragWindowListeners = (): void => {
+        if (!dragWindowListenersAttached || typeof window === "undefined") return;
+        dragWindowListenersAttached = false;
+        window.removeEventListener("pointermove", onPointerMove);
+        window.removeEventListener("pointerup", onPointerUp);
+        window.removeEventListener("pointercancel", onPointerUp);
+        window.removeEventListener("blur", onPointerUp);
     };
 
     const onPointerDown = (event: PointerEvent): void => {
+        if (sliderDestroyed || input.disabled) return;
         if ("pointerType" in event && event.pointerType === "mouse" && event.button !== 0) return;
         if (activePointerId !== null) return;
         if ("pointerId" in event && typeof event.pointerId === "number") {
@@ -395,7 +577,14 @@ export function createGlassSlider(
         }
         isPressed = true;
         hasPointerDragged = false;
-        pointerDownX = "clientX" in event && typeof event.clientX === "number" ? event.clientX : null;
+        cachedDragRect = null;
+        attachDragWindowListeners();
+        isHorizontalRtl = orientation === "horizontal" && getComputedStyle(input).direction === "rtl";
+        const coord =
+            orientation === "vertical"
+                ? ("clientY" in event && typeof event.clientY === "number" ? event.clientY : null)
+                : ("clientX" in event && typeof event.clientX === "number" ? event.clientX : null);
+        pointerDownX = coord;
         wrapper.classList.add("is-active");
         if (interactiveEnabled) {
             ensureMotionLoop();
@@ -404,27 +593,47 @@ export function createGlassSlider(
     };
 
     const onPointerMove = (event: PointerEvent): void => {
-        if (!isPressed) return;
+        if (sliderDestroyed || !isPressed) return;
         if (activePointerId !== null && "pointerId" in event && event.pointerId !== activePointerId) {
             return;
         }
-        const clientX = "clientX" in event && typeof event.clientX === "number" ? event.clientX : null;
-        if (clientX === null) return;
-        if (pointerDownX !== null && Math.abs(clientX - pointerDownX) > DRAG_THRESHOLD_PX) {
+        const coord =
+            orientation === "vertical"
+                ? ("clientY" in event && typeof event.clientY === "number" ? event.clientY : null)
+                : ("clientX" in event && typeof event.clientX === "number" ? event.clientX : null);
+        if (coord === null) return;
+        if (pointerDownX !== null && Math.abs(coord - pointerDownX) > DRAG_THRESHOLD_PX) {
             hasPointerDragged = true;
         }
-        const rect = wrapper.getBoundingClientRect();
+        if (targetProgress > 0 && targetProgress < 1) {
+            return;
+        }
+        const rect = cachedDragRect ?? (cachedDragRect = wrapper.getBoundingClientRect());
+        if (orientation === "vertical") {
+            if (rect.height <= 0) return;
+            if (coord >= rect.bottom && targetProgress <= 0 && lastBounceEdge !== -1) {
+                lastBounceEdge = -1;
+                triggerEdgeBounce(-1);
+            } else if (coord <= rect.top && targetProgress >= 1 && lastBounceEdge !== 1) {
+                lastBounceEdge = 1;
+                triggerEdgeBounce(1);
+            }
+            return;
+        }
         if (rect.width <= 0) return;
-        if (clientX <= rect.left && targetProgress <= 0 && lastBounceEdge !== -1) {
+        const beyondStart = isHorizontalRtl ? coord >= rect.right : coord <= rect.left;
+        const beyondEnd = isHorizontalRtl ? coord <= rect.left : coord >= rect.right;
+        if (beyondStart && targetProgress <= 0 && lastBounceEdge !== -1) {
             lastBounceEdge = -1;
             triggerEdgeBounce(-1);
-        } else if (clientX >= rect.right && targetProgress >= 1 && lastBounceEdge !== 1) {
+        } else if (beyondEnd && targetProgress >= 1 && lastBounceEdge !== 1) {
             lastBounceEdge = 1;
             triggerEdgeBounce(1);
         }
     };
 
     const onPointerUp = (event?: Event): void => {
+        if (sliderDestroyed) return;
         if (event && "pointerId" in event) {
             const pointerEvent = event as PointerEvent;
             if (
@@ -436,6 +645,8 @@ export function createGlassSlider(
             }
         }
         activePointerId = null;
+        cachedDragRect = null;
+        detachDragWindowListeners();
         if (!isPressed && !wrapper.classList.contains("is-active")) return;
         const wasPressed = isPressed;
         isPressed = false;
@@ -443,7 +654,6 @@ export function createGlassSlider(
         pointerDownX = null;
         wrapper.classList.remove("is-active");
         if (interactiveEnabled && wasPressed && !isMotionReduced()) {
-            // Ensure even a sub-frame click or tap plays a visible press-and-rebound spring.
             if (pressAmount < 0.45) {
                 pressAmount = Math.max(pressAmount, 0.38);
                 pressVelocity = Math.max(pressVelocity, 2.2);
@@ -453,28 +663,45 @@ export function createGlassSlider(
         scheduleThumbRefresh();
     };
 
-    const wrapperResizeObserver =
-        typeof ResizeObserver === "function"
-            ? new ResizeObserver(() => {
-                  paintCompositeScene();
-                  scheduleThumbRefresh();
-              })
-            : null;
-    wrapperResizeObserver?.observe(wrapper);
+    const onLayoutChange = (): void => {
+        cachedDragRect = null;
+        scheduleThumbRefresh();
+    };
+    const onScroll = (): void => {
+        cachedDragRect = null;
+        if (thumbGlass.engine === "webgl" && requestedSceneElement && requestedSceneElement !== wrapper) {
+            scheduleThumbRefresh(false);
+        }
+    };
+    const syncInputAttributes = (): void => {
+        if (input.dir) wrapper.dir = input.dir;
+        else wrapper.removeAttribute("dir");
+        syncProgress();
+    };
+    const onFormReset = (event: Event): void => {
+        if (event.target !== input.form) return;
+        queueMicrotask(() => {
+            if (!sliderDestroyed && !event.defaultPrevented) syncProgress();
+        });
+    };
+    const unobserveWrapperResize = observeSharedElementResize(wrapper, onLayoutChange);
+    const inputObserver = typeof MutationObserver === "function" ? new MutationObserver(() => {
+        if (!sliderDestroyed) {
+            syncInputAttributes();
+            scheduleThumbRefresh();
+        }
+    }) : null;
+    inputObserver?.observe(input, { attributes: true, attributeFilter: ["min", "max", "step", "value", "disabled", "dir"] });
 
     applyMotionVars();
-    syncProgress();
+    syncInputAttributes();
     syncExternalCapture();
     input.addEventListener("input", onInput);
     input.addEventListener("change", onInput);
     input.addEventListener("pointerdown", onPointerDown);
-    input.addEventListener("pointermove", onPointerMove);
+    input.ownerDocument.addEventListener("reset", onFormReset, true);
     if (typeof window !== "undefined") {
-        window.addEventListener("pointermove", onPointerMove);
-        window.addEventListener("pointerup", onPointerUp);
-        window.addEventListener("pointercancel", onPointerUp);
-        window.addEventListener("blur", onPointerUp);
-        window.addEventListener("scroll", scheduleThumbRefresh, { passive: true });
+        window.addEventListener("scroll", onScroll, { capture: true, passive: true });
     }
 
     return {
@@ -484,7 +711,44 @@ export function createGlassSlider(
         get engine() {
             return thumbGlass.engine;
         },
-        update(nextOptions: Partial<LiquidGlassOptions>) {
+        get value() {
+            return readNumericInputValue(input);
+        },
+        setValue(value: number, animate = true) {
+            if (sliderDestroyed || !Number.isFinite(value)) return;
+            input.value = String(value);
+            syncProgress();
+            if (!animate || isMotionReduced()) {
+                visualProgress = targetProgress;
+                visualVelocity = 0;
+                stopMotionLoop();
+                applyMotionVars();
+                paintCompositeScene();
+                thumbGlass.refresh();
+            }
+            const nextValue = readNumericInputValue(input);
+            lastEmittedValue = nextValue;
+            lastEventWasInput = false;
+            onChangeCallback?.(nextValue, input);
+        },
+        update(nextOptions: Partial<LiquidGlassSliderOptions>) {
+            if (sliderDestroyed) return;
+            if ("onChange" in nextOptions) {
+                onChangeCallback = nextOptions.onChange;
+            }
+            if ("onEngineChange" in nextOptions) {
+                onEngineChangeCallback = nextOptions.onEngineChange;
+            }
+            if ("orientation" in nextOptions) {
+                const nextOrientation: GlassOrientation =
+                    nextOptions.orientation === "vertical" ? "vertical" : "horizontal";
+                if (nextOrientation !== orientation) {
+                    onPointerUp();
+                    orientation = nextOrientation;
+                    syncOrientationAttr();
+                    applyMotionVars();
+                }
+            }
             const prevRequestedScene = requestedSceneElement;
             if ("sceneElement" in nextOptions) {
                 requestedSceneElement = nextOptions.sceneElement ?? null;
@@ -508,10 +772,10 @@ export function createGlassSlider(
             }
 
             const useComposite = needsCompositeScene();
+            const thumbPatch = stripSliderOwnOptions(nextOptions);
             thumbGlass.update({
                 pill: true,
-                blur: 0,
-                ...nextOptions,
+                ...thumbPatch,
                 interactive: false,
                 sceneElement: useComposite ? wrapper : (requestedSceneElement ?? wrapper),
                 sceneCanvas: useComposite ? ensureCompositeCanvas() : null,
@@ -520,6 +784,7 @@ export function createGlassSlider(
             syncExternalCapture();
         },
         refresh() {
+            if (sliderDestroyed) return;
             syncProgress();
             if (thumbGlass.engine === "webgl" && needsCompositeScene()) {
                 externalCapture?.scheduleCapture();
@@ -527,7 +792,12 @@ export function createGlassSlider(
             }
             thumbGlass.refresh();
         },
+        setLightTilt(horizontal: number, vertical: number) {
+            if (sliderDestroyed) return;
+            thumbGlass.setLightTilt?.(horizontal, vertical);
+        },
         setSceneCanvas(canvas: HTMLCanvasElement | null, sceneElement?: HTMLElement | null) {
+            if (sliderDestroyed) return;
             requestedSceneCanvas = canvas;
             if (sceneElement !== undefined) {
                 requestedSceneElement = sceneElement ?? null;
@@ -540,35 +810,41 @@ export function createGlassSlider(
             syncExternalCapture();
         },
         destroy() {
+            if (sliderDestroyed) return;
             sliderDestroyed = true;
-            if (dragRefreshRaf !== null && typeof cancelAnimationFrame === "function") {
-                cancelAnimationFrame(dragRefreshRaf);
-                dragRefreshRaf = null;
+            if (thumbRefreshRaf !== null && typeof cancelAnimationFrame === "function") {
+                cancelAnimationFrame(thumbRefreshRaf);
+                thumbRefreshRaf = null;
             }
             stopMotionLoop();
             detachExternalCapture();
-            wrapperResizeObserver?.disconnect();
+            unobserveWrapperResize();
+            inputObserver?.disconnect();
             input.removeEventListener("input", onInput);
             input.removeEventListener("change", onInput);
             input.removeEventListener("pointerdown", onPointerDown);
-            input.removeEventListener("pointermove", onPointerMove);
+            input.ownerDocument.removeEventListener("reset", onFormReset, true);
             activePointerId = null;
+            detachDragWindowListeners();
             if (typeof window !== "undefined") {
-                window.removeEventListener("pointermove", onPointerMove);
-                window.removeEventListener("pointerup", onPointerUp);
-                window.removeEventListener("pointercancel", onPointerUp);
-                window.removeEventListener("blur", onPointerUp);
-                window.removeEventListener("scroll", scheduleThumbRefresh);
+                window.removeEventListener("scroll", onScroll, true);
             }
 
             thumbGlass.destroy();
+            compositeRange?.collapse(true);
+            if (compositeCanvas) {
+                compositeCanvas.width = 0;
+                compositeCanvas.height = 0;
+                compositeCanvas = null;
+            }
             thumb.style.removeProperty("--lg-press-glow");
-            input.classList.remove("lg-slider-native");
+            wrapper.classList.remove("is-active", "is-disabled");
+            wrapper.removeAttribute("data-lg-slider-orientation");
+            restoreAriaOrientation();
+            if (!hadNativeClass) input.classList.remove("lg-slider-native");
 
             if (wrapper.parentNode) {
-                if (nextSibling && nextSibling.parentNode === wrapper.parentNode) {
-                    wrapper.parentNode.insertBefore(input, nextSibling);
-                } else {
+                if (input.parentNode === wrapper) {
                     wrapper.parentNode.insertBefore(input, wrapper);
                 }
                 wrapper.remove();

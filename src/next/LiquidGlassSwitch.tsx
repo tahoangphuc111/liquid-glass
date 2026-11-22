@@ -36,15 +36,19 @@ export type NextLiquidGlassSwitchProps<ElementTag extends ElementType = "nav"> =
         >;
 
 function normalizePathname(rawPath: string): string {
-    let cleanPath = rawPath.split(/[?#]/, 1)[0] ?? "/";
+    const trimmed = rawPath.trim();
+    if (trimmed.startsWith("?") || trimmed.startsWith("#")) {
+        return "";
+    }
+    let cleanPath = trimmed.split(/[?#]/, 1)[0] ?? "/";
     try {
         if (cleanPath.includes("://")) {
             cleanPath = new URL(cleanPath).pathname;
         }
     } catch {
-        // fallback
     }
-    const withLeadingSlash = cleanPath.startsWith("/") ? cleanPath : `/${cleanPath}`;
+    const collapsed = cleanPath.replace(/\/{2,}/g, "/");
+    const withLeadingSlash = collapsed.startsWith("/") ? collapsed : `/${collapsed}`;
     if (withLeadingSlash.length > 1 && withLeadingSlash.endsWith("/")) {
         return withLeadingSlash.replace(/\/+$/, "");
     }
@@ -53,34 +57,67 @@ function normalizePathname(rawPath: string): string {
 
 const historyListeners = new Set<() => void>();
 let historyPatched = false;
+let originalPushState: History["pushState"] | null = null;
+let originalReplaceState: History["replaceState"] | null = null;
+let patchedPushState: History["pushState"] | null = null;
+let patchedReplaceState: History["replaceState"] | null = null;
+let historyNotificationQueued = false;
+
+function notifyHistoryListenersDeferred(): void {
+    if (historyNotificationQueued || historyListeners.size === 0) return;
+    historyNotificationQueued = true;
+    const flush = () => {
+        historyNotificationQueued = false;
+        historyListeners.forEach((listener) => {
+            try {
+                listener();
+            } catch {
+            }
+        });
+    };
+    if (typeof queueMicrotask === "function") {
+        queueMicrotask(flush);
+    } else {
+        void Promise.resolve().then(flush);
+    }
+}
 
 function ensureHistoryPatched(): void {
     if (historyPatched || typeof window === "undefined" || !window.history) return;
     historyPatched = true;
-    const originalPushState = window.history.pushState;
-    const originalReplaceState = window.history.replaceState;
-    window.history.pushState = function (...args) {
-        const result = originalPushState.apply(this, args);
-        historyListeners.forEach((listener) => {
-            try {
-                listener();
-            } catch {
-                // ignore
-            }
-        });
+    originalPushState = window.history.pushState;
+    originalReplaceState = window.history.replaceState;
+    const nativePushState = originalPushState;
+    const nativeReplaceState = originalReplaceState;
+    patchedPushState = function (this: History, ...args) {
+        const result = nativePushState.apply(this, args);
+        notifyHistoryListenersDeferred();
         return result;
     };
-    window.history.replaceState = function (...args) {
-        const result = originalReplaceState.apply(this, args);
-        historyListeners.forEach((listener) => {
-            try {
-                listener();
-            } catch {
-                // ignore
-            }
-        });
+    patchedReplaceState = function (this: History, ...args) {
+        const result = nativeReplaceState.apply(this, args);
+        notifyHistoryListenersDeferred();
         return result;
     };
+    window.history.pushState = patchedPushState;
+    window.history.replaceState = patchedReplaceState;
+}
+
+function restoreHistoryIfUnused(): void {
+    if (!historyPatched || historyListeners.size > 0 || typeof window === "undefined" || !window.history) {
+        return;
+    }
+    if (originalPushState && window.history.pushState === patchedPushState) {
+        window.history.pushState = originalPushState;
+    }
+    if (originalReplaceState && window.history.replaceState === patchedReplaceState) {
+        window.history.replaceState = originalReplaceState;
+    }
+    originalPushState = null;
+    originalReplaceState = null;
+    patchedPushState = null;
+    patchedReplaceState = null;
+    historyPatched = false;
 }
 
 export function resolveSwitchValueForPathname(
@@ -92,38 +129,39 @@ export function resolveSwitchValueForPathname(
     }
 
     const normalizedCurrent = normalizePathname(pathname);
+    if (!normalizedCurrent) {
+        return undefined;
+    }
+
+    let bestPrefixValue: string | undefined;
+    let bestPrefixLength = -1;
 
     for (const item of items) {
         if (!item.href) {
             continue;
         }
         const normalizedHref = normalizePathname(item.href);
+        if (!normalizedHref) {
+            if (item.href === pathname) {
+                return item.value;
+            }
+            continue;
+        }
         if (normalizedHref === normalizedCurrent) {
             return item.value;
         }
-    }
-
-    let bestValue: string | undefined;
-    let bestLength = -1;
-
-    for (const item of items) {
-        if (!item.href || item.exact) {
-            continue;
-        }
-        const normalizedHref = normalizePathname(item.href);
-        if (normalizedHref === "/") {
-            continue;
-        }
         if (
+            !item.exact &&
+            normalizedHref !== "/" &&
             normalizedCurrent.startsWith(`${normalizedHref}/`) &&
-            normalizedHref.length > bestLength
+            normalizedHref.length > bestPrefixLength
         ) {
-            bestLength = normalizedHref.length;
-            bestValue = item.value;
+            bestPrefixLength = normalizedHref.length;
+            bestPrefixValue = item.value;
         }
     }
 
-    return bestValue;
+    return bestPrefixValue;
 }
 
 type NextLiquidGlassSwitchPolymorphicComponent = <ElementTag extends ElementType = "nav">(
@@ -144,18 +182,28 @@ const NextLiquidGlassSwitchImpl = forwardRef<
         className,
         value,
         defaultValue,
+        orientation,
         itemSelector,
         gliderElement,
+        trackOptions,
+        gliderOptions,
         onChange,
+        preset,
+        theme,
         surface,
         engine,
         thickness,
         bezel,
+        adaptiveRefraction,
+        refractionDirection,
+        refractionEdgeFade,
+        maxRefractionPx,
         scaleRatio,
         maxScaleMultiplier,
         blur,
         ior,
         radius,
+        cornerStyle,
         pill,
         hollow,
         alwaysOn,
@@ -163,10 +211,15 @@ const NextLiquidGlassSwitchImpl = forwardRef<
         tintColor,
         tintOpacity,
         highlight,
+        lightTilt,
         pixelRatio,
+        saturation,
         chromaticAberration,
+        abbeNumber,
         interactive,
         draggable,
+        dragBounds,
+        onDragChange,
         coalesce,
         sceneElement,
         sceneCanvas,
@@ -193,6 +246,7 @@ const NextLiquidGlassSwitchImpl = forwardRef<
         window.addEventListener("popstate", syncLocation);
         return () => {
             historyListeners.delete(syncLocation);
+            restoreHistoryIfUnused();
             window.removeEventListener("popstate", syncLocation);
         };
     }, [pathname]);
@@ -207,18 +261,28 @@ const NextLiquidGlassSwitchImpl = forwardRef<
     const { refresh } = useGlassSwitch(containerRef, {
         value: resolvedValue,
         defaultValue: defaultValue ?? items?.[0]?.value,
+        orientation,
         itemSelector,
         gliderElement,
+        trackOptions,
+        gliderOptions,
         onChange,
+        preset,
+        theme,
         surface,
         engine,
         thickness,
         bezel,
+        adaptiveRefraction,
+        refractionDirection,
+        refractionEdgeFade,
+        maxRefractionPx,
         scaleRatio,
         maxScaleMultiplier,
         blur,
         ior,
         radius,
+        cornerStyle,
         pill,
         hollow,
         alwaysOn,
@@ -226,10 +290,15 @@ const NextLiquidGlassSwitchImpl = forwardRef<
         tintColor,
         tintOpacity,
         highlight,
+        lightTilt,
         pixelRatio,
+        saturation,
         chromaticAberration,
+        abbeNumber,
         interactive,
         draggable,
+        dragBounds,
+        onDragChange,
         coalesce,
         sceneElement,
         sceneCanvas,

@@ -1,4 +1,9 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
+import {
+    computeMergedOptionPatch,
+    mergeGlassOptions,
+    serializeLightTiltKey,
+} from "../core/config.js";
 import { createGlassSwitch } from "../core/switch.js";
 import type {
     GlassEngine,
@@ -14,6 +19,7 @@ export interface UseGlassSwitchResult {
     setValue: (value: string, animate?: boolean) => void;
     setActiveIndex: (index: number, animate?: boolean) => void;
     refresh: () => void;
+    setLightTilt: (horizontal: number, vertical: number) => void;
 }
 
 export function useGlassSwitch(
@@ -22,78 +28,99 @@ export function useGlassSwitch(
 ): UseGlassSwitchResult {
     const context = useLiquidGlassContext();
     const instanceRef = useRef<LiquidGlassSwitchInstance | null>(null);
+    const prevMergedOptionsRef = useRef<LiquidGlassSwitchOptions | null>(null);
     const [engine, setEngine] = useState<GlassEngine>("css");
     const [value, setValueState] = useState<string>(
         options.value ?? options.defaultValue ?? "",
     );
     const [activeIndex, setActiveIndexState] = useState<number>(0);
 
-    const sceneCanvas = options.sceneCanvas ?? context?.sceneCanvas ?? null;
     const sceneElement = options.sceneElement ?? context?.sceneElement ?? null;
+    const sceneCanvas = options.sceneCanvas ?? (sceneElement ? null : context?.sceneCanvas) ?? null;
     const onChangeRef = useRef(options.onChange);
     onChangeRef.current = options.onChange;
     const onEngineChangeRef = useRef(options.onEngineChange);
     onEngineChangeRef.current = options.onEngineChange;
 
-    useEffect(() => {
-        if (options.engine === "webgl" && context && !context.sceneCanvas) {
-            context.requestSceneCapture();
-        }
-    }, [options.engine, context]);
+    const latestMergedOptionsRef = useRef<LiquidGlassSwitchOptions>({});
+    latestMergedOptionsRef.current = {
+        ...mergeGlassOptions(context?.defaults, options),
+        sceneCanvas,
+        sceneElement,
+        onChange: (nextValue, nextIndex, itemElement) => {
+            setValueState(nextValue);
+            setActiveIndexState(nextIndex);
+            onChangeRef.current?.(nextValue, nextIndex, itemElement);
+        },
+        onEngineChange: (nextEngine) => {
+            setEngine(nextEngine);
+            onEngineChangeRef.current?.(nextEngine);
+        },
+    };
 
-    useEffect(() => {
+    const syncTargetElement = useCallback(() => {
         const element = targetRef.current;
         if (!element) {
             instanceRef.current?.destroy();
             instanceRef.current = null;
+            prevMergedOptionsRef.current = null;
             return;
         }
-
-        const mergedOptions: LiquidGlassSwitchOptions = {
-            ...context?.defaults,
-            ...options,
-            sceneCanvas,
-            sceneElement,
-            onChange: (nextValue, nextIndex, itemElement) => {
-                setValueState(nextValue);
-                setActiveIndexState(nextIndex);
-                onChangeRef.current?.(nextValue, nextIndex, itemElement);
-            },
-            onEngineChange: (nextEngine) => {
-                setEngine(nextEngine);
-                onEngineChangeRef.current?.(nextEngine);
-            },
-        };
-
+        const mergedOptions = latestMergedOptionsRef.current;
         if (!instanceRef.current || instanceRef.current.element !== element) {
             instanceRef.current?.destroy();
             const instance = createGlassSwitch(element, mergedOptions);
             instanceRef.current = instance;
+            prevMergedOptionsRef.current = mergedOptions;
             setEngine(instance.engine);
             setValueState(instance.value);
             setActiveIndexState(instance.activeIndex);
         } else {
-            instanceRef.current.update(mergedOptions);
+            const patch = computeMergedOptionPatch(prevMergedOptionsRef.current, mergedOptions);
+            prevMergedOptionsRef.current = mergedOptions;
+            instanceRef.current.update(patch);
             setEngine(instanceRef.current.engine);
             setValueState(instanceRef.current.value);
             setActiveIndexState(instanceRef.current.activeIndex);
         }
+    }, [targetRef]);
+
+    useEffect(() => {
+        if ((options.engine ?? context?.defaults?.engine) === "webgl" && context && !context.sceneCanvas) {
+            context.requestSceneCapture();
+        }
+    }, [options.engine, context]);
+
+    const tiltKey = serializeLightTiltKey(options.lightTilt);
+
+    useEffect(() => {
+        syncTargetElement();
     }, [
-        targetRef,
+        syncTargetElement,
         context?.defaults,
         options.value,
         options.defaultValue,
+        options.orientation,
         options.itemSelector,
         options.gliderElement,
+        options.trackOptions,
+        options.gliderOptions,
+        options.preset,
+        options.theme,
         options.surface,
         options.engine,
         options.thickness,
         options.bezel,
+        options.adaptiveRefraction,
+        options.refractionDirection,
+        options.refractionEdgeFade,
+        options.maxRefractionPx,
         options.scaleRatio,
         options.maxScaleMultiplier,
         options.blur,
         options.ior,
         options.radius,
+        options.cornerStyle,
         options.pill,
         options.hollow,
         options.alwaysOn,
@@ -101,8 +128,11 @@ export function useGlassSwitch(
         options.tintColor,
         options.tintOpacity,
         options.highlight,
+        tiltKey,
         options.pixelRatio,
+        options.saturation,
         options.chromaticAberration,
+        options.abbeNumber,
         options.interactive,
         options.draggable,
         options.coalesce,
@@ -111,9 +141,18 @@ export function useGlassSwitch(
     ]);
 
     useEffect(() => {
+        const currentEl = targetRef.current;
+        const boundEl = instanceRef.current?.element ?? null;
+        if (currentEl !== boundEl) {
+            syncTargetElement();
+        }
+    });
+
+    useEffect(() => {
         return () => {
             instanceRef.current?.destroy();
             instanceRef.current = null;
+            prevMergedOptionsRef.current = null;
         };
     }, []);
 
@@ -141,6 +180,10 @@ export function useGlassSwitch(
         instanceRef.current?.refresh();
     }, []);
 
+    const setLightTilt = useCallback((horizontal: number, vertical: number) => {
+        instanceRef.current?.setLightTilt?.(horizontal, vertical);
+    }, []);
+
     return {
         engine,
         value,
@@ -148,5 +191,6 @@ export function useGlassSwitch(
         setValue,
         setActiveIndex,
         refresh,
+        setLightTilt,
     };
 }

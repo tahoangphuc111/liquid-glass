@@ -31,8 +31,56 @@ export interface CoalescenceParticipant {
 const MAX_PEERS_PER_ELEMENT = 4;
 const DEFAULT_INTERACTION_RANGE_PX = 42;
 const MAX_CANVAS_BLEED_PX = 24;
+const GRID_MIN_PARTICIPANTS = 16;
+const GRID_CELL_SIZE = 128;
+const COARSE_GRID_CELL_SIZE = 1024;
+const MAX_GRID_CELLS = 16;
+const MAX_QUERY_CELLS = 64;
+const EMPTY_PEERS: readonly CoalescencePeer[] = Object.freeze([]);
+export const EMPTY_COALESCENCE_SNAPSHOT: CoalescenceSnapshot = Object.freeze({
+    peers: EMPTY_PEERS,
+    interferenceIntensity: 0,
+    requiredBleedPx: 0,
+});
+
+function exceedsAxialRange(
+    leftA: number,
+    topA: number,
+    widthA: number,
+    heightA: number,
+    leftB: number,
+    topB: number,
+    widthB: number,
+    heightB: number,
+    maxRange: number,
+): boolean {
+    return (
+        leftB > leftA + widthA + maxRange ||
+        leftA > leftB + widthB + maxRange ||
+        topB > topA + heightA + maxRange ||
+        topA > topB + heightB + maxRange
+    );
+}
+
+function ensureNodeBounds(node: InternalNodeState): boolean {
+    if (node.width >= 2 && node.height >= 2) return true;
+    if (node.boundsProbed) return false;
+    node.boundsProbed = true;
+    const bounds = node.participant.readBounds();
+    if (!bounds) return false;
+    node.left = bounds.left;
+    node.top = bounds.top;
+    node.width = bounds.width;
+    node.height = bounds.height;
+    node.radius = bounds.radius;
+    node.bezel = bounds.bezel;
+    if (node.width < 2 || node.height < 2) return false;
+    spatialGrid?.update(node);
+    return true;
+}
 
 let nextParticipantOrder = 1;
+let currentNotifyEpoch = 0;
 
 interface InternalNodeState {
     readonly order: number;
@@ -43,10 +91,259 @@ interface InternalNodeState {
     height: number;
     radius: number;
     bezel: number;
-    lastPeerCount: number;
+    boundsProbed: boolean;
+    gridLevel: 0 | 1 | 2;
+    gridFirstX: number;
+    gridFirstY: number;
+    gridLastX: number;
+    gridLastY: number;
+    selectedPeers: InternalNodeState[] | null;
+    dependents: Set<InternalNodeState> | null;
+    lastNotifyEpoch: number;
 }
 
 const participantNodes = new Map<HTMLElement, InternalNodeState>();
+
+function fitsGridCoords(
+    firstX: number,
+    firstY: number,
+    lastX: number,
+    lastY: number,
+    limit: number,
+): boolean {
+    return (
+        Number.isSafeInteger(firstX) &&
+        Number.isSafeInteger(firstY) &&
+        Number.isSafeInteger(lastX) &&
+        Number.isSafeInteger(lastY) &&
+        (lastX - firstX + 1) * (lastY - firstY + 1) <= limit
+    );
+}
+
+class SpatialHashLevel {
+    private readonly rows = new Map<number, Map<number, Set<InternalNodeState>>>();
+
+    constructor(
+        readonly levelId: 1 | 2,
+        readonly cellSize: number,
+        readonly maxCells: number,
+    ) {}
+
+    insertCoords(
+        node: InternalNodeState,
+        firstX: number,
+        firstY: number,
+        lastX: number,
+        lastY: number,
+    ): void {
+        if (
+            node.gridLevel === this.levelId &&
+            node.gridFirstX === firstX &&
+            node.gridFirstY === firstY &&
+            node.gridLastX === lastX &&
+            node.gridLastY === lastY
+        ) {
+            return;
+        }
+        this.remove(node);
+        node.gridLevel = this.levelId;
+        node.gridFirstX = firstX;
+        node.gridFirstY = firstY;
+        node.gridLastX = lastX;
+        node.gridLastY = lastY;
+        for (let y = firstY; y <= lastY; y += 1) {
+            let row = this.rows.get(y);
+            if (!row) {
+                row = new Map();
+                this.rows.set(y, row);
+            }
+            for (let x = firstX; x <= lastX; x += 1) {
+                let cell = row.get(x);
+                if (!cell) {
+                    cell = new Set();
+                    row.set(x, cell);
+                }
+                cell.add(node);
+            }
+        }
+    }
+
+    remove(node: InternalNodeState): void {
+        if (node.gridLevel !== this.levelId) return;
+        const { gridFirstX, gridFirstY, gridLastX, gridLastY } = node;
+        node.gridLevel = 0;
+        for (let y = gridFirstY; y <= gridLastY; y += 1) {
+            const row = this.rows.get(y);
+            if (!row) continue;
+            for (let x = gridFirstX; x <= gridLastX; x += 1) {
+                const cell = row.get(x);
+                if (!cell) continue;
+                cell.delete(node);
+                if (cell.size === 0) row.delete(x);
+            }
+            if (row.size === 0) this.rows.delete(y);
+        }
+    }
+
+    forEachInBounds(
+        firstX: number,
+        firstY: number,
+        lastX: number,
+        lastY: number,
+        visit: (node: InternalNodeState) => void,
+    ): void {
+        for (let y = firstY; y <= lastY; y += 1) {
+            const row = this.rows.get(y);
+            if (!row) continue;
+            for (let x = firstX; x <= lastX; x += 1) {
+                const cell = row.get(x);
+                if (!cell) continue;
+                for (const node of cell) {
+                    if (
+                        x === (firstX > node.gridFirstX ? firstX : node.gridFirstX) &&
+                        y === (firstY > node.gridFirstY ? firstY : node.gridFirstY)
+                    ) {
+                        visit(node);
+                    }
+                }
+            }
+        }
+    }
+}
+
+class CoalescenceGrid {
+    private readonly fine = new SpatialHashLevel(1, GRID_CELL_SIZE, MAX_GRID_CELLS);
+    private readonly coarse = new SpatialHashLevel(2, COARSE_GRID_CELL_SIZE, MAX_GRID_CELLS);
+    private readonly oversized = new Set<InternalNodeState>();
+    private readonly unread = new Set<InternalNodeState>();
+
+    update(node: InternalNodeState): void {
+        if (node.width < 2 || node.height < 2) {
+            this.remove(node);
+            if (!node.boundsProbed) {
+                this.unread.add(node);
+            }
+            return;
+        }
+        const left = node.left;
+        const top = node.top;
+        const right = left + node.width;
+        const bottom = top + node.height;
+
+        const fineFirstX = Math.floor(left / GRID_CELL_SIZE);
+        const fineFirstY = Math.floor(top / GRID_CELL_SIZE);
+        const fineLastX = Math.floor(right / GRID_CELL_SIZE);
+        const fineLastY = Math.floor(bottom / GRID_CELL_SIZE);
+        if (fitsGridCoords(fineFirstX, fineFirstY, fineLastX, fineLastY, MAX_GRID_CELLS)) {
+            if (node.gridLevel === 2) this.coarse.remove(node);
+            this.fine.insertCoords(node, fineFirstX, fineFirstY, fineLastX, fineLastY);
+            this.unread.delete(node);
+            this.oversized.delete(node);
+            return;
+        }
+
+        if (node.gridLevel === 1) this.fine.remove(node);
+        const coarseFirstX = Math.floor(left / COARSE_GRID_CELL_SIZE);
+        const coarseFirstY = Math.floor(top / COARSE_GRID_CELL_SIZE);
+        const coarseLastX = Math.floor(right / COARSE_GRID_CELL_SIZE);
+        const coarseLastY = Math.floor(bottom / COARSE_GRID_CELL_SIZE);
+        if (fitsGridCoords(coarseFirstX, coarseFirstY, coarseLastX, coarseLastY, MAX_GRID_CELLS)) {
+            this.coarse.insertCoords(node, coarseFirstX, coarseFirstY, coarseLastX, coarseLastY);
+            this.unread.delete(node);
+            this.oversized.delete(node);
+            return;
+        }
+
+        this.remove(node);
+        this.oversized.add(node);
+    }
+
+    remove(node: InternalNodeState): void {
+        this.unread.delete(node);
+        this.oversized.delete(node);
+        if (node.gridLevel === 1) this.fine.remove(node);
+        else if (node.gridLevel === 2) this.coarse.remove(node);
+    }
+
+    forEachInBounds(
+        fineFirstX: number,
+        fineFirstY: number,
+        fineLastX: number,
+        fineLastY: number,
+        left: number,
+        top: number,
+        right: number,
+        bottom: number,
+        visit: (node: InternalNodeState) => void,
+    ): void {
+        if (this.unread.size > 0) {
+            for (const node of [...this.unread]) {
+                this.unread.delete(node);
+                ensureNodeBounds(node);
+            }
+        }
+
+        for (const node of this.oversized) {
+            visit(node);
+        }
+        this.coarse.forEachInBounds(
+            Math.floor(left / COARSE_GRID_CELL_SIZE),
+            Math.floor(top / COARSE_GRID_CELL_SIZE),
+            Math.floor(right / COARSE_GRID_CELL_SIZE),
+            Math.floor(bottom / COARSE_GRID_CELL_SIZE),
+            visit,
+        );
+        this.fine.forEachInBounds(fineFirstX, fineFirstY, fineLastX, fineLastY, visit);
+    }
+}
+
+let spatialGrid: CoalescenceGrid | null = null;
+
+function ensureSpatialGrid(): CoalescenceGrid {
+    if (!spatialGrid) {
+        spatialGrid = new CoalescenceGrid();
+        for (const node of participantNodes.values()) spatialGrid.update(node);
+    }
+    return spatialGrid;
+}
+
+function visitCandidates(
+    left: number,
+    top: number,
+    right: number,
+    bottom: number,
+    visit: (node: InternalNodeState) => void,
+): void {
+    if (participantNodes.size < GRID_MIN_PARTICIPANTS) {
+        for (const node of participantNodes.values()) visit(node);
+        return;
+    }
+    const firstX = Math.floor(left / GRID_CELL_SIZE);
+    const firstY = Math.floor(top / GRID_CELL_SIZE);
+    const lastX = Math.floor(right / GRID_CELL_SIZE);
+    const lastY = Math.floor(bottom / GRID_CELL_SIZE);
+    if (!fitsGridCoords(firstX, firstY, lastX, lastY, MAX_QUERY_CELLS)) {
+        for (const node of participantNodes.values()) visit(node);
+        return;
+    }
+    ensureSpatialGrid().forEachInBounds(firstX, firstY, lastX, lastY, left, top, right, bottom, visit);
+}
+
+function updateSelectedPeers(node: InternalNodeState, peers: InternalNodeState[] | null): void {
+    if (node.selectedPeers) {
+        for (const peer of node.selectedPeers) {
+            if (peers?.includes(peer)) continue;
+            peer.dependents?.delete(node);
+            if (peer.dependents?.size === 0) peer.dependents = null;
+        }
+    }
+    if (peers) {
+        for (const peer of peers) {
+            (peer.dependents ??= new Set()).add(node);
+        }
+    }
+    node.selectedPeers = peers;
+}
 let lastWaveClockMs = 0;
 let accumulatedWavePhase = 0;
 
@@ -58,53 +355,88 @@ function advanceWavePhase(motionImpulse: number): number {
     return accumulatedWavePhase;
 }
 
-function measureRectGap(
+function isWithinRoundedGap(
     selfLeft: number,
     selfTop: number,
     selfWidth: number,
     selfHeight: number,
+    selfRadius: number,
     peerLeft: number,
     peerTop: number,
     peerWidth: number,
     peerHeight: number,
-): number {
-    const gapHorizontal = Math.max(0, peerLeft - (selfLeft + selfWidth), selfLeft - (peerLeft + peerWidth));
-    const gapVertical = Math.max(0, peerTop - (selfTop + selfHeight), selfTop - (peerTop + peerHeight));
-    return Math.hypot(gapHorizontal, gapVertical);
+    peerRadius: number,
+    maxGap: number,
+): boolean {
+    const selfHalfW = selfWidth * 0.5;
+    const selfHalfH = selfHeight * 0.5;
+    const peerHalfW = peerWidth * 0.5;
+    const peerHalfH = peerHeight * 0.5;
+    const safeSelfRadius = Math.max(0, Math.min(selfRadius, selfHalfW, selfHalfH));
+    const safePeerRadius = Math.max(0, Math.min(peerRadius, peerHalfW, peerHalfH));
+
+    const selfCenterX = selfLeft + selfHalfW;
+    const selfCenterY = selfTop + selfHalfH;
+    const peerCenterX = peerLeft + peerHalfW;
+    const peerCenterY = peerTop + peerHalfH;
+
+    const coreDeltaX = Math.max(
+        0,
+        Math.abs(peerCenterX - selfCenterX) - (selfHalfW - safeSelfRadius) - (peerHalfW - safePeerRadius),
+    );
+    const coreDeltaY = Math.max(
+        0,
+        Math.abs(peerCenterY - selfCenterY) - (selfHalfH - safeSelfRadius) - (peerHalfH - safePeerRadius),
+    );
+    const maxCoreDist = maxGap + safeSelfRadius + safePeerRadius;
+    return coreDeltaX * coreDeltaX + coreDeltaY * coreDeltaY <= maxCoreDist * maxCoreDist;
 }
 
 export function registerCoalescenceParticipant(participant: CoalescenceParticipant): () => void {
-    const existing = participantNodes.get(participant.element);
-    if (!existing) {
-        participantNodes.set(participant.element, {
-            order: nextParticipantOrder++,
-            participant,
-            left: 0,
-            top: 0,
-            width: 0,
-            height: 0,
-            radius: 18,
-            bezel: 14,
-            lastPeerCount: 0,
-        });
+    const node: InternalNodeState = {
+        order: nextParticipantOrder++,
+        participant,
+        left: 0,
+        top: 0,
+        width: 0,
+        height: 0,
+        radius: 18,
+        bezel: 14,
+        boundsProbed: false,
+        gridLevel: 0,
+        gridFirstX: 0,
+        gridFirstY: 0,
+        gridLastX: 0,
+        gridLastY: 0,
+        selectedPeers: null,
+        dependents: null,
+        lastNotifyEpoch: 0,
+    };
+    if (!participantNodes.has(participant.element)) {
+        participantNodes.set(participant.element, node);
+        spatialGrid?.update(node);
     }
 
     return () => {
-        const node = participantNodes.get(participant.element);
-        if (!node) return;
+        if (participantNodes.get(participant.element) !== node) return;
         participantNodes.delete(participant.element);
-        let hadAnyActivePeers = node.lastPeerCount > 0;
-        if (!hadAnyActivePeers) {
-            for (const other of participantNodes.values()) {
-                if (other.lastPeerCount > 0) {
-                    hadAnyActivePeers = true;
-                    break;
-                }
+        spatialGrid?.remove(node);
+        if (participantNodes.size < GRID_MIN_PARTICIPANTS && spatialGrid !== null) {
+            for (const remaining of participantNodes.values()) {
+                remaining.gridLevel = 0;
             }
+            spatialGrid = null;
         }
-        if (hadAnyActivePeers) {
-            for (const other of participantNodes.values()) {
-                other.participant.notifyPeerUpdate();
+        updateSelectedPeers(node, null);
+        const dependents = node.dependents;
+        node.dependents = null;
+        if (dependents) {
+            for (const dependent of dependents) {
+                if (dependent.selectedPeers) {
+                    const remainingPeers = dependent.selectedPeers.filter((peer) => peer !== node);
+                    dependent.selectedPeers = remainingPeers.length > 0 ? remainingPeers : null;
+                }
+                dependent.participant.notifyPeerUpdate();
             }
         }
     };
@@ -128,12 +460,17 @@ export function syncCoalescenceGeometry(
     const prevTop = node.top;
     const prevWidth = node.width;
     const prevHeight = node.height;
+    const prevRadius = node.radius;
+    const opticalChanged = radius !== prevRadius || bezel !== node.bezel;
+    const boundsChanged = left !== prevLeft || top !== prevTop || width !== prevWidth || height !== prevHeight;
     node.left = left;
     node.top = top;
     node.width = width;
     node.height = height;
     node.radius = radius;
     node.bezel = bezel;
+    node.boundsProbed = true;
+    if (boundsChanged) spatialGrid?.update(node);
 
     if (!notifyPeers || participantNodes.size < 2) return;
 
@@ -142,137 +479,245 @@ export function syncCoalescenceGeometry(
         Math.abs(top - prevTop) > 0.25 ||
         Math.abs(width - prevWidth) > 0.5 ||
         Math.abs(height - prevHeight) > 0.5;
-    if (!moved && motionImpulse <= 0) return;
+    if (!moved && !opticalChanged && motionImpulse <= 0) return;
 
     advanceWavePhase(motionImpulse);
 
-    for (const candidate of participantNodes.values()) {
-        if (candidate.participant.element === element) continue;
-        if (
-            element.contains(candidate.participant.element) ||
-            candidate.participant.element.contains(element)
-        ) {
-            continue;
-        }
-        if (candidate.width < 2 || candidate.height < 2) {
-            const bounds = candidate.participant.readBounds();
-            if (!bounds) continue;
-            candidate.left = bounds.left;
-            candidate.top = bounds.top;
-            candidate.width = bounds.width;
-            candidate.height = bounds.height;
-            candidate.radius = bounds.radius;
-            candidate.bezel = bounds.bezel;
-        }
-        const prevGap = measureRectGap(
-            prevLeft,
-            prevTop,
-            prevWidth,
-            prevHeight,
-            candidate.left,
-            candidate.top,
-            candidate.width,
-            candidate.height,
-        );
-        const currGap = measureRectGap(
-            left,
-            top,
-            width,
-            height,
-            candidate.left,
-            candidate.top,
-            candidate.width,
-            candidate.height,
-        );
-        if (
-            prevGap <= DEFAULT_INTERACTION_RANGE_PX + 8 ||
-            currGap <= DEFAULT_INTERACTION_RANGE_PX + 8 ||
-            candidate.lastPeerCount > 0
-        ) {
-            candidate.participant.notifyPeerUpdate();
+    const hasPrevBounds = prevWidth >= 2 && prevHeight >= 2;
+    const unionLeft = hasPrevBounds ? Math.min(prevLeft, left) : left;
+    const unionTop = hasPrevBounds ? Math.min(prevTop, top) : top;
+    const unionRight = hasPrevBounds ? Math.max(prevLeft + prevWidth, left + width) : left + width;
+    const unionBottom = hasPrevBounds ? Math.max(prevTop + prevHeight, top + height) : top + height;
+    const notifyRange = DEFAULT_INTERACTION_RANGE_PX + 8;
+
+    const epoch = ++currentNotifyEpoch;
+    node.lastNotifyEpoch = epoch;
+    const toNotify: InternalNodeState[] = [];
+    if (node.dependents) {
+        for (const dependent of node.dependents) {
+            dependent.lastNotifyEpoch = epoch;
+            toNotify.push(dependent);
         }
     }
+
+    const unionWidth = unionRight - unionLeft;
+    const unionHeight = unionBottom - unionTop;
+    const inspectCandidate = (candidate: InternalNodeState): void => {
+        if (candidate.lastNotifyEpoch === epoch || !ensureNodeBounds(candidate)) return;
+        candidate.lastNotifyEpoch = epoch;
+        if (exceedsAxialRange(
+            unionLeft, unionTop, unionWidth, unionHeight,
+            candidate.left, candidate.top, candidate.width, candidate.height, notifyRange,
+        )) return;
+        if (element.contains(candidate.participant.element) || candidate.participant.element.contains(element)) return;
+
+        if (
+            isWithinRoundedGap(
+                left, top, width, height, radius,
+                candidate.left, candidate.top, candidate.width, candidate.height, candidate.radius,
+                notifyRange,
+            ) ||
+            (hasPrevBounds && isWithinRoundedGap(
+                prevLeft, prevTop, prevWidth, prevHeight, prevRadius,
+                candidate.left, candidate.top, candidate.width, candidate.height, candidate.radius,
+                notifyRange,
+            ))
+        ) {
+            toNotify.push(candidate);
+        }
+    };
+
+    if (
+        participantNodes.size >= GRID_MIN_PARTICIPANTS &&
+        hasPrevBounds &&
+        exceedsAxialRange(
+            left, top, width, height, prevLeft, prevTop, prevWidth, prevHeight, notifyRange * 2,
+        )
+    ) {
+        const oldLeft = prevLeft - notifyRange;
+        const oldTop = prevTop - notifyRange;
+        const oldRight = prevLeft + prevWidth + notifyRange;
+        const oldBottom = prevTop + prevHeight + notifyRange;
+        const newLeft = left - notifyRange;
+        const newTop = top - notifyRange;
+        const newRight = left + width + notifyRange;
+        const newBottom = top + height + notifyRange;
+        const oldFirstX = Math.floor(oldLeft / GRID_CELL_SIZE);
+        const oldFirstY = Math.floor(oldTop / GRID_CELL_SIZE);
+        const oldLastX = Math.floor(oldRight / GRID_CELL_SIZE);
+        const oldLastY = Math.floor(oldBottom / GRID_CELL_SIZE);
+        const newFirstX = Math.floor(newLeft / GRID_CELL_SIZE);
+        const newFirstY = Math.floor(newTop / GRID_CELL_SIZE);
+        const newLastX = Math.floor(newRight / GRID_CELL_SIZE);
+        const newLastY = Math.floor(newBottom / GRID_CELL_SIZE);
+        if (
+            fitsGridCoords(oldFirstX, oldFirstY, oldLastX, oldLastY, MAX_QUERY_CELLS) &&
+            fitsGridCoords(newFirstX, newFirstY, newLastX, newLastY, MAX_QUERY_CELLS)
+        ) {
+            const grid = ensureSpatialGrid();
+            grid.forEachInBounds(
+                oldFirstX, oldFirstY, oldLastX, oldLastY,
+                oldLeft, oldTop, oldRight, oldBottom, inspectCandidate,
+            );
+            grid.forEachInBounds(
+                newFirstX, newFirstY, newLastX, newLastY,
+                newLeft, newTop, newRight, newBottom, inspectCandidate,
+            );
+        } else {
+            for (const candidate of participantNodes.values()) inspectCandidate(candidate);
+        }
+    } else {
+        visitCandidates(
+            unionLeft - notifyRange, unionTop - notifyRange, unionRight + notifyRange, unionBottom + notifyRange,
+            inspectCandidate,
+        );
+    }
+
+    for (let idx = 0; idx < toNotify.length; idx += 1) {
+        toNotify[idx]!.participant.notifyPeerUpdate();
+    }
 }
+
+const scratchSelectedPeers: Array<InternalNodeState | null> = [null, null, null, null];
+const scratchSelectedGaps = new Float64Array(MAX_PEERS_PER_ELEMENT);
 
 export function collectCoalescenceSnapshot(element: HTMLElement): CoalescenceSnapshot {
     const selfNode = participantNodes.get(element);
     if (!selfNode || participantNodes.size < 2 || selfNode.width < 2 || selfNode.height < 2) {
-        if (selfNode) selfNode.lastPeerCount = 0;
-        return { peers: [], interferenceIntensity: 0, requiredBleedPx: 0 };
+        if (selfNode) updateSelectedPeers(selfNode, null);
+        return EMPTY_COALESCENCE_SNAPSHOT;
     }
 
-    const selfCenterX = selfNode.left + selfNode.width * 0.5;
-    const selfCenterY = selfNode.top + selfNode.height * 0.5;
-    const candidates: Array<{ peer: CoalescencePeer; gap: number }> = [];
-    let maxStrength = 0;
+    const range = DEFAULT_INTERACTION_RANGE_PX;
+    const selfLeft = selfNode.left;
+    const selfTop = selfNode.top;
+    const selfWidth = selfNode.width;
+    const selfHeight = selfNode.height;
+    const selfHalfW = selfWidth * 0.5;
+    const selfHalfH = selfHeight * 0.5;
+    const safeSelfRadius = Math.max(0, Math.min(selfNode.radius, selfHalfW, selfHalfH));
+    const selfInnerHalfW = selfHalfW - safeSelfRadius;
+    const selfInnerHalfH = selfHalfH - safeSelfRadius;
+    const selfCenterX = selfLeft + selfHalfW;
+    const selfCenterY = selfTop + selfHalfH;
 
-    for (const other of participantNodes.values()) {
-        if (other === selfNode) continue;
-        if (
-            element.contains(other.participant.element) ||
-            other.participant.element.contains(element)
-        ) {
-            continue;
-        }
-        if (other.width < 2 || other.height < 2) {
-            const bounds = other.participant.readBounds();
-            if (!bounds) continue;
-            other.left = bounds.left;
-            other.top = bounds.top;
-            other.width = bounds.width;
-            other.height = bounds.height;
-            other.radius = bounds.radius;
-            other.bezel = bounds.bezel;
-        }
-        const gap = measureRectGap(
-            selfNode.left,
-            selfNode.top,
-            selfNode.width,
-            selfNode.height,
-            other.left,
-            other.top,
-            other.width,
-            other.height,
+    let selectedCount = 0;
+    try {
+        visitCandidates(
+            selfLeft - range,
+            selfTop - range,
+            selfLeft + selfWidth + range,
+            selfTop + selfHeight + range,
+            (other) => {
+                if (other === selfNode || !ensureNodeBounds(other)) return;
+                if (exceedsAxialRange(
+                    selfLeft, selfTop, selfWidth, selfHeight,
+                    other.left, other.top, other.width, other.height, range,
+                )) return;
+
+                const peerHalfW = other.width * 0.5;
+                const peerHalfH = other.height * 0.5;
+                const safePeerRadius = Math.max(0, Math.min(other.radius, peerHalfW, peerHalfH));
+                const coreDeltaX = Math.max(
+                    0,
+                    Math.abs(other.left + peerHalfW - selfCenterX) - selfInnerHalfW - (peerHalfW - safePeerRadius),
+                );
+                const coreDeltaY = Math.max(
+                    0,
+                    Math.abs(other.top + peerHalfH - selfCenterY) - selfInnerHalfH - (peerHalfH - safePeerRadius),
+                );
+                const radiusSum = safeSelfRadius + safePeerRadius;
+                const cutoffGap =
+                    selectedCount === MAX_PEERS_PER_ELEMENT
+                        ? scratchSelectedGaps[MAX_PEERS_PER_ELEMENT - 1]!
+                        : range;
+                const maxCoreDist = cutoffGap + radiusSum;
+                const coreDistSq = coreDeltaX * coreDeltaX + coreDeltaY * coreDeltaY;
+                if (coreDistSq > maxCoreDist * maxCoreDist * (1 + 1e-12)) return;
+                const gap = coreDistSq <= radiusSum * radiusSum ? 0 : Math.sqrt(coreDistSq) - radiusSum;
+                if (gap > range) return;
+
+                let insertAt = selectedCount;
+                while (insertAt > 0) {
+                    const previous = insertAt - 1;
+                    const previousGap = scratchSelectedGaps[previous]!;
+                    if (gap > previousGap || (gap === previousGap && other.order > scratchSelectedPeers[previous]!.order)) {
+                        break;
+                    }
+                    insertAt = previous;
+                }
+                if (insertAt === MAX_PEERS_PER_ELEMENT) return;
+                if (element.contains(other.participant.element) || other.participant.element.contains(element)) return;
+
+                const limit = Math.min(selectedCount, MAX_PEERS_PER_ELEMENT - 1);
+                for (let index = limit; index > insertAt; index -= 1) {
+                    scratchSelectedPeers[index] = scratchSelectedPeers[index - 1]!;
+                    scratchSelectedGaps[index] = scratchSelectedGaps[index - 1]!;
+                }
+                scratchSelectedPeers[insertAt] = other;
+                scratchSelectedGaps[insertAt] = gap;
+                if (selectedCount < MAX_PEERS_PER_ELEMENT) selectedCount += 1;
+            },
         );
-        if (gap > DEFAULT_INTERACTION_RANGE_PX) continue;
 
-        const minBezel = Math.max(8, Math.min(selfNode.bezel, other.bezel));
-        const mergeRadius = Math.min(40, Math.max(22, minBezel * 2.25));
-        const otherCenterX = other.left + other.width * 0.5;
-        const otherCenterY = other.top + other.height * 0.5;
-        const strength = Math.max(0, 1 - gap / DEFAULT_INTERACTION_RANGE_PX);
-        if (strength > maxStrength) maxStrength = strength;
+        if (selectedCount === 0) {
+            updateSelectedPeers(selfNode, null);
+            return EMPTY_COALESCENCE_SNAPSHOT;
+        }
 
-        candidates.push({
-            gap,
-            peer: {
-                relCenterX: otherCenterX - selfCenterX,
-                relCenterY: otherCenterY - selfCenterY,
-                halfWidth: other.width * 0.5,
-                halfHeight: other.height * 0.5,
-                radius: Math.min(other.radius, other.width * 0.5, other.height * 0.5),
-                mergeRadius,
+        const prevSelected = selfNode.selectedPeers;
+        let sameSelection = prevSelected !== null && prevSelected.length === selectedCount;
+        if (sameSelection && prevSelected) {
+            for (let idx = 0; idx < selectedCount; idx += 1) {
+                if (prevSelected[idx] !== scratchSelectedPeers[idx]) {
+                    sameSelection = false;
+                    break;
+                }
+            }
+        }
+        const selected = sameSelection ? null : new Array<InternalNodeState>(selectedCount);
+        const peers = new Array<CoalescencePeer>(selectedCount);
+        for (let idx = 0; idx < selectedCount; idx += 1) {
+            const other = scratchSelectedPeers[idx]!;
+            if (selected) selected[idx] = other;
+            const halfWidth = other.width * 0.5;
+            const halfHeight = other.height * 0.5;
+            const minBezel = Math.max(8, Math.min(selfNode.bezel, other.bezel));
+            peers[idx] = {
+                relCenterX: other.left + halfWidth - selfCenterX,
+                relCenterY: other.top + halfHeight - selfCenterY,
+                halfWidth,
+                halfHeight,
+                radius: Math.min(other.radius, halfWidth, halfHeight),
+                mergeRadius: Math.min(48, Math.max(28, minBezel * 2.85)),
                 wavePhase: accumulatedWavePhase + (other.order % 4) * 0.65,
                 priorityWinsTie: selfNode.order < other.order,
-            },
-        });
+            };
+        }
+        if (selected) {
+            updateSelectedPeers(selfNode, selected);
+        }
+
+        const normalizedGap = Math.min(1, Math.max(0, scratchSelectedGaps[0]! / range));
+        const quinticFalloff =
+            normalizedGap * normalizedGap * normalizedGap * (normalizedGap * (normalizedGap * 6 - 15) + 10);
+        const interferenceIntensity = 1 - quinticFalloff;
+        return {
+            peers,
+            interferenceIntensity,
+            requiredBleedPx: Math.min(MAX_CANVAS_BLEED_PX, Math.ceil(12 + interferenceIntensity * 12)),
+        };
+    } finally {
+        scratchSelectedPeers.fill(null);
     }
-
-    candidates.sort((first, second) => first.gap - second.gap);
-    const peers = candidates.slice(0, MAX_PEERS_PER_ELEMENT).map((entry) => entry.peer);
-    selfNode.lastPeerCount = peers.length;
-    const requiredBleedPx = peers.length > 0 ? Math.min(MAX_CANVAS_BLEED_PX, Math.ceil(12 + maxStrength * 12)) : 0;
-
-    return {
-        peers,
-        interferenceIntensity: maxStrength,
-        requiredBleedPx,
-    };
 }
 
 export function resetCoalescenceForTesting(): void {
     participantNodes.clear();
+    spatialGrid = null;
+    scratchSelectedPeers.fill(null);
     nextParticipantOrder = 1;
+    currentNotifyEpoch = 0;
     lastWaveClockMs = 0;
     accumulatedWavePhase = 0;
 }

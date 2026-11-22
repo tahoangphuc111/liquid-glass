@@ -9,11 +9,14 @@ import {
     pickMapScale,
     resolveChromaticAberration,
 } from "./config.js";
+import { getRefractionSpan, resolveRefractionBezel, resolveRefractionTravel } from "./refractionBounds.js";
 import type { GlassConfig, GlassSurface } from "./types.js";
 import {
     acquireCachedDisplacementBlobUrl,
     getWasmDisplacementBmp,
+    MAX_DISPLACEMENT_TEXELS,
     releaseCachedDisplacementBlobUrl,
+    setOnBlobUrlEvicted,
 } from "./wasm.js";
 
 export interface FilterArchetype {
@@ -23,7 +26,7 @@ export interface FilterArchetype {
     clampedBezel: number;
     blob: Blob;
     blobUrl: string | null;
-    scale: string;
+    scale: number;
     needsSeparateT1Filter: boolean;
     filterX: string;
     filterY: string;
@@ -32,6 +35,7 @@ export interface FilterArchetype {
     debugStr: string;
     decoded: boolean;
     preloadPromise: Promise<void> | null;
+    finishPreload?: (reuseImage: boolean) => void;
     refCount: number;
     evicted: boolean;
 }
@@ -72,6 +76,7 @@ export interface SharedFilterRecord {
     readyPromise: Promise<void> | null;
     preloadImage: HTMLImageElement | null;
     preloadTimerId: ReturnType<typeof setTimeout> | null;
+    finishPreload?: (reuseImage: boolean) => void;
     actualW: number;
     actualH: number;
     lastFeW: number;
@@ -105,13 +110,25 @@ let lruEvictionTimer: ReturnType<typeof setTimeout> | null = null;
 const MAX_LRU_FILTERS = 2;
 const LRU_IDLE_EVICT_MS = 5000;
 const MAX_FILTER_ARCHETYPES = 16;
+const MAX_POOLED_STD_FILTERS = 16;
+const MAX_POOLED_PRELOAD_IMAGES = 8;
 const RESOLVED_VOID_PROMISE = Promise.resolve();
+const SVG_BLUE_SHIFT = 1.35 * 1.28;
+
+const freeStdFilterPool: PooledFilterElement[] = [];
+const freePreloadImages: HTMLImageElement[] = [];
+
+export function clearFilterElementPools(): void {
+    freeStdFilterPool.length = 0;
+    freePreloadImages.length = 0;
+}
 
 let lastArchCfg1: GlassConfig | null = null;
 let lastArchW1 = 0;
 let lastArchH1 = 0;
 let lastArchRad1 = -1;
 let lastArchSurf1 = "";
+let lastArchCornerStyle1 = "";
 let lastArchScale1 = 0;
 let lastArchTier1 = -1;
 let lastArchVal1: FilterArchetype | null = null;
@@ -121,6 +138,7 @@ let lastArchW2 = 0;
 let lastArchH2 = 0;
 let lastArchRad2 = -1;
 let lastArchSurf2 = "";
+let lastArchCornerStyle2 = "";
 let lastArchScale2 = 0;
 let lastArchTier2 = -1;
 let lastArchVal2: FilterArchetype | null = null;
@@ -130,6 +148,8 @@ export function resetArchetypeHotSlots(): void {
     lastArchCfg2 = null;
     lastArchVal1 = null;
     lastArchVal2 = null;
+    lastArchCornerStyle1 = "";
+    lastArchCornerStyle2 = "";
 }
 
 const getNowMs = (): number =>
@@ -218,14 +238,15 @@ export function buildFilterElement(
     blurAmt: number | string,
     isT1 = false,
     dispSmooth = 0,
-    chromaticAberration: boolean | number = 0,
+    chromaticAberration?: boolean | number,
+    abbeNumber?: number,
 ): { filterNode: PooledFilterElement; feImage: PooledFeImageElement } {
     const numericBlur = typeof blurAmt === "string" ? parseFloat(blurAmt) : blurAmt;
-    const chromaAmount = resolveChromaticAberration(chromaticAberration);
+    const chromaAmount = resolveChromaticAberration(chromaticAberration, abbeNumber);
     const numericScale = parseFloat(scale) || 0;
     const chromaShift = chromaAmount * 1.35;
-    const scaleMinus = Math.max(0, numericScale * (1 - chromaShift));
-    const scalePlus = numericScale * (1 + chromaShift);
+    const scaleMinus = Math.max(0, numericScale * (1 - chromaShift * 0.72));
+    const scalePlus = numericScale * (1 + chromaAmount * SVG_BLUE_SHIFT);
     const useChromatic = chromaAmount > 0 && scalePlus - scaleMinus >= 0.25;
 
     const isStandard =
@@ -235,6 +256,48 @@ export function buildFilterElement(
         dispSmooth <= 0 &&
         (colorMatrix === GLASS_COLOR_MATRIX || !colorMatrix || USE_CSS_SATURATION);
     const hasMatrix = !USE_CSS_SATURATION && Boolean(colorMatrix);
+
+    if (isStandard && !hasMatrix && freeStdFilterPool.length > 0) {
+        const pooledFilter = freeStdFilterPool.pop()!;
+        const pooledFeImage = pooledFilter._feImage;
+        const pooledFeDisp = pooledFilter._feDisp;
+        if (pooledFeImage && pooledFeDisp) {
+            pooledFilter.id = id;
+            if (pooledFilter._lastX !== filterX) {
+                pooledFilter.setAttribute("x", filterX);
+                pooledFilter._lastX = filterX;
+            }
+            if (pooledFilter._lastY !== filterY) {
+                pooledFilter.setAttribute("y", filterY);
+                pooledFilter._lastY = filterY;
+            }
+            if (pooledFilter._lastW !== filterW) {
+                pooledFilter.setAttribute("width", filterW);
+                pooledFilter._lastW = filterW;
+            }
+            if (pooledFilter._lastH !== filterH) {
+                pooledFilter.setAttribute("height", filterH);
+                pooledFilter._lastH = filterH;
+            }
+            if (pooledFeImage._lastHref !== combinedUrl) {
+                pooledFeImage.setAttribute("href", combinedUrl);
+                pooledFeImage._lastHref = combinedUrl;
+            }
+            if (pooledFeImage._lastW !== width) {
+                pooledFeImage.setAttribute("width", String(width));
+                pooledFeImage._lastW = width;
+            }
+            if (pooledFeImage._lastH !== height) {
+                pooledFeImage.setAttribute("height", String(height));
+                pooledFeImage._lastH = height;
+            }
+            if (pooledFeDisp._lastScale !== scale) {
+                pooledFeDisp.setAttribute("scale", scale);
+                pooledFeDisp._lastScale = scale;
+            }
+            return { filterNode: pooledFilter, feImage: pooledFeImage };
+        }
+    }
 
     const filterNode = document.createElementNS(SVG_NS, "filter") as PooledFilterElement;
     filterNode.id = id;
@@ -286,29 +349,29 @@ export function buildFilterElement(
 
     if (useChromatic) {
         const suffix = isT1 ? "_t1" : "";
-        const coolDispId = `disp_cool${suffix}`;
         const warmDispId = `disp_warm${suffix}`;
-        const coolMixId = `cool_mix${suffix}`;
+        const coolDispId = `disp_cool${suffix}`;
         const warmMixId = `warm_mix${suffix}`;
+        const coolMixId = `cool_mix${suffix}`;
 
         filterNode.appendChild(
-            createDisplacementNode(dispMapIn, dispMapSource, scaleMinus.toFixed(2), coolDispId),
+            createDisplacementNode(dispMapIn, dispMapSource, scaleMinus.toFixed(2), warmDispId),
         );
         filterNode.appendChild(
-            createDisplacementNode(dispMapIn, dispMapSource, scalePlus.toFixed(2), warmDispId),
-        );
-        filterNode.appendChild(
-            createChannelMatrixNode(
-                coolDispId,
-                "0 0 0 0 0  0 0.5 0 0 0  0 0 1 0 0  0 0 0 1 0",
-                coolMixId,
-            ),
+            createDisplacementNode(dispMapIn, dispMapSource, scalePlus.toFixed(2), coolDispId),
         );
         filterNode.appendChild(
             createChannelMatrixNode(
                 warmDispId,
                 "1 0 0 0 0  0 0.5 0 0 0  0 0 0 0 0  0 0 0 1 0",
                 warmMixId,
+            ),
+        );
+        filterNode.appendChild(
+            createChannelMatrixNode(
+                coolDispId,
+                "0 0 0 0 0  0 0.5 0 0 0  0 0 1 0 0  0 0 0 1 0",
+                coolMixId,
             ),
         );
 
@@ -360,11 +423,14 @@ export function startMapPreload(
     if (record.ready) return RESOLVED_VOID_PROMISE;
     if (record.readyPromise) return record.readyPromise;
     if (archetype && archetype.preloadPromise) {
-        record.readyPromise = archetype.preloadPromise;
-        return archetype.preloadPromise;
+        record.readyPromise = archetype.preloadPromise.then(() => {
+            record.ready = true;
+        });
+        return record.readyPromise;
     }
 
-    if (typeof Image === "undefined" || !record.blobUrl) {
+    const blobUrl = record.blobUrl;
+    if (typeof Image === "undefined" || !blobUrl) {
         record.ready = true;
         if (archetype) {
             archetype.decoded = true;
@@ -374,17 +440,20 @@ export function startMapPreload(
         return RESOLVED_VOID_PROMISE;
     }
 
-    const img = new Image();
+    const img = freePreloadImages.pop() ?? new Image();
     img.decoding = "async";
     record.preloadImage = img;
-    img.src = record.blobUrl;
-
     const preloadPromise = new Promise<void>((resolve) => {
-        let timerId: ReturnType<typeof setTimeout> | null = null;
-        const settle = () => {
-            if (timerId !== null) {
-                clearTimeout(timerId);
-                timerId = null;
+        const finish = (reuseImage: boolean) => {
+            if (record.finishPreload !== finish && (!archetype || archetype.finishPreload !== finish)) return;
+            if (record.finishPreload === finish) record.finishPreload = undefined;
+            if (archetype && archetype.finishPreload === finish) archetype.finishPreload = undefined;
+            if (record.preloadTimerId !== null) clearTimeout(record.preloadTimerId);
+            img.onload = null;
+            img.onerror = null;
+            img.removeAttribute("src");
+            if (reuseImage && freePreloadImages.length < MAX_POOLED_PRELOAD_IMAGES) {
+                freePreloadImages.push(img);
             }
             record.preloadTimerId = null;
             record.ready = true;
@@ -393,14 +462,17 @@ export function startMapPreload(
             resolve();
         };
 
-        timerId = setTimeout(settle, MAP_PRELOAD_TIMEOUT_MS);
-        record.preloadTimerId = timerId;
-
+        const settle = () => finish(true);
+        record.finishPreload = finish;
+        if (archetype) archetype.finishPreload = finish;
+        record.preloadTimerId = setTimeout(settle, MAP_PRELOAD_TIMEOUT_MS);
         if (typeof img.decode === "function") {
+            img.src = blobUrl;
             img.decode().then(settle, settle);
         } else {
             img.onload = settle;
             img.onerror = settle;
+            img.src = blobUrl;
         }
     });
 
@@ -423,7 +495,6 @@ export function acquireSharedFilter(
         radius,
         surface,
         rasterScale,
-        halfMinDim,
         svgDefs,
     } = options;
 
@@ -432,8 +503,7 @@ export function acquireSharedFilter(
     const existingRecord = sharedFilters.get(sharedKey);
     if (existingRecord !== undefined) {
         if (
-            existingRecord.refCount >= 1 &&
-            (existingRecord.actualW !== actualW || existingRecord.actualH !== actualH)
+            existingRecord.actualW !== actualW || existingRecord.actualH !== actualH
         ) {
             const exactKey = `${sharedKey}_${actualW}x${actualH}`;
             return acquireSharedFilter(
@@ -458,7 +528,8 @@ export function acquireSharedFilter(
 
     const blurAmt = config.blur;
     const ior = config.ior;
-    const chromaAmount = resolveChromaticAberration(config.chromaticAberration);
+    const cornerStyle = config.cornerStyle === "squircle" ? "squircle" : "circular";
+    const chromaAmount = resolveChromaticAberration(config.chromaticAberration, config.abbeNumber);
     const effectiveArchTier = tier === 1 && chromaAmount > 0 ? 3 : tier;
     let archetype: FilterArchetype | null = null;
     if (
@@ -469,6 +540,7 @@ export function acquireSharedFilter(
         h === lastArchH1 &&
         radius === lastArchRad1 &&
         surface === lastArchSurf1 &&
+        cornerStyle === lastArchCornerStyle1 &&
         rasterScale === lastArchScale1 &&
         effectiveArchTier === lastArchTier1
     ) {
@@ -481,36 +553,19 @@ export function acquireSharedFilter(
         h === lastArchH2 &&
         radius === lastArchRad2 &&
         surface === lastArchSurf2 &&
+        cornerStyle === lastArchCornerStyle2 &&
         rasterScale === lastArchScale2 &&
         effectiveArchTier === lastArchTier2
     ) {
         archetype = lastArchVal2;
     } else {
-        const maxBezel = config.bezel;
-        const limitBezel = halfMinDim - 1;
-        const minBezel = maxBezel < limitBezel ? maxBezel : limitBezel;
-        const clampedBezel = minBezel > 1 ? minBezel : 1;
+        const isAxisX = config.axis === "x";
+        const bezelSpan = isAxisX ? w : Math.min(w, h);
+        const clampedBezel = resolveRefractionBezel(bezelSpan, config.bezel, config.adaptiveRefraction === true);
         const glassThickness = config.thickness;
         const scaleRatio = config.scaleRatio;
-        const isAxisX = config.axis === "x";
 
-        const archetypeKey = [
-            w,
-            h,
-            radius,
-            clampedBezel,
-            glassThickness,
-            scaleRatio,
-            config.maxScaleMultiplier,
-            ior.toFixed(2),
-            surface,
-            config.pill ? 1 : 0,
-            isAxisX ? 1 : 0,
-            blurAmt,
-            config.colorMatrix ?? "",
-            rasterScale,
-            effectiveArchTier,
-        ].join("|");
+        const archetypeKey = `${w}|${h}|${radius}|${clampedBezel}|${glassThickness}|${scaleRatio}|${config.maxScaleMultiplier}|${Math.fround(ior)}|${surface}|${cornerStyle}|${config.pill ? 1 : 0}|${isAxisX ? 1 : 0}|${config.refractionDirection}|${config.refractionEdgeFade}|${blurAmt}|${rasterScale}|${effectiveArchTier}`;
         archetype = filterArchetypeCache.get(archetypeKey) ?? null;
         if (archetype) {
             filterArchetypeCache.delete(archetypeKey);
@@ -519,40 +574,43 @@ export function acquireSharedFilter(
 
         if (!archetype) {
             const baseScale = pickMapScale(w, h, clampedBezel, radius, blurAmt, isAxisX);
+            const hidpiFitScale =
+                !isAxisX && radius > 0 && tier === 0
+                    ? Math.min(
+                          rasterScale,
+                          Math.sqrt(MAX_DISPLACEMENT_TEXELS / Math.max(1, w * h)),
+                      )
+                    : baseScale;
             const activeScale =
-                radius <= 2
+                radius <= 0
                     ? baseScale
                     : tier === 2 || (tier === 1 && chromaAmount > 0)
                       ? baseScale * 0.5 > MAP_MIN_SCALE
                           ? baseScale * 0.5
                           : MAP_MIN_SCALE
-                      : baseScale;
+                      : Math.max(baseScale, hidpiFitScale);
             let targetW: number;
             let targetH: number;
             let effectiveScale: number;
             if (isAxisX) {
                 targetH = 1;
-                const rawEvenW = 2 * ((w * activeScale * 0.5 + 0.5) | 0);
-                targetW = rawEvenW > 4 ? rawEvenW : 4;
+                targetW = Math.min(MAX_DISPLACEMENT_TEXELS, Math.max(4, Math.round(w * activeScale)));
                 effectiveScale = targetW / w;
             } else if (w >= h) {
-                const rawEvenH = 2 * ((h * activeScale * 0.5 + 0.5) | 0);
-                targetH = rawEvenH > 2 ? rawEvenH : 2;
+                targetH = Math.max(2, Math.round(h * activeScale));
                 effectiveScale = targetH / h;
-                const rawEvenW = 2 * ((w * effectiveScale * 0.5 + 0.5) | 0);
-                targetW = rawEvenW > 4 ? rawEvenW : 4;
+                targetW = Math.max(4, Math.round(w * effectiveScale));
             } else {
-                const rawEvenW = 2 * ((w * activeScale * 0.5 + 0.5) | 0);
-                targetW = rawEvenW > 4 ? rawEvenW : 4;
+                targetW = Math.max(4, Math.round(w * activeScale));
                 effectiveScale = targetW / w;
-                const rawEvenH = 2 * ((h * effectiveScale * 0.5 + 0.5) | 0);
-                targetH = rawEvenH > 2 ? rawEvenH : 2;
+                targetH = Math.max(2, Math.round(h * effectiveScale));
             }
-            const maxSafeTexels = 136_000;
-            if (targetW * targetH > maxSafeTexels) {
-                const shrink = Math.sqrt(maxSafeTexels / Math.max(1, targetW * targetH));
-                targetW = Math.max(4, 2 * ((targetW * shrink * 0.5) | 0));
-                targetH = Math.max(2, 2 * ((targetH * shrink * 0.5) | 0));
+            if (targetW * targetH > MAX_DISPLACEMENT_TEXELS) {
+                const shrink = Math.sqrt(MAX_DISPLACEMENT_TEXELS / (targetW * targetH));
+                targetW = Math.max(4, Math.floor(targetW * shrink));
+                targetH = Math.max(2, Math.floor(targetH * shrink));
+                targetW = Math.min(targetW, Math.floor(MAX_DISPLACEMENT_TEXELS / 2));
+                targetH = Math.min(targetH, Math.floor(MAX_DISPLACEMENT_TEXELS / targetW));
                 effectiveScale = Math.min(targetW / w, targetH / h);
             }
 
@@ -567,6 +625,8 @@ export function acquireSharedFilter(
                 surface,
                 config.pill,
                 isAxisX,
+                cornerStyle,
+                config,
             );
 
             if (!wasmRes) {
@@ -578,11 +638,10 @@ export function acquireSharedFilter(
                 activeBlobUrlCount++;
             }
 
-            const finalMaxDisplacement = wasmRes.maxDisplacement || 1.0;
-            const rawScale = finalMaxDisplacement * scaleRatio;
-            const maxScale = config.maxScaleMultiplier * clampedBezel;
-            const clampedScale = rawScale < maxScale ? rawScale : maxScale;
-            const scale = (((clampedScale * 100 + 0.5) | 0) * 0.01).toFixed(2);
+            const scale = Math.max(0, Math.min(
+                wasmRes.maxDisplacement * scaleRatio,
+                config.maxScaleMultiplier * clampedBezel,
+            ));
 
             const needsSeparateT1Filter = PREBLUR_MODE === "svg" && blurAmt > 0;
             const padPx = needsSeparateT1Filter ? Math.ceil(3 * blurAmt) : 0;
@@ -644,6 +703,7 @@ export function acquireSharedFilter(
         lastArchH2 = lastArchH1;
         lastArchRad2 = lastArchRad1;
         lastArchSurf2 = lastArchSurf1;
+        lastArchCornerStyle2 = lastArchCornerStyle1;
         lastArchScale2 = lastArchScale1;
         lastArchTier2 = lastArchTier1;
         lastArchVal2 = lastArchVal1;
@@ -653,6 +713,7 @@ export function acquireSharedFilter(
         lastArchH1 = h;
         lastArchRad1 = radius;
         lastArchSurf1 = surface;
+        lastArchCornerStyle1 = cornerStyle;
         lastArchScale1 = rasterScale;
         lastArchTier1 = effectiveArchTier;
         lastArchVal1 = archetype;
@@ -664,6 +725,12 @@ export function acquireSharedFilter(
 
     archetype.refCount++;
     const combinedUrl = archetype.blobUrl ?? "";
+    let scale = archetype.scale;
+    const span = getRefractionSpan(actualW, actualH, config.axis === "x" ? "horizontal" : config.refractionDirection);
+    const adaptiveTravel = config.adaptiveRefraction === true ? resolveRefractionTravel(span, archetype.clampedBezel) : Infinity;
+    const travel = Math.min(adaptiveTravel, config.maxRefractionPx ?? Infinity);
+    scale = Math.min(scale, 2 * travel / (1 + chromaAmount * SVG_BLUE_SHIFT));
+    const scaleValue = (Math.floor(scale * 100) / 100).toFixed(2);
     filterIdCounter++;
     const filterId = `lg-${filterIdCounter}`;
     const needsSeparateT1Filter = archetype.needsSeparateT1Filter;
@@ -678,7 +745,7 @@ export function acquireSharedFilter(
         combinedUrl,
         actualW,
         actualH,
-        archetype.scale,
+        scaleValue,
         config.colorMatrix,
         blurAmt,
         false,
@@ -705,7 +772,7 @@ export function acquireSharedFilter(
             combinedUrl,
             actualW,
             actualH,
-            archetype.scale,
+            scaleValue,
             config.colorMatrix,
             blurAmtT1,
             true,
@@ -746,19 +813,32 @@ export function acquireSharedFilter(
     return newRecord;
 }
 
-export function disposeSharedFilter(key: string, _immediate = false): void {
+export function disposeSharedFilter(key: string, immediate = false): void {
     if (!key) return;
     const record = sharedFilters.get(key);
     if (!record) return;
 
-    if (record.preloadTimerId !== null) {
-        clearTimeout(record.preloadTimerId);
-        record.preloadTimerId = null;
+    if (!record.archetype) {
+        record.finishPreload?.(!immediate);
+    } else if (record.archetype.refCount <= 1) {
+        (record.archetype.finishPreload ?? record.finishPreload)?.(!immediate);
     }
 
     const node = record.node;
-    if (node && node.parentNode) {
-        node.remove();
+    if (node) {
+        if (node.parentNode) {
+            node.remove();
+        }
+        if (
+            !immediate &&
+            node._isStd &&
+            !node._hasMatrix &&
+            node._feImage &&
+            node._feDisp &&
+            freeStdFilterPool.length < MAX_POOLED_STD_FILTERS
+        ) {
+            freeStdFilterPool.push(node);
+        }
     }
     if (record.nodeT1 && record.nodeT1.parentNode) {
         record.nodeT1.remove();
@@ -767,7 +847,6 @@ export function disposeSharedFilter(key: string, _immediate = false): void {
     record.nodeT1 = null;
     record.feImage = null;
     record.feImageT1 = null;
-    record.preloadImage = null;
     const archetype = record.archetype;
     record.archetype = null;
     if (archetype) {
@@ -817,3 +896,5 @@ export function releaseSharedFilter(
 export function decrementActiveBlobUrlCount(): void {
     if (activeBlobUrlCount > 0) activeBlobUrlCount--;
 }
+
+setOnBlobUrlEvicted(decrementActiveBlobUrlCount);

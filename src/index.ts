@@ -31,11 +31,48 @@ export {
     registerManagedElement,
     unregisterManagedElement,
 } from "./core/engine.js";
-export { createSceneCaptureController, captureDomToCanvas } from "./core/sceneCapture.js";
+export {
+    acquireSharedSceneCapture,
+    createSceneCaptureController,
+    captureDomToCanvas,
+} from "./core/sceneCapture.js";
 export { GlassWebglRenderer, parseCssColorToRgb } from "./core/webglRenderer.js";
-export { createLiquidGlass } from "./core/controller.js";
+export {
+    parseCssColorToRgba,
+    computeRelativeLuminance,
+    computeWcagContrastRatio,
+} from "./core/cssColor.js";
+export {
+    OPTICAL_LUT_SIZE,
+    buildOpticalLut,
+    evaluateOpticalProfile,
+    evaluateChromaticDispersion,
+    evaluateCauchyIndex,
+    evaluateFresnelReflectance,
+    evaluateBrewsterAngle,
+    evaluateCriticalAngle,
+    evaluateSpectralRefraction,
+    solveRefractionRay,
+    type FresnelReflectanceSample,
+    type SpectralRefractionSample,
+    type VectorRefractionResult,
+} from "./core/optics.js";
+export {
+    buildSpringPropagator,
+    stepSpring,
+    evaluateSpringEnergy,
+    predictMomentumOffset,
+    type DampedSpringParams,
+    type SpringStepResult,
+    type SpringPropagator,
+} from "./core/spring.js";
+export { createLiquidGlass, requestDeviceTiltPermission } from "./core/controller.js";
 export { createGlassSlider } from "./core/slider.js";
 export { createGlassSwitch } from "./core/switch.js";
+export {
+    registerLiquidGlassElement,
+    type LiquidGlassCustomElement,
+} from "./core/customElement.js";
 export { glassEffect, type LiquidGlassGroup } from "./core/glassEffect.js";
 export type {
     LiquidGlassSwitchOptions,
