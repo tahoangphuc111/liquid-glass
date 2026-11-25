@@ -1,3 +1,5 @@
+import { evaluateDerjaguinEffectiveRadius } from "./optics.js";
+
 export interface CoalescencePeer {
     readonly relCenterX: number;
     readonly relCenterY: number;
@@ -81,6 +83,7 @@ function ensureNodeBounds(node: InternalNodeState): boolean {
 
 let nextParticipantOrder = 1;
 let currentNotifyEpoch = 0;
+let currentQueryEpoch = 0;
 
 interface InternalNodeState {
     readonly order: number;
@@ -100,6 +103,7 @@ interface InternalNodeState {
     selectedPeers: InternalNodeState[] | null;
     dependents: Set<InternalNodeState> | null;
     lastNotifyEpoch: number;
+    lastQueryEpoch: number;
 }
 
 const participantNodes = new Map<HTMLElement, InternalNodeState>();
@@ -185,30 +189,187 @@ class SpatialHashLevel {
         }
     }
 
+    enqueueCellsInBounds(
+        firstX: number,
+        firstY: number,
+        lastX: number,
+        lastY: number,
+        coreMinX: number,
+        coreMinY: number,
+        coreMaxX: number,
+        coreMaxY: number,
+        maxCoreDistSq: number,
+    ): void {
+        const size = this.cellSize;
+        for (let y = firstY; y <= lastY; y += 1) {
+            const row = this.rows.get(y);
+            if (!row) continue;
+            const cellMinY = y * size;
+            const cellMaxY = cellMinY + size;
+            const dy =
+                cellMaxY < coreMinY
+                    ? coreMinY - cellMaxY
+                    : cellMinY > coreMaxY
+                      ? cellMinY - coreMaxY
+                      : 0;
+            const dySq = dy * dy;
+            if (dySq > maxCoreDistSq) continue;
+            for (let x = firstX; x <= lastX; x += 1) {
+                const cell = row.get(x);
+                if (!cell) continue;
+                const cellMinX = x * size;
+                const cellMaxX = cellMinX + size;
+                const dx =
+                    cellMaxX < coreMinX
+                        ? coreMinX - cellMaxX
+                        : cellMinX > coreMaxX
+                          ? cellMinX - coreMaxX
+                          : 0;
+                const distSq = dx * dx + dySq;
+                if (distSq <= maxCoreDistSq) {
+                    pushAstarCell(cell, distSq);
+                }
+            }
+        }
+    }
+
     forEachInBounds(
         firstX: number,
         firstY: number,
         lastX: number,
         lastY: number,
         visit: (node: InternalNodeState) => void,
+        coreMinX = -Infinity,
+        coreMinY = -Infinity,
+        coreMaxX = Infinity,
+        coreMaxY = Infinity,
+        maxCoreDistSq = Infinity,
     ): void {
+        const pruneCorners = Number.isFinite(maxCoreDistSq);
+        const size = this.cellSize;
         for (let y = firstY; y <= lastY; y += 1) {
             const row = this.rows.get(y);
             if (!row) continue;
+            let dySq = 0;
+            if (pruneCorners) {
+                const cellMinY = y * size;
+                const cellMaxY = cellMinY + size;
+                const dy =
+                    cellMaxY < coreMinY
+                        ? coreMinY - cellMaxY
+                        : cellMinY > coreMaxY
+                          ? cellMinY - coreMaxY
+                          : 0;
+                dySq = dy * dy;
+                if (dySq > maxCoreDistSq) continue;
+            }
             for (let x = firstX; x <= lastX; x += 1) {
                 const cell = row.get(x);
                 if (!cell) continue;
-                for (const node of cell) {
-                    if (
-                        x === (firstX > node.gridFirstX ? firstX : node.gridFirstX) &&
-                        y === (firstY > node.gridFirstY ? firstY : node.gridFirstY)
-                    ) {
+                if (pruneCorners) {
+                    const cellMinX = x * size;
+                    const cellMaxX = cellMinX + size;
+                    const dx =
+                        cellMaxX < coreMinX
+                            ? coreMinX - cellMaxX
+                            : cellMinX > coreMaxX
+                              ? cellMinX - coreMaxX
+                              : 0;
+                    if (dx * dx + dySq > maxCoreDistSq) continue;
+                    for (const node of cell) {
                         visit(node);
+                    }
+                } else {
+                    for (const node of cell) {
+                        if (
+                            x === (firstX > node.gridFirstX ? firstX : node.gridFirstX) &&
+                            y === (firstY > node.gridFirstY ? firstY : node.gridFirstY)
+                        ) {
+                            visit(node);
+                        }
                     }
                 }
             }
         }
     }
+}
+
+const INITIAL_ASTAR_HEAP_CAPACITY = 96;
+const astarHeapCells: Array<Set<InternalNodeState> | null> = new Array(INITIAL_ASTAR_HEAP_CAPACITY).fill(null);
+let astarHeapDistSq = new Float64Array(INITIAL_ASTAR_HEAP_CAPACITY);
+let astarHeapSize = 0;
+
+let lastAstarExpandedCells = 0;
+let lastAstarPrunedCells = 0;
+let lastAstarEvaluatedNodes = 0;
+
+export interface CoalescenceSearchStats {
+    readonly expandedCells: number;
+    readonly prunedCells: number;
+    readonly evaluatedNodes: number;
+}
+
+export function getLastCoalescenceSearchStatsForTesting(): CoalescenceSearchStats {
+    return {
+        expandedCells: lastAstarExpandedCells,
+        prunedCells: lastAstarPrunedCells,
+        evaluatedNodes: lastAstarEvaluatedNodes,
+    };
+}
+
+function pushAstarCell(cell: Set<InternalNodeState>, distSq: number): void {
+    let idx = astarHeapSize;
+    if (idx >= astarHeapDistSq.length) {
+        const nextCapacity = astarHeapDistSq.length * 2;
+        const nextDist = new Float64Array(nextCapacity);
+        nextDist.set(astarHeapDistSq);
+        astarHeapDistSq = nextDist;
+        astarHeapCells.length = nextCapacity;
+    }
+    astarHeapSize = idx + 1;
+    while (idx > 0) {
+        const parent = (idx - 1) >> 1;
+        const parentDist = astarHeapDistSq[parent]!;
+        if (parentDist <= distSq) break;
+        astarHeapDistSq[idx] = parentDist;
+        astarHeapCells[idx] = astarHeapCells[parent]!;
+        idx = parent;
+    }
+    astarHeapDistSq[idx] = distSq;
+    astarHeapCells[idx] = cell;
+}
+
+function popAstarCell(): Set<InternalNodeState> {
+    const topCell = astarHeapCells[0]!;
+    const lastIdx = --astarHeapSize;
+    if (lastIdx > 0) {
+        const movedCell = astarHeapCells[lastIdx]!;
+        const movedDist = astarHeapDistSq[lastIdx]!;
+        let idx = 0;
+        const half = lastIdx >> 1;
+        while (idx < half) {
+            let child = (idx << 1) + 1;
+            const right = child + 1;
+            if (right < lastIdx && astarHeapDistSq[right]! < astarHeapDistSq[child]!) {
+                child = right;
+            }
+            if (movedDist <= astarHeapDistSq[child]!) break;
+            astarHeapDistSq[idx] = astarHeapDistSq[child]!;
+            astarHeapCells[idx] = astarHeapCells[child]!;
+            idx = child;
+        }
+        astarHeapDistSq[idx] = movedDist;
+        astarHeapCells[idx] = movedCell;
+    }
+    astarHeapCells[lastIdx] = null;
+    return topCell;
+}
+
+function clearAstarHeap(): void {
+    for (let idx = 0; idx < astarHeapSize; idx += 1) {
+        astarHeapCells[idx] = null;
+    }
+    astarHeapSize = 0;
 }
 
 class CoalescenceGrid {
@@ -275,6 +436,11 @@ class CoalescenceGrid {
         right: number,
         bottom: number,
         visit: (node: InternalNodeState) => void,
+        coreMinX = -Infinity,
+        coreMinY = -Infinity,
+        coreMaxX = Infinity,
+        coreMaxY = Infinity,
+        maxCoreDistSq = Infinity,
     ): void {
         if (this.unread.size > 0) {
             for (const node of [...this.unread]) {
@@ -292,8 +458,112 @@ class CoalescenceGrid {
             Math.floor(right / COARSE_GRID_CELL_SIZE),
             Math.floor(bottom / COARSE_GRID_CELL_SIZE),
             visit,
+            coreMinX,
+            coreMinY,
+            coreMaxX,
+            coreMaxY,
+            maxCoreDistSq,
         );
-        this.fine.forEachInBounds(fineFirstX, fineFirstY, fineLastX, fineLastY, visit);
+        this.fine.forEachInBounds(
+            fineFirstX,
+            fineFirstY,
+            fineLastX,
+            fineLastY,
+            visit,
+            coreMinX,
+            coreMinY,
+            coreMaxX,
+            coreMaxY,
+            maxCoreDistSq,
+        );
+    }
+
+    /**
+     * A* best-first branch-and-bound k-NN search over the 2-level spatial hash.
+     * Each cell's priority key is its admissible lower-bound squared distance
+     * from the query's rounded-rect inner core box, guaranteeing optimal early
+     * termination as soon as the minimum cell bound exceeds the dynamic k-th cutoff.
+     */
+    visitBestFirstInBounds(
+        fineFirstX: number,
+        fineFirstY: number,
+        fineLastX: number,
+        fineLastY: number,
+        left: number,
+        top: number,
+        right: number,
+        bottom: number,
+        coreMinX: number,
+        coreMinY: number,
+        coreMaxX: number,
+        coreMaxY: number,
+        initialMaxCoreDistSq: number,
+        getCutoffCoreDistSq: () => number,
+        visit: (node: InternalNodeState) => void,
+    ): void {
+        if (this.unread.size > 0) {
+            for (const node of [...this.unread]) {
+                this.unread.delete(node);
+                ensureNodeBounds(node);
+            }
+        }
+
+        const queryEpoch = ++currentQueryEpoch;
+        lastAstarExpandedCells = 0;
+        lastAstarPrunedCells = 0;
+        lastAstarEvaluatedNodes = 0;
+
+        for (const node of this.oversized) {
+            if (node.lastQueryEpoch === queryEpoch) continue;
+            node.lastQueryEpoch = queryEpoch;
+            lastAstarEvaluatedNodes += 1;
+            visit(node);
+        }
+
+        const currentBoundSq = Math.min(initialMaxCoreDistSq, getCutoffCoreDistSq());
+        clearAstarHeap();
+        try {
+            this.coarse.enqueueCellsInBounds(
+                Math.floor(left / COARSE_GRID_CELL_SIZE),
+                Math.floor(top / COARSE_GRID_CELL_SIZE),
+                Math.floor(right / COARSE_GRID_CELL_SIZE),
+                Math.floor(bottom / COARSE_GRID_CELL_SIZE),
+                coreMinX,
+                coreMinY,
+                coreMaxX,
+                coreMaxY,
+                currentBoundSq,
+            );
+            this.fine.enqueueCellsInBounds(
+                fineFirstX,
+                fineFirstY,
+                fineLastX,
+                fineLastY,
+                coreMinX,
+                coreMinY,
+                coreMaxX,
+                coreMaxY,
+                currentBoundSq,
+            );
+
+            while (astarHeapSize > 0) {
+                const cellDistSq = astarHeapDistSq[0]!;
+                if (cellDistSq > getCutoffCoreDistSq()) {
+                    lastAstarPrunedCells = astarHeapSize;
+                    break;
+                }
+                const cell = popAstarCell();
+                lastAstarExpandedCells += 1;
+                for (const node of cell) {
+                    if (node.lastQueryEpoch === queryEpoch) continue;
+                    node.lastQueryEpoch = queryEpoch;
+                    lastAstarEvaluatedNodes += 1;
+                    visit(node);
+                }
+            }
+        } finally {
+            clearAstarHeap();
+        }
     }
 }
 
@@ -313,6 +583,11 @@ function visitCandidates(
     right: number,
     bottom: number,
     visit: (node: InternalNodeState) => void,
+    coreMinX = -Infinity,
+    coreMinY = -Infinity,
+    coreMaxX = Infinity,
+    coreMaxY = Infinity,
+    maxCoreDistSq = Infinity,
 ): void {
     if (participantNodes.size < GRID_MIN_PARTICIPANTS) {
         for (const node of participantNodes.values()) visit(node);
@@ -326,7 +601,22 @@ function visitCandidates(
         for (const node of participantNodes.values()) visit(node);
         return;
     }
-    ensureSpatialGrid().forEachInBounds(firstX, firstY, lastX, lastY, left, top, right, bottom, visit);
+    ensureSpatialGrid().forEachInBounds(
+        firstX,
+        firstY,
+        lastX,
+        lastY,
+        left,
+        top,
+        right,
+        bottom,
+        visit,
+        coreMinX,
+        coreMinY,
+        coreMaxX,
+        coreMaxY,
+        maxCoreDistSq,
+    );
 }
 
 function updateSelectedPeers(node: InternalNodeState, peers: InternalNodeState[] | null): void {
@@ -344,6 +634,31 @@ function updateSelectedPeers(node: InternalNodeState, peers: InternalNodeState[]
     }
     node.selectedPeers = peers;
 }
+
+function releaseCoalescencePeers(node: InternalNodeState): void {
+    updateSelectedPeers(node, null);
+    const dependents = node.dependents;
+    node.dependents = null;
+    if (!dependents) return;
+    for (const dependent of dependents) {
+        if (dependent.selectedPeers) {
+            const remaining = dependent.selectedPeers.filter((peer) => peer !== node);
+            dependent.selectedPeers = remaining.length > 0 ? remaining : null;
+        }
+        dependent.participant.notifyPeerUpdate();
+    }
+}
+
+export function clearCoalescenceGeometry(element: HTMLElement): void {
+    const node = participantNodes.get(element);
+    if (!node) return;
+    node.boundsProbed = true;
+    node.width = 0;
+    node.height = 0;
+    spatialGrid?.remove(node);
+    releaseCoalescencePeers(node);
+}
+
 let lastWaveClockMs = 0;
 let accumulatedWavePhase = 0;
 
@@ -411,6 +726,7 @@ export function registerCoalescenceParticipant(participant: CoalescenceParticipa
         selectedPeers: null,
         dependents: null,
         lastNotifyEpoch: 0,
+        lastQueryEpoch: 0,
     };
     if (!participantNodes.has(participant.element)) {
         participantNodes.set(participant.element, node);
@@ -427,18 +743,7 @@ export function registerCoalescenceParticipant(participant: CoalescenceParticipa
             }
             spatialGrid = null;
         }
-        updateSelectedPeers(node, null);
-        const dependents = node.dependents;
-        node.dependents = null;
-        if (dependents) {
-            for (const dependent of dependents) {
-                if (dependent.selectedPeers) {
-                    const remainingPeers = dependent.selectedPeers.filter((peer) => peer !== node);
-                    dependent.selectedPeers = remainingPeers.length > 0 ? remainingPeers : null;
-                }
-                dependent.participant.notifyPeerUpdate();
-            }
-        }
+        releaseCoalescencePeers(node);
     };
 }
 
@@ -509,8 +814,6 @@ export function syncCoalescenceGeometry(
             unionLeft, unionTop, unionWidth, unionHeight,
             candidate.left, candidate.top, candidate.width, candidate.height, notifyRange,
         )) return;
-        if (element.contains(candidate.participant.element) || candidate.participant.element.contains(element)) return;
-
         if (
             isWithinRoundedGap(
                 left, top, width, height, radius,
@@ -523,7 +826,9 @@ export function syncCoalescenceGeometry(
                 notifyRange,
             ))
         ) {
-            toNotify.push(candidate);
+            if (!element.contains(candidate.participant.element) && !candidate.participant.element.contains(element)) {
+                toNotify.push(candidate);
+            }
         }
     };
 
@@ -554,14 +859,24 @@ export function syncCoalescenceGeometry(
             fitsGridCoords(oldFirstX, oldFirstY, oldLastX, oldLastY, MAX_QUERY_CELLS) &&
             fitsGridCoords(newFirstX, newFirstY, newLastX, newLastY, MAX_QUERY_CELLS)
         ) {
+            const safePrevR = Math.max(0, Math.min(prevRadius, prevWidth * 0.5, prevHeight * 0.5));
+            const oldBound = notifyRange + safePrevR;
+            const safeNewR = Math.max(0, Math.min(radius, width * 0.5, height * 0.5));
+            const newBound = notifyRange + safeNewR;
             const grid = ensureSpatialGrid();
             grid.forEachInBounds(
                 oldFirstX, oldFirstY, oldLastX, oldLastY,
                 oldLeft, oldTop, oldRight, oldBottom, inspectCandidate,
+                prevLeft + safePrevR, prevTop + safePrevR,
+                prevLeft + prevWidth - safePrevR, prevTop + prevHeight - safePrevR,
+                oldBound * oldBound * (1 + 1e-12),
             );
             grid.forEachInBounds(
                 newFirstX, newFirstY, newLastX, newLastY,
                 newLeft, newTop, newRight, newBottom, inspectCandidate,
+                left + safeNewR, top + safeNewR,
+                left + width - safeNewR, top + height - safeNewR,
+                newBound * newBound * (1 + 1e-12),
             );
         } else {
             for (const candidate of participantNodes.values()) inspectCandidate(candidate);
@@ -570,6 +885,8 @@ export function syncCoalescenceGeometry(
         visitCandidates(
             unionLeft - notifyRange, unionTop - notifyRange, unionRight + notifyRange, unionBottom + notifyRange,
             inspectCandidate,
+            unionLeft, unionTop, unionRight, unionBottom,
+            notifyRange * notifyRange * (1 + 1e-12),
         );
     }
 
@@ -602,63 +919,107 @@ export function collectCoalescenceSnapshot(element: HTMLElement): CoalescenceSna
     const selfCenterY = selfTop + selfHalfH;
 
     let selectedCount = 0;
-    try {
-        visitCandidates(
-            selfLeft - range,
-            selfTop - range,
-            selfLeft + selfWidth + range,
-            selfTop + selfHeight + range,
-            (other) => {
-                if (other === selfNode || !ensureNodeBounds(other)) return;
-                if (exceedsAxialRange(
-                    selfLeft, selfTop, selfWidth, selfHeight,
-                    other.left, other.top, other.width, other.height, range,
-                )) return;
+    const inspectPeerCandidate = (other: InternalNodeState): void => {
+        if (other === selfNode || !ensureNodeBounds(other)) return;
+        if (exceedsAxialRange(
+            selfLeft, selfTop, selfWidth, selfHeight,
+            other.left, other.top, other.width, other.height, range,
+        )) return;
 
-                const peerHalfW = other.width * 0.5;
-                const peerHalfH = other.height * 0.5;
-                const safePeerRadius = Math.max(0, Math.min(other.radius, peerHalfW, peerHalfH));
-                const coreDeltaX = Math.max(
-                    0,
-                    Math.abs(other.left + peerHalfW - selfCenterX) - selfInnerHalfW - (peerHalfW - safePeerRadius),
-                );
-                const coreDeltaY = Math.max(
-                    0,
-                    Math.abs(other.top + peerHalfH - selfCenterY) - selfInnerHalfH - (peerHalfH - safePeerRadius),
-                );
-                const radiusSum = safeSelfRadius + safePeerRadius;
-                const cutoffGap =
-                    selectedCount === MAX_PEERS_PER_ELEMENT
-                        ? scratchSelectedGaps[MAX_PEERS_PER_ELEMENT - 1]!
-                        : range;
-                const maxCoreDist = cutoffGap + radiusSum;
-                const coreDistSq = coreDeltaX * coreDeltaX + coreDeltaY * coreDeltaY;
-                if (coreDistSq > maxCoreDist * maxCoreDist * (1 + 1e-12)) return;
-                const gap = coreDistSq <= radiusSum * radiusSum ? 0 : Math.sqrt(coreDistSq) - radiusSum;
-                if (gap > range) return;
-
-                let insertAt = selectedCount;
-                while (insertAt > 0) {
-                    const previous = insertAt - 1;
-                    const previousGap = scratchSelectedGaps[previous]!;
-                    if (gap > previousGap || (gap === previousGap && other.order > scratchSelectedPeers[previous]!.order)) {
-                        break;
-                    }
-                    insertAt = previous;
-                }
-                if (insertAt === MAX_PEERS_PER_ELEMENT) return;
-                if (element.contains(other.participant.element) || other.participant.element.contains(element)) return;
-
-                const limit = Math.min(selectedCount, MAX_PEERS_PER_ELEMENT - 1);
-                for (let index = limit; index > insertAt; index -= 1) {
-                    scratchSelectedPeers[index] = scratchSelectedPeers[index - 1]!;
-                    scratchSelectedGaps[index] = scratchSelectedGaps[index - 1]!;
-                }
-                scratchSelectedPeers[insertAt] = other;
-                scratchSelectedGaps[insertAt] = gap;
-                if (selectedCount < MAX_PEERS_PER_ELEMENT) selectedCount += 1;
-            },
+        const peerHalfW = other.width * 0.5;
+        const peerHalfH = other.height * 0.5;
+        const safePeerRadius = Math.max(0, Math.min(other.radius, peerHalfW, peerHalfH));
+        const coreDeltaX = Math.max(
+            0,
+            Math.abs(other.left + peerHalfW - selfCenterX) - selfInnerHalfW - (peerHalfW - safePeerRadius),
         );
+        const coreDeltaY = Math.max(
+            0,
+            Math.abs(other.top + peerHalfH - selfCenterY) - selfInnerHalfH - (peerHalfH - safePeerRadius),
+        );
+        const radiusSum = safeSelfRadius + safePeerRadius;
+        const cutoffGap =
+            selectedCount === MAX_PEERS_PER_ELEMENT
+                ? scratchSelectedGaps[MAX_PEERS_PER_ELEMENT - 1]!
+                : range;
+        const maxCoreDist = cutoffGap + radiusSum;
+        const coreDistSq = coreDeltaX * coreDeltaX + coreDeltaY * coreDeltaY;
+        if (coreDistSq > maxCoreDist * maxCoreDist * (1 + 1e-12)) return;
+        const gap = coreDistSq <= radiusSum * radiusSum ? 0 : Math.sqrt(coreDistSq) - radiusSum;
+        if (gap > range) return;
+
+        let insertAt = selectedCount;
+        while (insertAt > 0) {
+            const previous = insertAt - 1;
+            const previousGap = scratchSelectedGaps[previous]!;
+            if (gap > previousGap || (gap === previousGap && other.order > scratchSelectedPeers[previous]!.order)) {
+                break;
+            }
+            insertAt = previous;
+        }
+        if (insertAt === MAX_PEERS_PER_ELEMENT) return;
+        if (element.contains(other.participant.element) || other.participant.element.contains(element)) return;
+
+        const limit = Math.min(selectedCount, MAX_PEERS_PER_ELEMENT - 1);
+        for (let index = limit; index > insertAt; index -= 1) {
+            scratchSelectedPeers[index] = scratchSelectedPeers[index - 1]!;
+            scratchSelectedGaps[index] = scratchSelectedGaps[index - 1]!;
+        }
+        scratchSelectedPeers[insertAt] = other;
+        scratchSelectedGaps[insertAt] = gap;
+        if (selectedCount < MAX_PEERS_PER_ELEMENT) selectedCount += 1;
+    };
+
+    try {
+        const queryLeft = selfLeft - range;
+        const queryTop = selfTop - range;
+        const queryRight = selfLeft + selfWidth + range;
+        const queryBottom = selfTop + selfHeight + range;
+        const fineFirstX = Math.floor(queryLeft / GRID_CELL_SIZE);
+        const fineFirstY = Math.floor(queryTop / GRID_CELL_SIZE);
+        const fineLastX = Math.floor(queryRight / GRID_CELL_SIZE);
+        const fineLastY = Math.floor(queryBottom / GRID_CELL_SIZE);
+
+        if (
+            participantNodes.size >= GRID_MIN_PARTICIPANTS &&
+            fitsGridCoords(fineFirstX, fineFirstY, fineLastX, fineLastY, MAX_QUERY_CELLS)
+        ) {
+            const coreMinX = selfLeft + safeSelfRadius;
+            const coreMinY = selfTop + safeSelfRadius;
+            const coreMaxX = selfLeft + selfWidth - safeSelfRadius;
+            const coreMaxY = selfTop + selfHeight - safeSelfRadius;
+            const rangeCoreDist = range + safeSelfRadius;
+            const rangeCoreDistSq = rangeCoreDist * rangeCoreDist * (1 + 1e-12);
+            ensureSpatialGrid().visitBestFirstInBounds(
+                fineFirstX,
+                fineFirstY,
+                fineLastX,
+                fineLastY,
+                queryLeft,
+                queryTop,
+                queryRight,
+                queryBottom,
+                coreMinX,
+                coreMinY,
+                coreMaxX,
+                coreMaxY,
+                rangeCoreDistSq,
+                () => {
+                    if (selectedCount < MAX_PEERS_PER_ELEMENT) return rangeCoreDistSq;
+                    const bound = scratchSelectedGaps[MAX_PEERS_PER_ELEMENT - 1]! + safeSelfRadius;
+                    return bound * bound * (1 + 1e-12);
+                },
+                inspectPeerCandidate,
+            );
+        } else {
+            lastAstarExpandedCells = 0;
+            lastAstarPrunedCells = 0;
+            lastAstarEvaluatedNodes = 0;
+            for (const other of participantNodes.values()) {
+                lastAstarEvaluatedNodes += 1;
+                inspectPeerCandidate(other);
+            }
+        }
 
         if (selectedCount === 0) {
             updateSelectedPeers(selfNode, null);
@@ -682,14 +1043,19 @@ export function collectCoalescenceSnapshot(element: HTMLElement): CoalescenceSna
             if (selected) selected[idx] = other;
             const halfWidth = other.width * 0.5;
             const halfHeight = other.height * 0.5;
-            const minBezel = Math.max(8, Math.min(selfNode.bezel, other.bezel));
+            const safeSelfBezel = Math.max(8, selfNode.bezel);
+            const safePeerBezel = Math.max(8, other.bezel);
+            const effectiveMeniscusRadius = evaluateDerjaguinEffectiveRadius(
+                safeSelfBezel,
+                safePeerBezel,
+            );
             peers[idx] = {
                 relCenterX: other.left + halfWidth - selfCenterX,
                 relCenterY: other.top + halfHeight - selfCenterY,
                 halfWidth,
                 halfHeight,
                 radius: Math.min(other.radius, halfWidth, halfHeight),
-                mergeRadius: Math.min(48, Math.max(28, minBezel * 2.85)),
+                mergeRadius: Math.min(48, Math.max(28, effectiveMeniscusRadius * 2.85)),
                 wavePhase: accumulatedWavePhase + (other.order % 4) * 0.65,
                 priorityWinsTie: selfNode.order < other.order,
             };
@@ -716,8 +1082,13 @@ export function resetCoalescenceForTesting(): void {
     participantNodes.clear();
     spatialGrid = null;
     scratchSelectedPeers.fill(null);
+    clearAstarHeap();
     nextParticipantOrder = 1;
     currentNotifyEpoch = 0;
+    currentQueryEpoch = 0;
+    lastAstarExpandedCells = 0;
+    lastAstarPrunedCells = 0;
+    lastAstarEvaluatedNodes = 0;
     lastWaveClockMs = 0;
     accumulatedWavePhase = 0;
 }

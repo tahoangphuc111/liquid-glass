@@ -35,24 +35,35 @@ export function useLiquidGlass(
     const [engine, setEngine] = useState<GlassEngine>("css");
 
     const sceneElement = options.sceneElement ?? context?.sceneElement ?? null;
-    const sceneCanvas = options.sceneCanvas ?? (sceneElement ? null : context?.sceneCanvas) ?? null;
+    const sceneCanvas =
+        options.sceneCanvas ??
+        (options.sceneElement && options.sceneElement !== context?.sceneElement
+            ? null
+            : context?.sceneCanvas) ??
+        null;
     const onEngineChangeRef = useRef(options.onEngineChange);
     onEngineChangeRef.current = options.onEngineChange;
     const onDragChangeRef = useRef(options.onDragChange);
     onDragChangeRef.current = options.onDragChange;
+
+    const handleDragChange = useCallback(
+        (offsetX: number, offsetY: number, isDragging: boolean) => {
+            onDragChangeRef.current?.(offsetX, offsetY, isDragging);
+        },
+        [],
+    );
+    const handleEngineChange = useCallback((nextEngine: GlassEngine) => {
+        setEngine(nextEngine);
+        onEngineChangeRef.current?.(nextEngine);
+    }, []);
 
     const latestMergedOptionsRef = useRef<LiquidGlassOptions>({});
     latestMergedOptionsRef.current = {
         ...mergeGlassOptions(context?.defaults, options),
         sceneCanvas,
         sceneElement,
-        onDragChange: (offsetX, offsetY, isDragging) => {
-            onDragChangeRef.current?.(offsetX, offsetY, isDragging);
-        },
-        onEngineChange: (nextEngine) => {
-            setEngine(nextEngine);
-            onEngineChangeRef.current?.(nextEngine);
-        },
+        onDragChange: handleDragChange,
+        onEngineChange: handleEngineChange,
     };
 
     const syncTargetElement = useCallback(() => {
@@ -73,7 +84,9 @@ export function useLiquidGlass(
         } else {
             const patch = computeMergedOptionPatch(prevMergedOptionsRef.current, mergedOptions);
             prevMergedOptionsRef.current = mergedOptions;
-            instanceRef.current.update(patch);
+            if (Object.keys(patch).length > 0) {
+                instanceRef.current.update(patch);
+            }
             setEngine(instanceRef.current.engine);
         }
     }, [targetRef]);
@@ -117,6 +130,7 @@ export function useLiquidGlass(
         options.highlight,
         tiltKey,
         options.pixelRatio,
+        options.sharpness,
         options.saturation,
         options.chromaticAberration,
         options.abbeNumber,

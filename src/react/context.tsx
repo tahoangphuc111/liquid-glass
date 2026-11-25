@@ -9,6 +9,7 @@ import {
     type ReactNode,
     type RefObject,
 } from "react";
+import { resolveSceneCaptureSharpness } from "../core/config.js";
 import { canUseSvgGlass, canUseWebglRefraction, getMediaQueries, subscribeBatteryChanges } from "../core/observer.js";
 import { acquireSharedSceneCapture } from "../core/sceneCapture.js";
 import type { LiquidGlassOptions, SceneCaptureController } from "../core/types.js";
@@ -73,6 +74,7 @@ export function LiquidGlassProvider({
 }: LiquidGlassProviderProps) {
     const wrapperRef = useRef<HTMLDivElement | null>(null);
     const controllerRef = useRef<SceneCaptureController | null>(null);
+    const captureTargetRef = useRef<HTMLElement | null>(null);
     const stabilizedDefaultsRef = useRef<Partial<LiquidGlassOptions>>(defaults);
     if (!shallowDefaultsEqual(stabilizedDefaultsRef.current, defaults)) {
         stabilizedDefaultsRef.current = defaults;
@@ -92,6 +94,7 @@ export function LiquidGlassProvider({
 
     const syncCapture = useCallback(() => {
         const target = sceneRef?.current ?? wrapperRef.current;
+        captureTargetRef.current = target;
         if (!target || !shouldCaptureNow()) {
             controllerRef.current?.destroy();
             controllerRef.current = null;
@@ -108,10 +111,14 @@ export function LiquidGlassProvider({
 
         controllerRef.current?.destroy();
         setSceneCanvas(null);
-        const controller = acquireSharedSceneCapture(target, () => ({
-            pixelRatio: defaultsRef.current.pixelRatio,
-            radius: defaultsRef.current.pill ? 9999 : defaultsRef.current.radius,
-        }));
+        const controller = acquireSharedSceneCapture(target, () => {
+            const sharpness = resolveSceneCaptureSharpness(defaultsRef.current);
+            return {
+                pixelRatio: defaultsRef.current.pixelRatio,
+                radius: defaultsRef.current.pill ? 9999 : defaultsRef.current.radius,
+                ...(sharpness > 0 ? { sharpness } : {}),
+            };
+        });
         controllerRef.current = controller;
         setSceneElement(target);
         controller.subscribe((canvas, sourceEl) => {
@@ -143,14 +150,36 @@ export function LiquidGlassProvider({
             mobileOrTouchQuery?.removeEventListener?.("change", syncCapture);
             reducedTransparencyQuery?.removeEventListener?.("change", syncCapture);
             highContrastQuery?.removeEventListener?.("change", syncCapture);
-            controllerRef.current?.destroy();
-            controllerRef.current = null;
         };
     }, [captureScene, syncCapture]);
 
-    const requestSceneCapture = useCallback(() => {
-        setForcedCapture(true);
+    useEffect(() => {
+        if ((sceneRef?.current ?? wrapperRef.current) !== captureTargetRef.current) syncCapture();
+    });
+
+    useEffect(() => {
+        controllerRef.current?.scheduleCapture();
+    }, [
+        stableDefaults.pixelRatio,
+        stableDefaults.radius,
+        stableDefaults.pill,
+        stableDefaults.sharpness,
+        stableDefaults.blur,
+        stableDefaults.preset,
+    ]);
+
+    useEffect(() => {
+        return () => {
+            controllerRef.current?.destroy();
+            controllerRef.current = null;
+        };
     }, []);
+
+    const requestSceneCapture = useCallback(() => {
+        if (captureScene === "auto") {
+            setForcedCapture(true);
+        }
+    }, [captureScene]);
 
     const refreshCapture = useCallback(() => {
         controllerRef.current?.scheduleCapture();

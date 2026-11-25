@@ -4,6 +4,7 @@ use core::cell::UnsafeCell;
 
 const BMP_HEADER_BYTES: usize = 64;
 const MAX_BMP_BYTES: usize = BMP_HEADER_BYTES + 136_000 * 4;
+const HALF_TEXEL_DIAGONAL: f32 = core::f32::consts::FRAC_1_SQRT_2;
 
 const LUT_LEN: usize = 256;
 const SURFACE_COUNT: usize = 5;
@@ -563,6 +564,54 @@ unsafe fn write_axis_x_strip(
 }
 
 #[inline(always)]
+fn edge_coverage(sd: f32, nx: f32, ny: f32) -> f32 {
+    let major = nx.max(ny).max(1e-5);
+    let minor = nx.min(ny);
+    let abs_sd = sd.abs();
+    if abs_sd <= (major - minor) * 0.5 {
+        return 0.5 - sd / major;
+    }
+    // The pixel area beyond the central strip is a triangle.
+    let tail = ((major + minor) * 0.5 - abs_sd).max(0.0);
+    let coverage = tail * tail / (2.0 * major * minor.max(1e-5));
+    if sd > 0.0 {
+        coverage
+    } else {
+        1.0 - coverage
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline(always)]
+fn edge_coverage_simd(
+    sd: core::arch::wasm32::v128,
+    nx: core::arch::wasm32::v128,
+    ny: core::arch::wasm32::v128,
+) -> core::arch::wasm32::v128 {
+    use core::arch::wasm32::*;
+
+    let half = f32x4_splat(0.5);
+    let one = f32x4_splat(1.0);
+    let zero = f32x4_splat(0.0);
+    let epsilon = f32x4_splat(1e-5);
+    let major = f32x4_max(f32x4_max(nx, ny), epsilon);
+    let minor = f32x4_min(nx, ny);
+    let abs_sd = f32x4_abs(sd);
+    let central = f32x4_le(abs_sd, f32x4_mul(f32x4_sub(major, minor), half));
+    let linear = f32x4_sub(half, f32x4_div(sd, major));
+    let tail = f32x4_max(
+        zero,
+        f32x4_sub(f32x4_mul(f32x4_add(major, minor), half), abs_sd),
+    );
+    let area = f32x4_div(
+        f32x4_mul(half, f32x4_mul(tail, tail)),
+        f32x4_mul(major, f32x4_max(minor, epsilon)),
+    );
+    let corner = v128_bitselect(area, f32x4_sub(one, area), f32x4_gt(sd, zero));
+    v128_bitselect(linear, corner, central)
+}
+
+#[inline(always)]
 fn eval_distance_pixel(
     qx: f32,
     qy: f32,
@@ -607,12 +656,15 @@ fn eval_distance_pixel(
         (sd_val, len, q_plus_x * inv_len, q_plus_y * inv_len)
     };
     let depth = -sd;
-    if sd >= 0.5 || depth >= scaled_bezel {
+    if sd >= HALF_TEXEL_DIAGONAL || depth >= scaled_bezel {
         return (0.0, 0.0);
     }
-    let edge_cov = if sd > -0.5 {
-        let t = 0.5 - sd;
-        t * t * (3.0 - 2.0 * t)
+    let edge_cov = if sd > -HALF_TEXEL_DIAGONAL {
+        if out_len > 1e-5 {
+            edge_coverage(sd, raw_nx, raw_ny)
+        } else {
+            clamp_f32(0.5 - sd, 0.0, 1.0)
+        }
     } else {
         1.0
     };
@@ -788,10 +840,8 @@ unsafe fn write_corner_span<const IS_SQUIRCLE: bool>(
     };
     let neg_sign_y_v = f32x4_splat(-sign_y);
 
-    let half_v = f32x4_splat(0.5);
-    let neg_half_v = f32x4_splat(-0.5);
-    let three_v = f32x4_splat(3.0);
-    let two_v = f32x4_splat(2.0);
+    let aa_limit_v = f32x4_splat(HALF_TEXEL_DIAGONAL);
+    let neg_aa_limit_v = f32x4_neg(aa_limit_v);
     let c128_v = f32x4_splat(128.0);
     let c255_v = f32x4_splat(255.0);
     let zero_i = i32x4_splat(0);
@@ -841,7 +891,7 @@ unsafe fn write_corner_span<const IS_SQUIRCLE: bool>(
         };
         let depth_v = f32x4_neg(sd_v);
 
-        let inside_lane_mask = v128_and(f32x4_lt(sd_v, half_v), f32x4_lt(depth_v, bezel_v));
+        let inside_lane_mask = v128_and(f32x4_lt(sd_v, aa_limit_v), f32x4_lt(depth_v, bezel_v));
         if i32x4_bitmask(inside_lane_mask) == 0 {
             px_v = f32x4_add(px_v, four_v);
             x += 4;
@@ -881,18 +931,16 @@ unsafe fn write_corner_span<const IS_SQUIRCLE: bool>(
             *disp_q_delta_ptr.add(idx3),
         );
         let interp_disp_q_v = f32x4_add(d0_v, f32x4_mul(delta_v, frac_v));
-        let disp_q_v = if i32x4_bitmask(f32x4_gt(sd_v, neg_half_v)) != 0 {
-            let edge_t_v = f32x4_min(f32x4_max(f32x4_sub(half_v, sd_v), zero), one);
-            let edge_cov_v = f32x4_mul(
-                f32x4_mul(edge_t_v, edge_t_v),
-                f32x4_sub(three_v, f32x4_mul(two_v, edge_t_v)),
-            );
+        let corner_mask = f32x4_gt(out_len_v, eps_v);
+        let disp_q_v = if i32x4_bitmask(f32x4_gt(sd_v, neg_aa_limit_v)) != 0 {
+            let coverage_x = v128_bitselect(norm_x_v, one, corner_mask);
+            let coverage_y = v128_and(norm_y_v, corner_mask);
+            let edge_cov_v = edge_coverage_simd(sd_v, coverage_x, coverage_y);
             v128_and(f32x4_mul(interp_disp_q_v, edge_cov_v), inside_lane_mask)
         } else {
             v128_and(interp_disp_q_v, inside_lane_mask)
         };
 
-        let corner_mask = f32x4_gt(out_len_v, eps_v);
         let corner_ny_v = f32x4_mul(neg_sign_y_v, norm_y_v);
 
         let x_edge_mask = f32x4_gt(qx_v, qy_v);
@@ -1111,7 +1159,7 @@ unsafe fn write_symmetric_map(
         let r2 = r * r;
         r2 * r2
     } else {
-        let r = radius + 0.6;
+        let r = radius + HALF_TEXEL_DIAGONAL;
         r * r
     };
     let inner_r_limit = if is_squircle {
@@ -1143,12 +1191,7 @@ unsafe fn write_symmetric_map(
                         core::ptr::copy_nonoverlapping(template, row, stride);
                     }
                 }
-                let edge_cov = if depth < 0.5 {
-                    let t = 0.5 + depth;
-                    t * t * (3.0 - 2.0 * t)
-                } else {
-                    1.0
-                };
+                let edge_cov = clamp_f32(0.5 + depth, 0.0, 1.0);
                 let ny = if py < 0.0 {
                     sample_disp_lut(disp_lut, depth * inv_bezel) * inv_max_disp * edge_cov
                 } else {
@@ -1169,12 +1212,7 @@ unsafe fn write_symmetric_map(
                 }
                 let depth = radius - qy;
                 let pixel = if py < 0.0 && depth > -0.5 && depth < bezel {
-                    let edge_cov = if depth < 0.5 {
-                        let t = 0.5 + depth;
-                        t * t * (3.0 - 2.0 * t)
-                    } else {
-                        1.0
-                    };
+                    let edge_cov = clamp_f32(0.5 + depth, 0.0, 1.0);
                     let ny = sample_disp_lut(disp_lut, depth.max(0.0) * inv_bezel)
                         * inv_max_disp
                         * edge_cov;
@@ -1436,10 +1474,8 @@ unsafe fn write_directional_horizontal_corner_simd(
     let feather_v = f32x4_splat(feather);
     let q_cross_v = f32x4_splat(q_cross);
     let q_cross_sq_v = f32x4_mul(q_cross_v, q_cross_v);
-    let half_v = f32x4_splat(0.5);
-    let neg_half_v = f32x4_splat(-0.5);
-    let three_v = f32x4_splat(3.0);
-    let two_v = f32x4_splat(2.0);
+    let aa_limit_v = f32x4_splat(HALF_TEXEL_DIAGONAL);
+    let neg_aa_limit_v = f32x4_neg(aa_limit_v);
     let c128_v = f32x4_splat(128.0);
     let c255_v = f32x4_splat(255.0);
     let base_bgra_v = i32x4_splat(0xff00_8080_u32 as i32);
@@ -1454,7 +1490,7 @@ unsafe fn write_directional_horizontal_corner_simd(
 
     while main_idx + 4 <= main_end {
         let q_plus_x_v = f32x4_max(q_main_v, zero);
-        let (sd_v, out_len_v, raw_nx_v) = if is_squircle {
+        let (sd_v, out_len_v, raw_nx_v, raw_ny_v) = if is_squircle {
             let x_major_mask = f32x4_ge(q_plus_x_v, q_cross_v);
             let major_v = v128_bitselect(q_plus_x_v, q_cross_v, x_major_mask);
             let minor_v = v128_bitselect(q_cross_v, q_plus_x_v, x_major_mask);
@@ -1475,24 +1511,26 @@ unsafe fn write_directional_horizontal_corner_simd(
                 v128_bitselect(sd_sq_v, neg_radius_v, pos_mask),
                 len_v,
                 v128_bitselect(inv_g_v, minor_norm_v, x_major_mask),
+                v128_bitselect(minor_norm_v, inv_g_v, x_major_mask),
             )
         } else {
             let len_v = f32x4_sqrt(f32x4_add(f32x4_mul(q_plus_x_v, q_plus_x_v), q_cross_sq_v));
             let sd_val_v = f32x4_sub(len_v, radius_v);
-            (sd_val_v, len_v, q_plus_x_v)
+            (sd_val_v, len_v, q_plus_x_v, q_cross_v)
         };
         let depth_v = f32x4_neg(sd_v);
-        let inside_lane_mask = v128_and(f32x4_lt(sd_v, half_v), f32x4_lt(depth_v, bezel_v));
+        let inside_lane_mask = v128_and(f32x4_lt(sd_v, aa_limit_v), f32x4_lt(depth_v, bezel_v));
         if i32x4_bitmask(inside_lane_mask) == 0 {
             q_main_v = f32x4_sub(q_main_v, four_v);
             main_idx += 4;
             continue;
         }
 
-        let norm_x_v = if is_squircle {
-            raw_nx_v
+        let (norm_x_v, norm_y_v) = if is_squircle {
+            (raw_nx_v, raw_ny_v)
         } else {
-            f32x4_div(raw_nx_v, f32x4_max(out_len_v, eps_v))
+            let inv_norm_v = f32x4_div(one, f32x4_max(out_len_v, eps_v));
+            (f32x4_mul(raw_nx_v, inv_norm_v), f32x4_mul(raw_ny_v, inv_norm_v))
         };
 
         let safe_depth_v = f32x4_max(depth_v, zero);
@@ -1500,18 +1538,16 @@ unsafe fn write_directional_horizontal_corner_simd(
             sample_disp_q_simd(safe_depth_v, inv_bezel_v, disp_q_ptr, disp_q_delta_ptr),
             feather_v,
         );
-        let disp_q_v = if i32x4_bitmask(f32x4_gt(sd_v, neg_half_v)) != 0 {
-            let edge_t_v = f32x4_min(f32x4_max(f32x4_sub(half_v, sd_v), zero), one);
-            let edge_cov_v = f32x4_mul(
-                f32x4_mul(edge_t_v, edge_t_v),
-                f32x4_sub(three_v, f32x4_mul(two_v, edge_t_v)),
-            );
+        let corner_mask = f32x4_gt(out_len_v, eps_v);
+        let disp_q_v = if i32x4_bitmask(f32x4_gt(sd_v, neg_aa_limit_v)) != 0 {
+            let coverage_x = v128_bitselect(norm_x_v, one, corner_mask);
+            let coverage_y = v128_and(norm_y_v, corner_mask);
+            let edge_cov_v = edge_coverage_simd(sd_v, coverage_x, coverage_y);
             v128_and(f32x4_mul(interp_disp_q_v, edge_cov_v), inside_lane_mask)
         } else {
             v128_and(interp_disp_q_v, inside_lane_mask)
         };
 
-        let corner_mask = f32x4_gt(out_len_v, eps_v);
         let x_edge_mask = f32x4_gt(q_main_v, q_cross_v);
         let edge_nx_v = v128_and(x_edge_mask, one);
         let nx_v = v128_bitselect(norm_x_v, edge_nx_v, corner_mask);
@@ -1605,7 +1641,7 @@ unsafe fn write_directional_map(
         let r2 = r * r;
         r2 * r2
     } else {
-        let r = radius + 0.6;
+        let r = radius + HALF_TEXEL_DIAGONAL;
         r * r
     };
     let inner_radius_limit = if is_squircle {
@@ -1970,6 +2006,17 @@ pub extern "C" fn generateDirectionalDisplacementBmp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edge_coverage_resolves_axis_aligned_and_diagonal_texels() {
+        assert_eq!(edge_coverage(0.25, 1.0, 0.0), 0.25);
+        assert_eq!(edge_coverage(-0.25, 0.0, 1.0), 0.75);
+
+        let diagonal = HALF_TEXEL_DIAGONAL;
+        assert!((edge_coverage(diagonal * 0.5, diagonal, diagonal) - 0.125).abs() < 1e-6);
+        assert!((edge_coverage(-diagonal * 0.5, diagonal, diagonal) - 0.875).abs() < 1e-6);
+        assert_eq!(edge_coverage(diagonal, diagonal, diagonal), 0.0);
+    }
 
     fn read_max_displacement() -> f32 {
         unsafe { max_displacement_ptr().read_unaligned() }

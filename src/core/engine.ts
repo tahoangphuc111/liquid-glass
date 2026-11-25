@@ -8,8 +8,10 @@ import {
     parseCssCornerRadiusPx,
     parseElementGlassAttributes,
     pickMapScale,
-    resolveChromaticAberration,
+    resolveEffectiveChromaticAberration,
     resolveGlassConfig,
+    resolveGlassSharpness,
+    resolveSharpnessPixelRatio,
 } from "./config.js";
 import {
     activeBlobUrlCount,
@@ -26,6 +28,7 @@ import {
     resetArchetypeHotSlots,
     sharedFilters,
     startMapPreload,
+    tryUpdateFilterScalesInPlace,
     type SharedFilterRecord,
 } from "./filter.js";
 import {
@@ -282,7 +285,10 @@ export function applyCssFallback(
         state.appliedFilterVal = null;
         activeElements.delete(element);
     } else {
-        const filter = formatCssFallbackFilter(state.config.saturation);
+        const filter = formatCssFallbackFilter(
+            state.config.saturation,
+            state.config.blur === DEFAULT_GLASS_CONFIG.blur ? undefined : state.config.blur,
+        );
         element.style.setProperty("--lg-filter", filter);
         state.appliedFilterVal = filter;
         element.classList.add("lg-on");
@@ -630,7 +636,22 @@ export function rebuildLiquidGlassFilterForElement(
     const dpr = typeof window !== "undefined" && typeof window.devicePixelRatio === "number"
         ? window.devicePixelRatio
         : 1;
-    const rasterScale = radius <= 0 ? Math.min(dpr, 0.5) : Math.min(3, Math.max(1.5, dpr + 0.5));
+    const sharpnessAmount = resolveGlassSharpness(config.sharpness, config.blur);
+    const chromaAmount = resolveEffectiveChromaticAberration(
+        config.chromaticAberration,
+        config.abbeNumber,
+        config.ior,
+    );
+    const baseRasterScale =
+        chromaAmount > 0 && sharpnessAmount <= 0
+            ? Math.min(2, Math.max(1, dpr))
+            : Math.min(3.5, Math.max(2, dpr + 1));
+    const rasterScale =
+        radius <= 0
+            ? Math.min(dpr, 0.25)
+            : sharpnessAmount > 0
+              ? Math.max(baseRasterScale, resolveSharpnessPixelRatio(sharpnessAmount, dpr))
+              : baseRasterScale;
 
     const adaptive = config.adaptiveRefraction === true;
     const clampedBezel = resolveRefractionBezel(config.axis === "x" ? w : Math.min(w, h), config.bezel, adaptive);
@@ -640,7 +661,9 @@ export function rebuildLiquidGlassFilterForElement(
             w > clampedBezel * 2 + 8 &&
             h > clampedBezel * 2 + 8,
     );
-    const coreFilter = hasCore ? formatGlassCoreFilter(config.coreFilter || undefined, config.saturation) : "";
+    const coreFilter = hasCore
+        ? formatGlassCoreFilter(config.coreFilter || undefined, config.saturation)
+        : "";
 
     const deviceArea = Math.round(w * h * dpr * dpr);
     const oldElementArea = state.deviceArea || 0;
@@ -688,13 +711,20 @@ export function rebuildLiquidGlassFilterForElement(
         }
     }
 
-    const chromaAmount = resolveChromaticAberration(config.chromaticAberration, config.abbeNumber);
+    const quantizedChromaAmount = Math.round(chromaAmount * 1000) / 1000;
     const filterTier = qualityTier === 2 || (qualityTier === 1 && chromaAmount > 0) ? qualityTier : 0;
+    const baseFilterKey = [
+        surface, w, h, radius, clampedBezel, config.thickness,
+        config.blur, sharpnessAmount, config.ior, config.pill, config.axis,
+        config.colorMatrix, rasterScale, config.cornerStyle, adaptive, filterTier,
+        config.refractionDirection, config.refractionEdgeFade,
+    ].join("|");
     const newSharedKey = [
-        surface, w, h, radius, clampedBezel, config.thickness, config.scaleRatio,
-        config.maxScaleMultiplier, config.blur, config.ior, config.pill, config.axis,
-        config.colorMatrix, rasterScale, chromaAmount, config.cornerStyle, adaptive, filterTier,
-        config.refractionDirection, config.refractionEdgeFade, config.maxRefractionPx,
+        baseFilterKey,
+        config.scaleRatio,
+        config.maxScaleMultiplier,
+        quantizedChromaAmount,
+        config.maxRefractionPx,
     ].join("|");
     const meta: FilterCommitMeta = {
         w, h, radius, deviceArea, blur: config.blur, saturation: config.saturation, clampedBezel, hasCore, coreFilter,
@@ -714,8 +744,36 @@ export function rebuildLiquidGlassFilterForElement(
         }
     }
 
+    if (state.sharedKey) {
+        const updatedRecord = tryUpdateFilterScalesInPlace(
+            state.sharedKey,
+            newSharedKey,
+            baseFilterKey,
+            config,
+            w,
+            h,
+            qualityTier,
+        );
+        if (updatedRecord) {
+            state.sharedKey = newSharedKey;
+            commitFilter(element, state, updatedRecord, meta, true);
+            return;
+        }
+    }
+
     const record = acquireSharedFilter(
-        { sharedKey: newSharedKey, config, w, h, radius, surface, rasterScale, halfMinDim, svgDefs },
+        {
+            sharedKey: newSharedKey,
+            baseKey: baseFilterKey,
+            config,
+            w,
+            h,
+            radius,
+            surface,
+            rasterScale,
+            halfMinDim,
+            svgDefs,
+        },
         qualityTier,
     );
     if (!record) {
@@ -845,6 +903,7 @@ function resolveConfigWithElementAttributes(element: HTMLElement, baseConfig: Gl
         scaleRatio: baseConfig.scaleRatio,
         maxScaleMultiplier: baseConfig.maxScaleMultiplier,
         blur: baseConfig.blur,
+        sharpness: baseConfig.sharpness,
         saturation: baseConfig.saturation,
         ior: baseConfig.ior,
         coreFilter: baseConfig.coreFilter,
@@ -1122,7 +1181,14 @@ function bindGlobalEngineCallbacks(): void {
         for (const element of observedElements) {
             const state = elementStateMap.get(element);
             if (!state || (!activeElements.has(element) && !state.pendingFilter)) continue;
-            if (rebuildAll || resolveChromaticAberration(state.config.chromaticAberration, state.config.abbeNumber) > 0) {
+            if (
+                rebuildAll ||
+                resolveEffectiveChromaticAberration(
+                    state.config.chromaticAberration,
+                    state.config.abbeNumber,
+                    state.config.ior,
+                ) > 0
+            ) {
                 dirtyElements.add(element);
                 needsFlush = true;
                 continue;

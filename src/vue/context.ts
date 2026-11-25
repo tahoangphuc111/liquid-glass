@@ -12,6 +12,7 @@ import {
     type PropType,
     type Ref,
 } from "vue";
+import { resolveSceneCaptureSharpness } from "../core/config.js";
 import { canUseSvgGlass, canUseWebglRefraction, getMediaQueries, subscribeBatteryChanges } from "../core/observer.js";
 import { acquireSharedSceneCapture } from "../core/sceneCapture.js";
 import type { LiquidGlassOptions, SceneCaptureController } from "../core/types.js";
@@ -88,10 +89,14 @@ export const LiquidGlassProvider = defineComponent({
 
             controller?.destroy();
             sceneCanvas.value = null;
-            controller = acquireSharedSceneCapture(target, () => ({
-                pixelRatio: defaultsRef.value.pixelRatio,
-                radius: defaultsRef.value.pill ? 9999 : defaultsRef.value.radius,
-            }));
+            controller = acquireSharedSceneCapture(target, () => {
+                const sharpness = resolveSceneCaptureSharpness(defaultsRef.value);
+                return {
+                    pixelRatio: defaultsRef.value.pixelRatio,
+                    radius: defaultsRef.value.pill ? 9999 : defaultsRef.value.radius,
+                    ...(sharpness > 0 ? { sharpness } : {}),
+                };
+            });
             activeSceneEl.value = target;
             controller.subscribe((canvas, sourceEl) => {
                 sceneCanvas.value = canvas;
@@ -99,7 +104,18 @@ export const LiquidGlassProvider = defineComponent({
             });
         };
 
-        watch([() => props.sceneElement, () => props.captureScene, forcedCapture], syncCapture);
+        watch([() => props.sceneElement, () => props.captureScene, forcedCapture], syncCapture, { flush: "post" });
+        watch(
+            [
+                () => defaultsRef.value.pixelRatio,
+                () => defaultsRef.value.radius,
+                () => defaultsRef.value.pill,
+                () => defaultsRef.value.sharpness,
+                () => defaultsRef.value.blur,
+                () => defaultsRef.value.preset,
+            ],
+            () => controller?.scheduleCapture(),
+        );
 
         let unsubWasm: (() => void) | null = null;
         let unsubscribeBattery: (() => void) | null = null;
@@ -146,7 +162,9 @@ export const LiquidGlassProvider = defineComponent({
             sceneElement: activeSceneEl,
             defaults: defaultsRef,
             requestSceneCapture: () => {
-                forcedCapture.value = true;
+                if (props.captureScene === "auto") {
+                    forcedCapture.value = true;
+                }
             },
             refreshCapture: () => {
                 controller?.scheduleCapture();

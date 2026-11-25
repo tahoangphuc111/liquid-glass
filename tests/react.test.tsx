@@ -9,7 +9,8 @@ import {
     useGlassSlider,
     useLiquidGlass,
 } from "../src/react/index.js";
-import { destroyLiquidGlass } from "../src/index.js";
+import { GlassWebglRenderer, destroyLiquidGlass } from "../src/index.js";
+import * as sceneCapture from "../src/core/sceneCapture.js";
 
 function setForcedChromium(value: boolean | undefined): void {
     const win = window as unknown as { __LG_FORCE_CHROMIUM__?: boolean };
@@ -192,5 +193,152 @@ describe("React bindings", () => {
         expect(values).toContain(70);
 
         expect(() => view.rerender(<Harness showSlider={false} />)).not.toThrow();
+    });
+
+    it("rebinds a provider when the same ref points to a replacement scene and refreshes its quality", () => {
+        const captureSchedule = vi.fn();
+        const acquireCapture = vi.spyOn(sceneCapture, "acquireSharedSceneCapture").mockImplementation((source) => ({
+            source,
+            canvas: null,
+            subscribe: () => () => {},
+            scheduleCapture: captureSchedule,
+            destroy: () => {},
+        }));
+        function Harness({ sceneKey, pixelRatio }: { sceneKey: string; pixelRatio: number }) {
+            const sceneRef = useRef<HTMLDivElement>(null);
+            return (
+                <>
+                    <div key={sceneKey} ref={sceneRef} data-testid="replaceable-scene" />
+                    <LiquidGlassProvider sceneRef={sceneRef} captureScene="always" defaults={{ pixelRatio }}>
+                        <span>Glass</span>
+                    </LiquidGlassProvider>
+                </>
+            );
+        }
+
+        const view = render(<Harness sceneKey="initial" pixelRatio={1} />);
+        const firstScene = screen.getByTestId("replaceable-scene");
+        expect(acquireCapture).toHaveBeenCalledTimes(1);
+        expect(acquireCapture.mock.calls[0]?.[0]).toBe(firstScene);
+        captureSchedule.mockClear();
+
+        view.rerender(<Harness sceneKey="initial" pixelRatio={2} />);
+        expect(captureSchedule).toHaveBeenCalledOnce();
+        expect(acquireCapture).toHaveBeenCalledTimes(1);
+        expect(acquireCapture.mock.calls[0]?.[1]?.()).toEqual({ pixelRatio: 2, radius: undefined });
+
+        view.rerender(<Harness sceneKey="replacement" pixelRatio={2} />);
+        const replacement = screen.getByTestId("replaceable-scene");
+        expect(replacement).not.toBe(firstScene);
+        expect(acquireCapture).toHaveBeenCalledTimes(2);
+        expect(acquireCapture.mock.calls[1]?.[0]).toBe(replacement);
+    });
+
+    it("forwards captured sceneCanvas from LiquidGlassProvider to child WebGL glass surfaces", () => {
+        setForcedChromium(false);
+        const capturedCanvas = document.createElement("canvas");
+        capturedCanvas.width = 320;
+        capturedCanvas.height = 180;
+        const setSceneCanvasSpy = vi.fn();
+        const renderSpy = vi.fn();
+        vi.spyOn(GlassWebglRenderer, "create").mockReturnValue({
+            hasSceneTexture: true,
+            render: renderSpy,
+            setSceneCanvas: setSceneCanvasSpy,
+            dispose: vi.fn(),
+        } as unknown as GlassWebglRenderer);
+        const acquireSpy = vi
+            .spyOn(sceneCapture, "acquireSharedSceneCapture")
+            .mockImplementation((sourceEl) => {
+                vi.spyOn(sourceEl, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, 320, 180));
+                return {
+                    canvas: capturedCanvas,
+                    source: sourceEl,
+                    subscribe(listener) {
+                        listener(capturedCanvas, sourceEl);
+                        return () => {};
+                    },
+                    scheduleCapture: vi.fn(),
+                    setActive: vi.fn(),
+                    destroy: vi.fn(),
+                };
+            });
+
+        const rafQueue: FrameRequestCallback[] = [];
+        vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+            rafQueue.push(cb);
+            return rafQueue.length;
+        });
+        vi.stubGlobal("cancelAnimationFrame", vi.fn());
+
+        try {
+            const view = render(
+                <LiquidGlassProvider captureScene="always">
+                    <LiquidGlass engine="webgl" highlight={0.4} data-testid="webgl-child">
+                        Glass
+                    </LiquidGlass>
+                </LiquidGlassProvider>,
+            );
+            const child = screen.getByTestId("webgl-child");
+            vi.spyOn(child, "getBoundingClientRect").mockReturnValue(new DOMRect(10, 10, 120, 60));
+            while (rafQueue.length > 0) rafQueue.shift()!(16);
+
+            expect(acquireSpy).toHaveBeenCalledTimes(1);
+            expect(setSceneCanvasSpy).toHaveBeenCalledTimes(1);
+            expect(setSceneCanvasSpy).toHaveBeenCalledWith(capturedCanvas);
+
+            view.rerender(
+                <LiquidGlassProvider captureScene="always">
+                    <LiquidGlass engine="webgl" highlight={0.75} data-testid="webgl-child">
+                        Glass
+                    </LiquidGlass>
+                </LiquidGlassProvider>,
+            );
+            while (rafQueue.length > 0) rafQueue.shift()!(16);
+            expect(setSceneCanvasSpy).toHaveBeenCalledTimes(1);
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it("forwards sharpness in React LiquidGlassProvider scene capture and reschedules when sharpness or blur changes", () => {
+        const scheduleCapture = vi.fn();
+        let qualityGetter: (() => unknown) | undefined;
+        vi.spyOn(sceneCapture, "acquireSharedSceneCapture").mockImplementation((sourceEl, getQuality) => {
+            qualityGetter = getQuality;
+            return {
+                canvas: document.createElement("canvas"),
+                source: sourceEl,
+                subscribe: () => () => {},
+                scheduleCapture,
+                setActive: vi.fn(),
+                destroy: vi.fn(),
+            };
+        });
+
+        const view = render(
+            <LiquidGlassProvider captureScene="always" defaults={{ blur: 0 }}>
+                <span>Scene</span>
+            </LiquidGlassProvider>,
+        );
+        expect(qualityGetter?.()).toMatchObject({ sharpness: 0.65 });
+
+        scheduleCapture.mockClear();
+        view.rerender(
+            <LiquidGlassProvider captureScene="always" defaults={{ blur: 0, sharpness: 1 }}>
+                <span>Scene</span>
+            </LiquidGlassProvider>,
+        );
+        expect(scheduleCapture).toHaveBeenCalledTimes(1);
+        expect(qualityGetter?.()).toMatchObject({ sharpness: 1 });
+
+        scheduleCapture.mockClear();
+        view.rerender(
+            <LiquidGlassProvider captureScene="always" defaults={{ blur: 8 }}>
+                <span>Scene</span>
+            </LiquidGlassProvider>,
+        );
+        expect(scheduleCapture).toHaveBeenCalledTimes(1);
+        expect(qualityGetter?.()).not.toHaveProperty("sharpness");
     });
 });

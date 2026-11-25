@@ -1,6 +1,9 @@
 import "../src/styles.css";
 import "./playground.css";
+import { parseCssColorToRgb } from "../src/core/cssColor.js";
 import {
+    DEFAULT_ABBE_NUMBER,
+    DEFAULT_CHROMATIC_ABERRATION,
     GLASS_PRESETS,
     createGlassSwitch,
     createLiquidGlass,
@@ -63,6 +66,7 @@ const ctrlBezel = document.getElementById("ctrl-bezel") as HTMLInputElement;
 const ctrlScaleRatio = document.getElementById("ctrl-scale-ratio") as HTMLInputElement;
 const ctrlIor = document.getElementById("ctrl-ior") as HTMLInputElement;
 const ctrlBlur = document.getElementById("ctrl-blur") as HTMLInputElement;
+const ctrlSharpness = document.getElementById("ctrl-sharpness") as HTMLInputElement;
 const ctrlRadius = document.getElementById("ctrl-radius") as HTMLInputElement;
 const ctrlHighlight = document.getElementById("ctrl-highlight") as HTMLInputElement;
 const ctrlPill = document.getElementById("ctrl-pill") as HTMLInputElement;
@@ -109,6 +113,7 @@ function readOptions(): LiquidGlassOptions {
         adaptiveRefraction: ctrlAdaptive.checked,
         ior: Number(ctrlIor.value),
         blur: Number(ctrlBlur.value),
+        sharpness: ctrlSharpness.valueAsNumber < 0 ? undefined : ctrlSharpness.valueAsNumber,
         saturation: ctrlSaturation.valueAsNumber < 0 ? undefined : ctrlSaturation.valueAsNumber,
         radius: Number(ctrlRadius.value),
         highlight: Number(ctrlHighlight.value),
@@ -148,7 +153,10 @@ const circleGlass = createLiquidGlass(circleEl, {
 const sliderGlass = sliderEl.glassEffect({
     sceneElement: sceneEl,
     engine: ctrlEngine.value as GlassEngineMode,
+    theme: ctrlTheme.value as GlassTheme,
+    sharpness: ctrlSharpness.valueAsNumber < 0 ? undefined : ctrlSharpness.valueAsNumber,
     chromaticAberration: ctrlChroma.valueAsNumber,
+    abbeNumber: Number(ctrlAbbe.value),
 });
 
 function toSwitchGlassOptions(options: LiquidGlassOptions): LiquidGlassSwitchOptions {
@@ -190,17 +198,25 @@ function applyPresetValues(presetKey: GlassPreset): void {
     if (preset.scaleRatio !== undefined) ctrlScaleRatio.value = String(preset.scaleRatio);
     if (preset.ior !== undefined) ctrlIor.value = String(preset.ior);
     if (preset.blur !== undefined) ctrlBlur.value = String(preset.blur);
+    ctrlSharpness.value = preset.sharpness !== undefined ? String(preset.sharpness) : "-0.05";
     if (preset.highlight !== undefined) ctrlHighlight.value = String(preset.highlight);
-    if (preset.abbeNumber !== undefined) ctrlAbbe.value = String(preset.abbeNumber);
-    if (preset.chromaticAberration !== undefined) {
-        ctrlChroma.value = String(
-            preset.chromaticAberration === true ? 0.5 : preset.chromaticAberration === false ? 0 : preset.chromaticAberration,
-        );
-    }
+    ctrlSaturation.value = preset.saturation !== undefined ? String(preset.saturation) : "-0.05";
+    ctrlAbbe.value = String(preset.abbeNumber ?? DEFAULT_ABBE_NUMBER);
+    ctrlChroma.value =
+        preset.chromaticAberration === undefined || preset.chromaticAberration === false
+            ? "0"
+            : preset.chromaticAberration === true
+              ? String(DEFAULT_CHROMATIC_ABERRATION)
+              : String(preset.chromaticAberration);
     if (preset.tintColor !== undefined || preset.tintOpacity !== undefined) {
         ctrlTintEnabled.checked = true;
-        if (preset.tintColor && preset.tintColor.startsWith("#") && preset.tintColor.length === 7) {
-            ctrlTintColor.value = preset.tintColor;
+        if (preset.tintColor) {
+            const [red, green, blue] = parseCssColorToRgb(preset.tintColor);
+            const toHex = (channel: number) =>
+                Math.round(Math.min(1, Math.max(0, channel)) * 255)
+                    .toString(16)
+                    .padStart(2, "0");
+            ctrlTintColor.value = `#${toHex(red)}${toHex(green)}${toHex(blue)}`;
         }
         if (preset.tintOpacity !== undefined) ctrlTintOpacity.value = String(preset.tintOpacity);
     } else {
@@ -208,18 +224,17 @@ function applyPresetValues(presetKey: GlassPreset): void {
     }
 }
 
-function syncControls(event?: Event) {
-    if (event?.target === ctrlPreset && ctrlPreset.value) {
-        applyPresetValues(ctrlPreset.value as GlassPreset);
-    } else if (event && event.target !== ctrlPreset && event.target !== ctrlEngine) {
-        ctrlPreset.value = "";
-    }
+let pendingControlSyncRaf: number | null = null;
+let lastAppliedControlSnapshot = "";
 
+function updateControlReadouts(): void {
     document.getElementById("val-thickness")!.textContent = ctrlThickness.value;
     document.getElementById("val-bezel")!.textContent = ctrlBezel.value;
     document.getElementById("val-scale-ratio")!.textContent = ctrlScaleRatio.value;
     document.getElementById("val-ior")!.textContent = ctrlIor.value;
     document.getElementById("val-blur")!.textContent = ctrlBlur.value;
+    document.getElementById("val-sharpness")!.textContent =
+        ctrlSharpness.valueAsNumber < 0 ? "auto" : ctrlSharpness.value;
     document.getElementById("val-radius")!.textContent = ctrlRadius.value;
     document.getElementById("val-highlight")!.textContent = ctrlHighlight.value;
     document.getElementById("val-saturation")!.textContent = ctrlSaturation.valueAsNumber < 0 ? "auto" : ctrlSaturation.value;
@@ -231,6 +246,45 @@ function syncControls(event?: Event) {
     document.getElementById("val-switch-color")!.textContent = ctrlSwitchColor.value;
     document.getElementById("val-switch-track-opacity")!.textContent = ctrlSwitchTrackOpacity.value;
     document.getElementById("val-switch-glider-opacity")!.textContent = ctrlSwitchGliderOpacity.value;
+}
+
+function flushGlassControlUpdates(): void {
+    pendingControlSyncRaf = null;
+    const opts = readOptions();
+    const controlSnapshot = JSON.stringify({
+        engine: opts.engine,
+        theme: opts.theme,
+        surface: opts.surface,
+        thickness: opts.thickness,
+        bezel: opts.bezel,
+        scaleRatio: opts.scaleRatio,
+        adaptiveRefraction: opts.adaptiveRefraction,
+        ior: opts.ior,
+        blur: opts.blur,
+        sharpness: opts.sharpness,
+        saturation: opts.saturation,
+        radius: opts.radius,
+        highlight: opts.highlight,
+        lightTilt: ctrlLightTilt.value,
+        tintColor: opts.tintColor,
+        tintOpacity: opts.tintOpacity,
+        pill: opts.pill,
+        cornerStyle: opts.cornerStyle,
+        hollow: opts.hollow,
+        coalesce: opts.coalesce,
+        chromaticAberration: opts.chromaticAberration,
+        abbeNumber: opts.abbeNumber,
+        switchRefraction: ctrlSwitchRefraction.value,
+        switchFade: ctrlSwitchFade.value,
+        gliderStrength: ctrlGliderStrength.value,
+        switchColor: ctrlSwitchColor.value,
+        switchTrackColor: ctrlSwitchTrackColor.value,
+        switchTrackOpacity: ctrlSwitchTrackOpacity.value,
+        switchGliderColor: ctrlSwitchGliderColor.value,
+        switchGliderOpacity: ctrlSwitchGliderOpacity.value,
+    });
+    if (controlSnapshot === lastAppliedControlSnapshot) return;
+    lastAppliedControlSnapshot = controlSnapshot;
 
     switchEl.style.setProperty("--lg-switch-active-ink", ctrlSwitchColor.value);
     switchEl.style.setProperty(
@@ -242,7 +296,6 @@ function syncControls(event?: Event) {
         hexToRgba(ctrlSwitchGliderColor.value, Number(ctrlSwitchGliderOpacity.value)),
     );
 
-    const opts = readOptions();
     panelGlass.update(opts);
     dockGlass.update({ ...opts, pill: true });
     pillGlass.update({ ...opts, pill: true });
@@ -251,11 +304,36 @@ function syncControls(event?: Event) {
         engine: opts.engine,
         theme: opts.theme,
         sceneElement: sceneEl,
+        sharpness: opts.sharpness,
         chromaticAberration: opts.chromaticAberration,
+        abbeNumber: opts.abbeNumber,
         saturation: opts.saturation,
     });
     switchGlass.update(toSwitchGlassOptions(opts));
     requestAnimationFrame(refreshStats);
+}
+
+function syncControls(event?: Event) {
+    if (event?.target === ctrlPreset && ctrlPreset.value) {
+        applyPresetValues(ctrlPreset.value as GlassPreset);
+    } else if (event && event.target !== ctrlPreset && event.target !== ctrlEngine) {
+        ctrlPreset.value = "";
+    }
+
+    updateControlReadouts();
+
+    if (event?.type === "input") {
+        if (pendingControlSyncRaf === null) {
+            pendingControlSyncRaf = requestAnimationFrame(flushGlassControlUpdates);
+        }
+        return;
+    }
+
+    if (pendingControlSyncRaf !== null) {
+        cancelAnimationFrame(pendingControlSyncRaf);
+        pendingControlSyncRaf = null;
+    }
+    flushGlassControlUpdates();
 }
 
 const allControls = [
@@ -269,6 +347,7 @@ const allControls = [
     ctrlScaleRatio,
     ctrlIor,
     ctrlBlur,
+    ctrlSharpness,
     ctrlRadius,
     ctrlHighlight,
     ctrlPill,
@@ -316,11 +395,11 @@ copyConfigBtn.addEventListener("click", async () => {
 });
 
 function applySwitchThemeDefaults(isDark: boolean): void {
-    ctrlSwitchColor.value = isDark ? "#38bdf8" : "#007aff";
-    ctrlSwitchTrackColor.value = isDark ? "#101216" : "#ffffff";
-    ctrlSwitchTrackOpacity.value = isDark ? "0.38" : "0.22";
-    ctrlSwitchGliderColor.value = isDark ? "#a2a8b2" : "#cbd5e1";
-    ctrlSwitchGliderOpacity.value = isDark ? "0.26" : "0.36";
+    ctrlSwitchColor.value = isDark ? "#409cff" : "#007aff";
+    ctrlSwitchTrackColor.value = isDark ? "#1c1c1e" : "#ffffff";
+    ctrlSwitchTrackOpacity.value = isDark ? "0.60" : "0.22";
+    ctrlSwitchGliderColor.value = isDark ? "#8e8e93" : "#cbd5e1";
+    ctrlSwitchGliderOpacity.value = isDark ? "0.30" : "0.36";
 }
 
 resetControlsBtn.addEventListener("click", () => {
@@ -334,11 +413,12 @@ resetControlsBtn.addEventListener("click", () => {
     ctrlScaleRatio.value = "2.35";
     ctrlIor.value = "2.15";
     ctrlBlur.value = "2";
+    ctrlSharpness.value = "-0.05";
     ctrlRadius.value = "22";
-    ctrlHighlight.value = "0.4";
+    ctrlHighlight.value = "0.7";
     ctrlSaturation.value = "-0.05";
     ctrlChroma.value = "0";
-    ctrlAbbe.value = "58.5";
+    ctrlAbbe.value = String(DEFAULT_ABBE_NUMBER);
     ctrlTintEnabled.checked = false;
     ctrlTintColor.value = "#ffffff";
     ctrlTintOpacity.value = "0.12";
@@ -397,11 +477,19 @@ panelEl.addEventListener("pointerdown", (event) => {
     originTop = rect.top;
 });
 
+let panelDragRefreshRaf: number | null = null;
 panelEl.addEventListener("pointermove", (event) => {
     if (!dragging || event.pointerId !== activePointerId) return;
     panelEl.style.left = `${Math.round(originLeft + (event.clientX - startX))}px`;
     panelEl.style.top = `${Math.round(originTop + (event.clientY - startY))}px`;
-    panelGlass.refresh();
+    if (panelGlass.engine === "webgl") {
+        panelGlass.refreshMotion();
+    } else if (ctrlCoalesce.checked && panelDragRefreshRaf === null) {
+        panelDragRefreshRaf = requestAnimationFrame(() => {
+            panelDragRefreshRaf = null;
+            panelGlass.refresh();
+        });
+    }
 });
 
 panelEl.addEventListener("pointerup", stopDragging);
@@ -414,6 +502,9 @@ const makeCapsuleDraggable = (targetEl: HTMLElement) => {
     let capsuleStartY = 0;
     let origLeft = 0;
     let origTop = 0;
+    let cachedCapsuleWidth = 0;
+    let cachedCapsuleHeight = 0;
+    let capsuleDragRefreshRaf: number | null = null;
     targetEl.addEventListener("pointerdown", (event) => {
         if (event.button !== 0) return;
         const rect = targetEl.getBoundingClientRect();
@@ -422,6 +513,8 @@ const makeCapsuleDraggable = (targetEl: HTMLElement) => {
         capsuleStartY = event.clientY;
         origLeft = rect.left;
         origTop = rect.top;
+        cachedCapsuleWidth = targetEl.offsetWidth || rect.width;
+        cachedCapsuleHeight = targetEl.offsetHeight || rect.height;
         targetEl.style.right = "auto";
         targetEl.style.marginInline = "0";
         targetEl.style.left = `${origLeft}px`;
@@ -430,9 +523,16 @@ const makeCapsuleDraggable = (targetEl: HTMLElement) => {
     });
     targetEl.addEventListener("pointermove", (event) => {
         if (!capsuleDragging) return;
-        targetEl.style.left = `${Math.max(8, Math.min(window.innerWidth - targetEl.offsetWidth - 8, origLeft + event.clientX - capsuleStartX))}px`;
-        targetEl.style.top = `${Math.max(8, Math.min(window.innerHeight - targetEl.offsetHeight - 8, origTop + event.clientY - capsuleStartY))}px`;
-        dockGlass.refresh();
+        targetEl.style.left = `${Math.max(8, Math.min(window.innerWidth - cachedCapsuleWidth - 8, origLeft + event.clientX - capsuleStartX))}px`;
+        targetEl.style.top = `${Math.max(8, Math.min(window.innerHeight - cachedCapsuleHeight - 8, origTop + event.clientY - capsuleStartY))}px`;
+        if (dockGlass.engine === "webgl") {
+            dockGlass.refreshMotion();
+        } else if (ctrlCoalesce.checked && capsuleDragRefreshRaf === null) {
+            capsuleDragRefreshRaf = requestAnimationFrame(() => {
+                capsuleDragRefreshRaf = null;
+                dockGlass.refresh();
+            });
+        }
     });
     const finish = () => {
         capsuleDragging = false;

@@ -34,6 +34,15 @@ export function useGlassSlider(
     let instance: LiquidGlassSliderInstance | null = null;
     let prevMergedOptions: LiquidGlassSliderOptions | null = null;
 
+    const handleChange = (nextValue: number, inputElement: HTMLInputElement) => {
+        value.value = nextValue;
+        toValue(options).onChange?.(nextValue, inputElement);
+    };
+    const handleEngineChange = (nextEngine: GlassEngine) => {
+        engine.value = nextEngine;
+        toValue(options).onEngineChange?.(nextEngine);
+    };
+
     const syncInstance = () => {
         const element = inputRef.value;
         if (!element) {
@@ -53,18 +62,19 @@ export function useGlassSlider(
         }
 
         const sceneElement = currentOptions.sceneElement ?? context?.sceneElement.value ?? null;
+        const sceneCanvas =
+            currentOptions.sceneCanvas ??
+            (currentOptions.sceneElement &&
+            currentOptions.sceneElement !== context?.sceneElement.value
+                ? null
+                : context?.sceneCanvas.value) ??
+            null;
         const mergedOptions: LiquidGlassSliderOptions = {
             ...mergeGlassOptions(context?.defaults.value, currentOptions),
-            sceneCanvas: currentOptions.sceneCanvas ?? (sceneElement ? null : context?.sceneCanvas.value) ?? null,
+            sceneCanvas,
             sceneElement,
-            onChange: (nextValue, inputEl) => {
-                value.value = nextValue;
-                currentOptions.onChange?.(nextValue, inputEl);
-            },
-            onEngineChange: (nextEngine) => {
-                engine.value = nextEngine;
-                currentOptions.onEngineChange?.(nextEngine);
-            },
+            onChange: handleChange,
+            onEngineChange: handleEngineChange,
         };
 
         if (!instance || instance.element !== element) {
@@ -76,7 +86,9 @@ export function useGlassSlider(
         } else {
             const patch = computeMergedOptionPatch(prevMergedOptions, mergedOptions);
             prevMergedOptions = mergedOptions;
-            instance.update(patch);
+            if (Object.keys(patch).length > 0) {
+                instance.update(patch);
+            }
             engine.value = instance.engine;
             value.value = instance.value;
         }

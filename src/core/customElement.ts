@@ -19,6 +19,7 @@ const SHORT_TO_DATA_ATTR: ReadonlyArray<readonly [string, string]> = [
     ["scale-ratio", "data-lg-scale-ratio"],
     ["max-scale-multiplier", "data-lg-max-scale-multiplier"],
     ["blur", "data-lg-blur"],
+    ["sharpness", "data-lg-sharpness"],
     ["saturation", "data-lg-saturation"],
     ["ior", "data-lg-ior"],
     ["radius", "data-lg-radius"],
@@ -161,6 +162,7 @@ export function registerLiquidGlassElement(tagName = "liquid-glass"): boolean {
             this.lastOptions = nextOptions;
             this.isSyncing = true;
             try {
+                this.instance?.destroy();
                 this.instance = createLiquidGlass(this, nextOptions);
             } finally {
                 this.isSyncing = false;
@@ -187,6 +189,7 @@ export function registerLiquidGlassElement(tagName = "liquid-glass"): boolean {
             const nextOptions = readCustomElementGlassOptions(this);
             const patch = computeMergedOptionPatch(this.lastOptions, nextOptions);
             this.lastOptions = nextOptions;
+            if (Object.keys(patch).length === 0) return;
             this.isSyncing = true;
             try {
                 this.instance.update(patch);

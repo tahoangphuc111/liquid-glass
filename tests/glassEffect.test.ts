@@ -146,6 +146,39 @@ describe("glassEffect helper and HTMLElement prototype method", () => {
         slider.destroy();
     });
 
+    it("reserves slider overshoot for a drag past the track and clears it on an immediate update", () => {
+        vi.useFakeTimers();
+        const input = document.createElement("input");
+        input.type = "range";
+        input.value = "90";
+        document.body.append(input);
+        const slider = createGlassSlider(input, { engine: "css" });
+        const wrapper = input.closest<HTMLElement>(".lg-slider")!;
+        vi.spyOn(wrapper, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, 200, 34));
+        const bounceX = () => Number.parseFloat(wrapper.style.getPropertyValue("--lg-slider-bounce-x"));
+
+        try {
+            slider.setValue(100);
+            vi.advanceTimersByTime(400);
+            expect(wrapper.style.getPropertyValue("--lg-slider-visual-progress")).toBe("1.0000");
+            expect(bounceX()).toBe(0);
+
+            input.dispatchEvent(new MouseEvent("pointerdown", { clientX: 190 }));
+            window.dispatchEvent(new MouseEvent("pointermove", { clientX: 215 }));
+            vi.advanceTimersByTime(48);
+            expect(bounceX()).toBeGreaterThan(0);
+
+            slider.setValue(0, false);
+            expect(wrapper.style.getPropertyValue("--lg-slider-visual-progress")).toBe("0.0000");
+            expect(bounceX()).toBe(0);
+            vi.advanceTimersByTime(400);
+            expect(bounceX()).toBe(0);
+        } finally {
+            slider.destroy();
+            vi.useRealTimers();
+        }
+    });
+
     it("snaps slider progress immediately when prefers-reduced-motion is enabled", () => {
         const origMatchMedia = window.matchMedia;
         let reduceMotion = true;
@@ -426,5 +459,16 @@ describe("glassEffect helper and HTMLElement prototype method", () => {
         expect(removedOnRelease).toHaveLength(1);
 
         slider.destroy();
+    });
+
+    it("ignores non-HTMLElement nodes when given a mixed iterable", () => {
+        const div = document.createElement("div");
+        const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        document.body.append(div, svg);
+
+        const group = glassEffect([div, svg as unknown as HTMLElement], { engine: "css" });
+        expect(group.instances).toHaveLength(1);
+        expect(group.instances[0]!.element).toBe(div);
+        group.destroy();
     });
 });

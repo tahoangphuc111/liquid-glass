@@ -4,6 +4,7 @@ import {
     acquireSharedSceneCapture,
     captureDomToCanvas,
     createSceneCaptureController,
+    resolveCaptureDimensions,
 } from "../src/core/sceneCapture.js";
 
 function createMockCanvas2dContext() {
@@ -113,6 +114,87 @@ describe("sceneCapture upgrades and visibility gating", () => {
         } finally {
             leaseA.destroy();
             leaseB.destroy();
+            vi.useRealTimers();
+        }
+    });
+
+    it("ignores scroll and load events inside descendant glass surfaces omitted from the capture", async () => {
+        vi.useFakeTimers();
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
+            createMockCanvas2dContext() as unknown as CanvasRenderingContext2D,
+        );
+        const source = document.body.appendChild(document.createElement("section"));
+        source.setAttribute("data-lg-surface", "convex_squircle");
+        setRect(source, 200, 100);
+        const managed = source.appendChild(document.createElement("div"));
+        managed.setAttribute("data-lg-surface", "convex_squircle");
+        const excluded = managed.appendChild(document.createElement("div"));
+        const included = source.appendChild(document.createElement("div"));
+        const capture = createSceneCaptureController(source);
+        const listener = vi.fn();
+        capture.subscribe(listener);
+        try {
+            await vi.advanceTimersByTimeAsync(32);
+            expect(listener).toHaveBeenCalledTimes(1);
+            excluded.dispatchEvent(new Event("load"));
+            excluded.dispatchEvent(new Event("scroll"));
+            await vi.advanceTimersByTimeAsync(160);
+            expect(listener).toHaveBeenCalledTimes(1);
+            included.dispatchEvent(new Event("scroll"));
+            await vi.advanceTimersByTimeAsync(32);
+            expect(listener).toHaveBeenCalledTimes(2);
+        } finally {
+            capture.destroy();
+            vi.useRealTimers();
+        }
+    });
+
+    it("notifies only visible leases and replays the newest shared capture once on resume", async () => {
+        vi.useFakeTimers();
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
+            createMockCanvas2dContext() as unknown as CanvasRenderingContext2D,
+        );
+        const source = document.body.appendChild(document.createElement("section"));
+        setRect(source, 200, 100);
+        const visible = acquireSharedSceneCapture(source);
+        const paused = acquireSharedSceneCapture(source);
+        const visibleListener = vi.fn();
+        const pausedListener = vi.fn();
+        const lateListener = vi.fn();
+        const removedListener = vi.fn();
+        visible.subscribe(visibleListener);
+        paused.subscribe(pausedListener);
+        try {
+            await vi.advanceTimersByTimeAsync(32);
+            expect(visibleListener).toHaveBeenCalledTimes(1);
+            expect(pausedListener).toHaveBeenCalledTimes(1);
+
+            paused.setActive?.(false);
+            paused.subscribe(lateListener);
+            const unsubscribe = paused.subscribe(removedListener);
+            for (let index = 0; index < 3; index++) {
+                visible.scheduleCapture();
+                await vi.advanceTimersByTimeAsync(32);
+            }
+            expect(visibleListener).toHaveBeenCalledTimes(4);
+            expect(pausedListener).toHaveBeenCalledTimes(1);
+            expect(lateListener).not.toHaveBeenCalled();
+            unsubscribe();
+
+            paused.setActive?.(true);
+            expect(pausedListener).toHaveBeenCalledTimes(2);
+            expect(pausedListener).toHaveBeenLastCalledWith(visible.canvas, source);
+            expect(lateListener).toHaveBeenCalledOnce();
+            expect(removedListener).not.toHaveBeenCalled();
+            paused.setActive?.(false);
+            paused.setActive?.(true);
+            await vi.advanceTimersByTimeAsync(160);
+            expect(visibleListener).toHaveBeenCalledTimes(4);
+            expect(pausedListener).toHaveBeenCalledTimes(2);
+            expect(lateListener).toHaveBeenCalledOnce();
+        } finally {
+            visible.destroy();
+            paused.destroy();
             vi.useRealTimers();
         }
     });
@@ -442,7 +524,7 @@ describe("sceneCapture upgrades and visibility gating", () => {
         document.body.appendChild(sceneEl);
         setRect(sceneEl, 320, 200);
 
-        const leaseA = acquireSharedSceneCapture(sceneEl, () => ({ pixelRatio: 1, radius: 0 }));
+        const leaseA = acquireSharedSceneCapture(sceneEl, () => ({ radius: 24 }));
         const leaseB = acquireSharedSceneCapture(sceneEl, () => ({ pixelRatio: 1, radius: 24 }));
 
         expect(leaseA.source).toBe(sceneEl);
@@ -491,6 +573,296 @@ describe("sceneCapture upgrades and visibility gating", () => {
         }
     });
 
+    it("coalesces root style mutations while applying theme changes on the next frame", async () => {
+        vi.useFakeTimers();
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
+            createMockCanvas2dContext() as unknown as CanvasRenderingContext2D,
+        );
+        const source = document.body.appendChild(document.createElement("section"));
+        setRect(source, 240, 40);
+        const capture = createSceneCaptureController(source);
+        const listener = vi.fn();
+        capture.subscribe(listener);
+        const root = document.documentElement;
+        const previousTheme = root.getAttribute("data-theme");
+        try {
+            await vi.advanceTimersByTimeAsync(32);
+            expect(listener).toHaveBeenCalledTimes(1);
+            for (let index = 0; index < 5; index++) {
+                root.style.setProperty("--lg-test-animated-style", String(index));
+                await vi.advanceTimersByTimeAsync(16);
+            }
+            expect(listener).toHaveBeenCalledTimes(1);
+            await vi.advanceTimersByTimeAsync(32);
+            expect(listener).toHaveBeenCalledTimes(2);
+
+            root.style.setProperty("--lg-test-animated-style", "5");
+            root.setAttribute("data-theme", "lg-test-dark");
+            await vi.advanceTimersByTimeAsync(16);
+            expect(listener).toHaveBeenCalledTimes(3);
+            await vi.advanceTimersByTimeAsync(160);
+            expect(listener).toHaveBeenCalledTimes(3);
+
+            source.style.setProperty("--lg-local-style", "1");
+            source.setAttribute("data-theme", "dark");
+            await vi.advanceTimersByTimeAsync(16);
+            expect(listener).toHaveBeenCalledTimes(4);
+        } finally {
+            capture.destroy();
+            root.style.removeProperty("--lg-test-animated-style");
+            if (previousTheme === null) root.removeAttribute("data-theme");
+            else root.setAttribute("data-theme", previousTheme);
+            vi.useRealTimers();
+        }
+    });
+
+    it("shares document listeners across scene sources and detaches after the last capture", async () => {
+        vi.useFakeTimers();
+        const addWindowListener = vi.spyOn(window, "addEventListener");
+        const removeWindowListener = vi.spyOn(window, "removeEventListener");
+        const addDocumentListener = vi.spyOn(document, "addEventListener");
+        const removeDocumentListener = vi.spyOn(document, "removeEventListener");
+        const observeMutations = vi.spyOn(MutationObserver.prototype, "observe");
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
+            createMockCanvas2dContext() as unknown as CanvasRenderingContext2D,
+        );
+        const first = document.body.appendChild(document.createElement("section"));
+        const second = document.body.appendChild(document.createElement("section"));
+        setRect(first, 200, 80);
+        setRect(second, 200, 80);
+        const firstCapture = createSceneCaptureController(first);
+        const secondCapture = createSceneCaptureController(second);
+        const firstPaint = vi.fn();
+        const secondPaint = vi.fn();
+        firstCapture.subscribe(firstPaint);
+        secondCapture.subscribe(secondPaint);
+        const root = document.documentElement;
+        const previousTheme = root.getAttribute("data-theme");
+        try {
+            const resizeListeners = addWindowListener.mock.calls.filter(([type]) => type === "resize");
+            const visibilityListeners = addDocumentListener.mock.calls.filter(([type]) => type === "visibilitychange");
+            expect(resizeListeners).toHaveLength(1);
+            expect(visibilityListeners).toHaveLength(1);
+            expect(observeMutations.mock.calls.filter(([target]) => target === root)).toHaveLength(1);
+            expect(observeMutations.mock.calls.filter(([target]) => target === document.body)).toHaveLength(1);
+            await vi.advanceTimersByTimeAsync(32);
+            root.setAttribute("data-theme", "lg-shared-signal-dark");
+            await vi.advanceTimersByTimeAsync(16);
+            expect(firstPaint).toHaveBeenCalledTimes(2);
+            expect(secondPaint).toHaveBeenCalledTimes(2);
+
+            firstCapture.destroy();
+            expect(removeWindowListener).not.toHaveBeenCalledWith("resize", resizeListeners[0]![1]);
+            root.setAttribute("data-theme", "lg-shared-signal-light");
+            await vi.advanceTimersByTimeAsync(16);
+            expect(firstPaint).toHaveBeenCalledTimes(2);
+            expect(secondPaint).toHaveBeenCalledTimes(3);
+
+            secondCapture.destroy();
+            expect(removeWindowListener).toHaveBeenCalledWith("resize", resizeListeners[0]![1]);
+            expect(removeDocumentListener).toHaveBeenCalledWith("visibilitychange", visibilityListeners[0]![1]);
+        } finally {
+            firstCapture.destroy();
+            secondCapture.destroy();
+            if (previousTheme === null) root.removeAttribute("data-theme");
+            else root.setAttribute("data-theme", previousTheme);
+            vi.useRealTimers();
+        }
+    });
+
+    it("recaptures after hidden or SVG attribute changes and after a video becomes ready or seeks", async () => {
+        vi.useFakeTimers();
+        const context = createMockCanvas2dContext();
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
+            context as unknown as CanvasRenderingContext2D,
+        );
+        const source = document.body.appendChild(document.createElement("section"));
+        source.setAttribute("data-lg-surface", "");
+        const content = source.appendChild(document.createElement("div"));
+        const video = content.appendChild(document.createElement("video"));
+        const svgNs = "http://www.w3.org/2000/svg";
+        const svg = source.appendChild(document.createElementNS(svgNs, "svg"));
+        const shape = svg.appendChild(document.createElementNS(svgNs, "rect"));
+        setRect(source, 200, 80);
+        setRect(content, 80, 40);
+        setRect(video, 80, 40);
+        let readyState = 0;
+        Object.defineProperties(video, {
+            readyState: { get: () => readyState },
+            videoWidth: { value: 80 },
+            videoHeight: { value: 40 },
+        });
+        const capture = createSceneCaptureController(source);
+        const paint = vi.fn();
+        capture.subscribe(paint);
+        try {
+            await vi.advanceTimersByTimeAsync(32);
+            expect(paint).toHaveBeenCalledTimes(1);
+            readyState = 2;
+            video.dispatchEvent(new Event("loadeddata"));
+            await vi.advanceTimersByTimeAsync(140);
+            expect(paint).toHaveBeenCalledTimes(2);
+            expect(context.drawImage.mock.calls[0]?.[0]).toBe(video);
+
+            video.dispatchEvent(new Event("seeked"));
+            await vi.advanceTimersByTimeAsync(140);
+            expect(paint).toHaveBeenCalledTimes(3);
+
+            shape.setAttribute("fill", "red");
+            await vi.advanceTimersByTimeAsync(140);
+            expect(paint).toHaveBeenCalledTimes(4);
+
+            context.drawImage.mockClear();
+            content.hidden = true;
+            await vi.advanceTimersByTimeAsync(140);
+            expect(paint).toHaveBeenCalledTimes(5);
+            expect(context.drawImage).not.toHaveBeenCalled();
+        } finally {
+            capture.destroy();
+            vi.useRealTimers();
+        }
+    });
+
+    it("invalidates collapsed scenes once and tells a paused shared lease when it resumes", async () => {
+        vi.useFakeTimers();
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
+            createMockCanvas2dContext() as unknown as CanvasRenderingContext2D,
+        );
+        const source = document.body.appendChild(document.createElement("section"));
+        setRect(source, 200, 80);
+        const capture = acquireSharedSceneCapture(source);
+        const paused = acquireSharedSceneCapture(source);
+        const widths: number[] = [];
+        const pausedWidths: number[] = [];
+        capture.subscribe((canvas) => widths.push(canvas.width));
+        paused.subscribe((canvas) => pausedWidths.push(canvas.width));
+        try {
+            await vi.advanceTimersByTimeAsync(32);
+            const canvas = capture.canvas!;
+            const initialWidth = canvas.width;
+            paused.setActive?.(false);
+            setRect(source, 0, 0);
+            capture.scheduleCapture();
+            await vi.advanceTimersByTimeAsync(32);
+            expect(capture.canvas).toBeNull();
+            expect(widths).toEqual([initialWidth, 0]);
+            expect(pausedWidths).toEqual([initialWidth]);
+            capture.scheduleCapture();
+            await vi.advanceTimersByTimeAsync(32);
+            expect(widths).toHaveLength(2);
+
+            paused.setActive?.(true);
+            expect(pausedWidths).toEqual([initialWidth, 0]);
+            setRect(source, 200, 80);
+            capture.scheduleCapture();
+            await vi.advanceTimersByTimeAsync(32);
+            expect(capture.canvas).toBe(canvas);
+            expect(widths).toEqual([initialWidth, 0, initialWidth]);
+            expect(pausedWidths).toEqual(widths);
+        } finally {
+            paused.destroy();
+            capture.destroy();
+            vi.useRealTimers();
+        }
+    });
+
+    it("keeps overflowing content visible on the unclipped axis", () => {
+        const source = document.body.appendChild(document.createElement("section"));
+        const clip = source.appendChild(document.createElement("div"));
+        clip.style.overflowX = "clip";
+        clip.style.overflowY = "visible";
+        const visible = clip.appendChild(document.createElement("div"));
+        const clipped = clip.appendChild(document.createElement("div"));
+        visible.style.backgroundColor = "lime";
+        clipped.style.backgroundColor = "red";
+        setRect(source, 200, 160);
+        setRect(clip, 80, 40, 10, 10);
+        setRect(visible, 30, 20, 20, 80);
+        setRect(clipped, 30, 20, 100, 80);
+        const canvas = document.createElement("canvas");
+        const context = createMockCanvas2dContext();
+        vi.spyOn(canvas, "getContext").mockReturnValue(context as unknown as CanvasRenderingContext2D);
+
+        expect(captureDomToCanvas(source, canvas, document.createRange(), 1)).toBe(true);
+        expect(context.fillRect).toHaveBeenCalledWith(20, 80, 30, 20);
+        expect(context.fillRect).not.toHaveBeenCalledWith(100, 80, 30, 20);
+    });
+
+    it("paints the ancestor behind a nearly opaque scene on every capture", () => {
+        const parent = document.body.appendChild(document.createElement("div"));
+        parent.style.backgroundColor = "blue";
+        const source = parent.appendChild(document.createElement("section"));
+        source.style.backgroundColor = "rgba(255, 0, 0, 0.99)";
+        setRect(source, 160, 100);
+        const canvas = document.createElement("canvas");
+        const context = createMockCanvas2dContext();
+        vi.spyOn(canvas, "getContext").mockReturnValue(context as unknown as CanvasRenderingContext2D);
+        const colors: string[] = [];
+        context.fillRect.mockImplementation(() => { colors.push(context.fillStyle); });
+        const range = document.createRange();
+
+        expect(captureDomToCanvas(source, canvas, range, 1)).toBe(true);
+        parent.style.backgroundColor = "lime";
+        expect(captureDomToCanvas(source, canvas, range, 1)).toBe(true);
+
+        expect(colors).toEqual([
+            "rgb(0, 0, 255)", "rgba(255, 0, 0, 0.99)",
+            "rgb(0, 255, 0)", "rgba(255, 0, 0, 0.99)",
+        ]);
+    });
+
+    it("skips canvas draws for clipped lines in long text", () => {
+        const source = document.body.appendChild(document.createElement("section"));
+        const paragraph = source.appendChild(document.createElement("pre"));
+        paragraph.style.whiteSpace = "pre";
+        paragraph.textContent = Array.from({ length: 100 }, (_, index) => `Line ${index}`).join("\n");
+        setRect(source, 160, 60);
+        const canvas = document.createElement("canvas");
+        const context = createMockCanvas2dContext();
+        vi.spyOn(canvas, "getContext").mockReturnValue(context as unknown as CanvasRenderingContext2D);
+        const range = document.createRange();
+        Object.defineProperty(range, "getClientRects", {
+            value: () => Array.from({ length: 100 }, (_, index) => new DOMRect(8, index * 20, 60, 20)),
+        });
+
+        expect(captureDomToCanvas(source, canvas, range, 1)).toBe(true);
+        expect(context.fillText.mock.calls).toEqual([
+            ["Line 0", 8, 10],
+            ["Line 1", 8, 30],
+            ["Line 2", 8, 50],
+            ["Line 3", 8, 70],
+        ]);
+    });
+
+    it("keeps automatic rounded capture quality when a second lease requests a lower or invalid scale", () => {
+        vi.useFakeTimers();
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
+            createMockCanvas2dContext() as unknown as CanvasRenderingContext2D,
+        );
+        const source = document.body.appendChild(document.createElement("section"));
+        setRect(source, 160, 100);
+        const low = acquireSharedSceneCapture(source, () => ({ pixelRatio: 0.5, radius: 0 }));
+        let rounded: ReturnType<typeof acquireSharedSceneCapture> | undefined;
+        let invalid: ReturnType<typeof acquireSharedSceneCapture> | undefined;
+        try {
+            vi.advanceTimersByTime(32);
+            expect(low.canvas?.width).toBe(80);
+            rounded = acquireSharedSceneCapture(source, () => ({ radius: 12 }));
+            invalid = acquireSharedSceneCapture(source, () => ({ radius: 0, pixelRatio: NaN }));
+            vi.advanceTimersByTime(32);
+            const { texWidth } = resolveCaptureDimensions(160, 100, undefined, 12);
+            expect(low.canvas?.width).toBe(texWidth);
+            rounded.destroy();
+            vi.advanceTimersByTime(32);
+            expect(low.canvas?.width).toBe(80);
+        } finally {
+            low.destroy();
+            rounded?.destroy();
+            invalid?.destroy();
+            vi.useRealTimers();
+        }
+    });
+
     it("shrinks a shared capture when its last rounded consumer leaves", () => {
         vi.useFakeTimers();
         try {
@@ -504,7 +876,7 @@ describe("sceneCapture upgrades and visibility gating", () => {
             expect(square.canvas!.width).toBeGreaterThan(320);
             rounded.destroy();
             vi.advanceTimersByTime(32);
-            expect(square.canvas!.width).toBe(64);
+            expect(square.canvas!.width).toBe(32);
             square.destroy();
         } finally {
             vi.useRealTimers();
@@ -551,6 +923,85 @@ describe("sceneCapture upgrades and visibility gating", () => {
         expect(getClientRectsSpy).toHaveBeenCalledTimes(1);
         expect(getBoundingClientRectSpy).not.toHaveBeenCalled();
         expect(mockCtx.fillText).toHaveBeenCalledWith("Hello Glass", 12, 30);
+    });
+
+    it("reuses wrapped text during scrolling and refits when text, widths, or typography change", () => {
+        const scene = document.body.appendChild(document.createElement("section"));
+        const paragraph = scene.appendChild(document.createElement("p"));
+        paragraph.style.fontSize = "16px";
+        paragraph.textContent = "One two three four five six seven eight nine";
+        setRect(scene, 160, 110);
+        const ctx = Object.assign(createMockCanvas2dContext(), { letterSpacing: "0px" });
+        ctx.measureText = vi.fn((text: string) => ({ width: text.length * 6 }));
+        const canvas = document.createElement("canvas");
+        vi.spyOn(canvas, "getContext").mockReturnValue(ctx as unknown as CanvasRenderingContext2D);
+        const range = document.createRange();
+        let top = 30;
+        let width = 100;
+        Object.defineProperty(range, "getClientRects", {
+            value: () => [0, 1, 2].map((index) => new DOMRect(8, top + index * 18, width, 18)),
+        });
+        const capture = () => expect(captureDomToCanvas(scene, canvas, range, 1)).toBe(true);
+
+        capture();
+        expect(ctx.measureText).toHaveBeenCalled();
+        const initialLines = ctx.fillText.mock.calls.slice();
+        expect(initialLines.length).toBeGreaterThan(1);
+        ctx.measureText.mockClear();
+        ctx.fillText.mockClear();
+        top -= 12;
+        capture();
+        expect(ctx.measureText).not.toHaveBeenCalled();
+        expect(ctx.fillText.mock.calls).toEqual(initialLines.map(([text, x, y]) => [text, x, y - 12]));
+
+        for (const change of [
+            () => { width = 60; },
+            () => { paragraph.style.fontSize = "20px"; },
+            () => { paragraph.style.letterSpacing = "2px"; },
+            () => { paragraph.firstChild!.textContent += " ten"; },
+        ]) {
+            change();
+            ctx.measureText.mockClear();
+            capture();
+            expect(ctx.measureText).toHaveBeenCalled();
+        }
+    });
+
+    it("refits wrapped text when the loaded font set changes at the same size", () => {
+        const scene = document.body.appendChild(document.createElement("section"));
+        scene.textContent = "Wrapped text uses a downloadable font when it is available";
+        setRect(scene, 160, 110);
+        const canvas = document.createElement("canvas");
+        const ctx = createMockCanvas2dContext();
+        vi.spyOn(canvas, "getContext").mockReturnValue(ctx as unknown as CanvasRenderingContext2D);
+        const range = document.createRange();
+        Object.defineProperty(range, "getClientRects", {
+            value: () => [new DOMRect(4, 0, 70, 18), new DOMRect(4, 18, 65, 18)],
+        });
+        const firstFont = { family: "WebFont", status: "loaded" };
+        const fontSet = Object.assign(new Set([firstFont]), { status: "loaded" });
+        const descriptor = Object.getOwnPropertyDescriptor(document, "fonts");
+        Object.defineProperty(document, "fonts", { value: fontSet, configurable: true });
+        const capture = () => expect(captureDomToCanvas(scene, canvas, range, 1)).toBe(true);
+        try {
+            capture();
+            ctx.measureText.mockClear();
+            capture();
+            expect(ctx.measureText).not.toHaveBeenCalled();
+
+            fontSet.delete(firstFont);
+            fontSet.add({ ...firstFont });
+            capture();
+            expect(ctx.measureText).toHaveBeenCalled();
+            ctx.measureText.mockClear();
+
+            fontSet.status = "loading";
+            capture();
+            expect(ctx.measureText).toHaveBeenCalled();
+        } finally {
+            if (descriptor) Object.defineProperty(document, "fonts", descriptor);
+            else Reflect.deleteProperty(document, "fonts");
+        }
     });
 
     it("walks translucent ancestors, resolves repeating/double-position/stacked gradients, clips overflow, draws url()/video, wraps unbroken text, deduplicates SVG text, and cleans leases", () => {
@@ -695,90 +1146,6 @@ describe("sceneCapture upgrades and visibility gating", () => {
         vi.unstubAllGlobals();
     });
 
-    it("prunes zero-area and off-screen overflow:hidden subtrees and skips SVG cloning on repeated cache hits", () => {
-        const scene = document.createElement("div");
-        const collapsed = document.createElement("div");
-        collapsed.style.overflow = "hidden";
-        const collapsedChild = document.createElement("div");
-        collapsedChild.style.backgroundColor = "rgb(250, 10, 10)";
-        collapsed.appendChild(collapsedChild);
-
-        const offscreen = document.createElement("div");
-        offscreen.style.overflow = "hidden";
-        const offscreenChild = document.createElement("div");
-        offscreenChild.style.backgroundColor = "rgb(10, 250, 10)";
-        offscreen.appendChild(offscreenChild);
-
-        const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-        const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-        svg.appendChild(circle);
-        scene.append(collapsed, offscreen, svg);
-        document.body.appendChild(scene);
-
-        vi.spyOn(scene, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, 100, 100));
-        vi.spyOn(collapsed, "getBoundingClientRect").mockReturnValue(new DOMRect(10, 10, 0, 0));
-        vi.spyOn(collapsedChild, "getBoundingClientRect").mockReturnValue(new DOMRect(10, 10, 50, 50));
-        vi.spyOn(offscreen, "getBoundingClientRect").mockReturnValue(new DOMRect(500, 500, 80, 80));
-        vi.spyOn(offscreenChild, "getBoundingClientRect").mockReturnValue(new DOMRect(10, 10, 50, 50));
-        vi.spyOn(svg, "getBoundingClientRect").mockReturnValue(new DOMRect(10, 10, 32, 32));
-
-        const cloneSpy = vi.spyOn(svg, "cloneNode");
-        const origCreateUrl = URL.createObjectURL;
-        const origRevokeUrl = URL.revokeObjectURL;
-        URL.createObjectURL = vi.fn(() => "blob:svg-cache-hit");
-        URL.revokeObjectURL = vi.fn();
-        vi.stubGlobal(
-            "Image",
-            class {
-                onload: (() => void) | null = null;
-                onerror: (() => void) | null = null;
-                set src(_val: string) {
-                    this.onload?.();
-                }
-            },
-        );
-
-        const paintedFills: string[] = [];
-        let curFill = "";
-        const drawImageSpy = vi.fn();
-        const mockCtx = {
-            set fillStyle(val: string) {
-                curFill = val;
-            },
-            get fillStyle() {
-                return curFill;
-            },
-            setTransform: () => {},
-            clearRect: () => {},
-            fillRect: () => paintedFills.push(curFill),
-            fill: () => paintedFills.push(curFill),
-            beginPath: () => {},
-            rect: () => {},
-            roundRect: () => {},
-            save: () => {},
-            restore: () => {},
-            clip: () => {},
-            drawImage: drawImageSpy,
-        } as unknown as CanvasRenderingContext2D;
-
-        const outCanvas = document.createElement("canvas");
-        vi.spyOn(outCanvas, "getContext").mockReturnValue(mockCtx);
-        try {
-            expect(captureDomToCanvas(scene, outCanvas, document.createRange())).toBe(true);
-            expect(paintedFills).not.toContain("rgb(250, 10, 10)");
-            expect(paintedFills).not.toContain("rgb(10, 250, 10)");
-            expect(cloneSpy).toHaveBeenCalledTimes(1);
-
-            expect(captureDomToCanvas(scene, outCanvas, document.createRange())).toBe(true);
-            expect(cloneSpy).toHaveBeenCalledTimes(1);
-            expect(drawImageSpy).toHaveBeenCalledTimes(1);
-        } finally {
-            URL.createObjectURL = origCreateUrl;
-            URL.revokeObjectURL = origRevokeUrl;
-            vi.unstubAllGlobals();
-        }
-    });
-
     it("prunes descendants outside nested active clip bounds and reuses compiled gradients", () => {
         const scene = document.createElement("div");
         const outerClip = document.createElement("div");
@@ -909,6 +1276,194 @@ describe("sceneCapture upgrades and visibility gating", () => {
             expect(drawImageCalls[0]?.[3]).toBeCloseTo(50, 3);
         } finally {
             vi.unstubAllGlobals();
+        }
+    });
+
+    it("multiplies ancestor opacity down nested subtrees and clips rounded canvas elements", () => {
+        const scene = document.createElement("div");
+        const group = document.createElement("div");
+        group.style.opacity = "0.5";
+        const nestedChild = document.createElement("div");
+        nestedChild.style.opacity = "0.5";
+        nestedChild.style.backgroundColor = "rgb(20, 40, 60)";
+        group.appendChild(nestedChild);
+
+        const sibling = document.createElement("div");
+        sibling.style.backgroundColor = "rgb(80, 90, 100)";
+
+        const innerCanvas = document.createElement("canvas");
+        innerCanvas.width = 40;
+        innerCanvas.height = 40;
+        innerCanvas.style.borderTopLeftRadius = "12px";
+
+        scene.append(group, sibling, innerCanvas);
+        document.body.appendChild(scene);
+
+        setRect(scene, 200, 200, 0, 0);
+        setRect(group, 100, 100, 0, 0);
+        setRect(nestedChild, 50, 50, 10, 10);
+        setRect(sibling, 50, 50, 100, 10);
+        setRect(innerCanvas, 40, 40, 10, 100);
+
+        const alphaByFill = new Map<string, number>();
+        const mockCtx = { ...createMockCanvas2dContext(), roundRect: vi.fn() };
+        mockCtx.fillRect = vi.fn(() => {
+            if (typeof mockCtx.fillStyle === "string") {
+                alphaByFill.set(mockCtx.fillStyle, mockCtx.globalAlpha);
+            }
+        });
+        const outCanvas = document.createElement("canvas");
+        mockCtx.canvas = outCanvas;
+        vi.spyOn(outCanvas, "getContext").mockReturnValue(mockCtx as unknown as CanvasRenderingContext2D);
+
+        expect(captureDomToCanvas(scene, outCanvas, document.createRange(), 1, 0)).toBe(true);
+        expect(alphaByFill.get("rgb(20, 40, 60)")).toBeCloseTo(0.25, 5);
+        expect(alphaByFill.get("rgb(80, 90, 100)")).toBeCloseTo(1, 5);
+        expect(mockCtx.clip).toHaveBeenCalled();
+        expect(mockCtx.drawImage).toHaveBeenCalledWith(innerCanvas, 10, 100, 40, 40);
+    });
+
+    it("parses nested color-mix in box-shadows and gradient stops, applies dashed borders, skips hidden borders, and wraps emoji surrogate pairs safely", () => {
+        const scene = document.createElement("div");
+        scene.style.backgroundImage =
+            "linear-gradient(90deg, color-mix(in srgb, color-mix(in srgb, #ff0000 50%, #0000ff), #ffffff) 25%, #000000 100%)";
+        const shadowCard = document.createElement("div");
+        shadowCard.style.boxShadow =
+            "0px 4px 12px color-mix(in srgb, color-mix(in srgb, red 50%, blue), white)";
+        const dashedCard = document.createElement("div");
+        dashedCard.style.borderTopWidth = "2px";
+        dashedCard.style.borderRightWidth = "2px";
+        dashedCard.style.borderBottomWidth = "2px";
+        dashedCard.style.borderLeftWidth = "2px";
+        dashedCard.style.borderTopStyle = "dashed";
+        dashedCard.style.borderRightStyle = "dashed";
+        dashedCard.style.borderBottomStyle = "dashed";
+        dashedCard.style.borderLeftStyle = "dashed";
+        dashedCard.style.borderTopColor = "rgb(10, 20, 30)";
+        dashedCard.style.borderRightColor = "rgb(10, 20, 30)";
+        dashedCard.style.borderBottomColor = "rgb(10, 20, 30)";
+        dashedCard.style.borderLeftColor = "rgb(10, 20, 30)";
+
+        const hiddenBorderCard = document.createElement("div");
+        hiddenBorderCard.style.borderTopWidth = "3px";
+        hiddenBorderCard.style.borderTopStyle = "hidden";
+        hiddenBorderCard.style.borderTopColor = "rgb(200, 10, 10)";
+
+        const emojiBox = document.createElement("div");
+        emojiBox.style.width = "36px";
+        emojiBox.style.overflowWrap = "break-word";
+        emojiBox.textContent = "🚀🔥✨🌟💎";
+
+        scene.append(shadowCard, dashedCard, hiddenBorderCard, emojiBox);
+        document.body.appendChild(scene);
+
+        setRect(scene, 200, 200, 0, 0);
+        setRect(shadowCard, 60, 40, 10, 10);
+        setRect(dashedCard, 60, 40, 10, 60);
+        setRect(emojiBox, 36, 60, 10, 110);
+        const hiddenRectSpy = vi.fn(() => ({
+            left: 10, top: 120, right: 70, bottom: 160, width: 60, height: 40, x: 10, y: 120, toJSON() {},
+        }));
+        hiddenBorderCard.getBoundingClientRect = hiddenRectSpy as unknown as HTMLElement["getBoundingClientRect"];
+
+        const shadowColors: string[] = [];
+        const lineDashCalls: number[][] = [];
+        const gradientStops: Array<{ offset: number; color: string }> = [];
+        const drawnLines: string[] = [];
+        const mockCtx = {
+            ...createMockCanvas2dContext(),
+            strokeRect: vi.fn(),
+            setLineDash: vi.fn((segments: number[]) => {
+                lineDashCalls.push([...segments]);
+            }),
+        };
+        mockCtx.createLinearGradient = vi.fn(() => ({
+            addColorStop: vi.fn((offset: number, color: string) => {
+                gradientStops.push({ offset, color });
+            }),
+        }));
+        mockCtx.measureText = vi.fn((text: string) => ({ width: text.length * 10 }));
+        mockCtx.fillText = vi.fn((text: string) => {
+            drawnLines.push(text);
+        });
+        const origFillRect = mockCtx.fillRect;
+        mockCtx.fillRect = vi.fn((...args: unknown[]) => {
+            if (mockCtx.shadowColor) shadowColors.push(mockCtx.shadowColor);
+            origFillRect(...args);
+        });
+        const fakeRange = {
+            setStart: vi.fn(),
+            setEnd: vi.fn(),
+            getClientRects: () => [
+                new DOMRect(10, 110, 36, 18),
+                new DOMRect(10, 128, 36, 18),
+                new DOMRect(10, 146, 36, 18),
+            ],
+        } as unknown as Range;
+        const outCanvas = document.createElement("canvas");
+        mockCtx.canvas = outCanvas;
+        vi.spyOn(outCanvas, "getContext").mockReturnValue(mockCtx as unknown as CanvasRenderingContext2D);
+
+        expect(captureDomToCanvas(scene, outCanvas, fakeRange, 1, 0)).toBe(true);
+        expect(shadowColors.some((c) => c.includes("191") && c.includes("128"))).toBe(true);
+        expect(lineDashCalls).toContainEqual([6, 4]);
+        expect(hiddenRectSpy).not.toHaveBeenCalled();
+        expect(gradientStops[0]?.offset).toBeCloseTo(0.25, 5);
+        expect(gradientStops[0]?.color).toBe("rgb(191, 128, 191)");
+        expect(drawnLines.join("")).toBe("🚀🔥✨🌟💎");
+        for (const line of drawnLines) {
+            expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(line)).toBe(false);
+        }
+    });
+
+    it("skips fallback DOM children and text inside video and canvas elements, and honors explicit light data-theme inside a dark document", () => {
+        const root = document.documentElement;
+        const hadDark = root.classList.contains("dark");
+        root.classList.add("dark");
+
+        try {
+            const scene = document.createElement("div");
+            scene.setAttribute("data-theme", "light");
+            const unloadedVideo = document.createElement("video");
+            Object.defineProperty(unloadedVideo, "readyState", { value: 0, configurable: true });
+            unloadedVideo.textContent = "Video fallback text";
+            const webglCanvas = document.createElement("canvas");
+            webglCanvas.className = "lg-webgl-canvas";
+            const fallbackDiv = document.createElement("div");
+            fallbackDiv.style.backgroundColor = "rgb(255, 0, 0)";
+            fallbackDiv.textContent = "Canvas fallback text";
+            webglCanvas.appendChild(fallbackDiv);
+            scene.append(unloadedVideo, webglCanvas);
+            document.body.appendChild(scene);
+
+            setRect(scene, 120, 80, 0, 0);
+            setRect(unloadedVideo, 100, 60, 0, 0);
+            setRect(webglCanvas, 100, 60, 0, 0);
+            setRect(fallbackDiv, 100, 60, 0, 0);
+
+            const fillRectColors: string[] = [];
+            const mockCtx = createMockCanvas2dContext();
+            mockCtx.fillRect = vi.fn(() => {
+                if (typeof mockCtx.fillStyle === "string") {
+                    fillRectColors.push(mockCtx.fillStyle);
+                }
+            });
+            const outCanvas = document.createElement("canvas");
+            mockCtx.canvas = outCanvas;
+            vi.spyOn(outCanvas, "getContext").mockReturnValue(mockCtx as unknown as CanvasRenderingContext2D);
+
+            const fakeRange = {
+                setStart: vi.fn(),
+                setEnd: vi.fn(),
+                getClientRects: () => [new DOMRect(0, 0, 80, 16)],
+            } as unknown as Range;
+
+            expect(captureDomToCanvas(scene, outCanvas, fakeRange, 1, 0)).toBe(true);
+            expect(mockCtx.fillText).not.toHaveBeenCalled();
+            expect(fillRectColors).not.toContain("rgb(255, 0, 0)");
+            expect(fillRectColors[0]).toBe("#f3f2f6");
+        } finally {
+            if (!hadDark) root.classList.remove("dark");
         }
     });
 });

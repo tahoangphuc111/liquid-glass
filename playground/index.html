@@ -22,6 +22,7 @@
             <section class="scene-content">
                 <header class="scene-header">
                     <p class="eyebrow">@tahoangphuc111/liquid-glass</p>
+                    <a class="preview-link" href="./preview/">Brand preview <span aria-hidden="true">↗</span></a>
                     <h1>optical refraction &amp; dual-rim specular test</h1>
                     <p class="subtitle">
                         drag the floating glass over typography and color bands to inspect refraction, blur, and top/bottom hairline highlights across engines
@@ -208,13 +209,18 @@
                 </label>
 
                 <label>
+                    sharpness <span id="val-sharpness">auto</span>
+                    <input id="ctrl-sharpness" type="range" min="-0.05" max="1" step="0.05" value="-0.05" />
+                </label>
+
+                <label>
                     radius <span id="val-radius">22</span>
                     <input id="ctrl-radius" type="range" min="0" max="44" value="22" />
                 </label>
 
                 <label>
-                    highlight <span id="val-highlight">0.4</span>
-                    <input id="ctrl-highlight" type="range" min="0" max="1" step="0.05" value="0.4" />
+                    highlight <span id="val-highlight">0.7</span>
+                    <input id="ctrl-highlight" type="range" min="0" max="1" step="0.05" value="0.7" />
                 </label>
 
                 <label>
@@ -229,7 +235,7 @@
 
                 <label>
                     abbe number <span id="val-abbe">58.5</span>
-                    <input id="ctrl-abbe" type="range" min="20" max="90" step="0.5" value="58.5" />
+                    <input id="ctrl-abbe" type="range" min="10" max="120" step="0.5" value="58.5" />
                 </label>
 
                 <div class="color-row">

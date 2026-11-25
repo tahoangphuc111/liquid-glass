@@ -17,10 +17,11 @@ import {
     resolveGlassEngine,
 } from "../src/index.js";
 import { disconnectLoafTelemetry, initLoafTelemetry } from "../src/core/telemetry.js";
-import { dirtyElements, flushDirtyElements } from "../src/core/engine.js";
+import { dirtyElements, elementStateMap, flushDirtyElements } from "../src/core/engine.js";
 import {
     attachGlobalListeners,
     detachGlobalListeners,
+    observeSharedElementResize,
     resetObserverForTesting,
 } from "../src/core/observer.js";
 import {
@@ -96,6 +97,25 @@ describe("LiquidGlass controller and engine selection", () => {
         expect(targetEl.hasAttribute("data-lg-surface")).toBe(false);
         expect(targetEl.hasAttribute("data-lg-engine")).toBe(false);
         expect(targetEl.hasAttribute("data-lg-pill")).toBe(false);
+    });
+
+    it("cleans up SVG registration when onEngineChange destroys the controller", () => {
+        setForcedChromium(true);
+        const element = document.body.appendChild(document.createElement("div"));
+        const glass = createLiquidGlass(element, { engine: "css" });
+        try {
+            glass.update({
+                engine: "wasm-svg",
+                onEngineChange(engine) {
+                    if (engine === "wasm-svg") glass.destroy();
+                },
+            });
+            expect(elementStateMap.has(element)).toBe(false);
+            expect(element.hasAttribute("data-lg-engine")).toBe(false);
+            expect(element.hasAttribute("data-lg-refraction-axis")).toBe(false);
+        } finally {
+            glass.destroy();
+        }
     });
 
     it("creates and revokes SVG displacement blob URLs on desktop Chromium", () => {
@@ -315,6 +335,63 @@ describe("LiquidGlass controller and engine selection", () => {
 
         buttonGlass.destroy();
         expect(buttonEl.classList.contains("lg-interactive")).toBe(false);
+    });
+
+    it("keeps the rim highlight continuous when a held button is released", () => {
+        vi.useFakeTimers();
+        const button = document.body.appendChild(document.createElement("button"));
+        const glass = createLiquidGlass(button, { engine: "css" });
+        const readGlow = () => Number(button.style.getPropertyValue("--lg-press-glow"));
+
+        try {
+            button.dispatchEvent(new MouseEvent("pointerdown"));
+            vi.advanceTimersByTime(300);
+            const heldGlow = readGlow();
+            expect(heldGlow).toBeGreaterThan(0.08);
+
+            button.dispatchEvent(new MouseEvent("pointerup"));
+            vi.advanceTimersByTime(16);
+            expect(readGlow()).toBeGreaterThan(heldGlow * 0.75);
+            vi.advanceTimersByTime(600);
+            expect(readGlow()).toBe(0);
+        } finally {
+            glass.destroy();
+            vi.useRealTimers();
+        }
+    });
+
+    it("finishes glass drags outside the element when pointer capture fails or drag mode changes", () => {
+        const button = document.body.appendChild(document.createElement("button"));
+        const onDragChange = vi.fn();
+        const glass = createLiquidGlass(button, { engine: "css", pill: true, draggable: "free", onDragChange });
+        const dispatch = (target: EventTarget, type: string, clientX: number, pointerId = 7) => {
+            const event = new MouseEvent(type, { bubbles: true, clientX });
+            Object.defineProperty(event, "pointerId", { value: pointerId });
+            target.dispatchEvent(event);
+        };
+
+        try {
+            dispatch(button, "pointerdown", 10);
+            dispatch(document.body, "pointermove", 35);
+            expect(button.getAttribute("data-lg-dragging")).toBe("1");
+            dispatch(document.body, "pointerup", 35, 8);
+            expect(button.getAttribute("data-lg-dragging")).toBe("1");
+            dispatch(document.body, "pointerup", 35);
+            expect(button.hasAttribute("data-lg-dragging")).toBe(false);
+            expect(onDragChange).toHaveBeenLastCalledWith(expect.any(Number), expect.any(Number), false);
+
+            dispatch(button, "pointerdown", 10);
+            dispatch(document.body, "pointermove", 35);
+            glass.update({ draggable: "elastic" });
+            expect(button.hasAttribute("data-lg-dragging")).toBe(false);
+            expect(onDragChange).toHaveBeenLastCalledWith(0, 0, false);
+            onDragChange.mockClear();
+            dispatch(document.body, "pointermove", 60);
+            expect(onDragChange).not.toHaveBeenCalled();
+        } finally {
+            glass.destroy();
+        }
+        expect(button.classList.contains("lg-surface")).toBe(false);
     });
 
     it("isolates primary drag pointer from secondary pointers during interactive drag", () => {
@@ -662,6 +739,19 @@ describe("LiquidGlass controller and engine selection", () => {
         }
     });
 
+    it("settles an elastic spring at a nonzero programmatic drag offset", () => {
+        vi.useFakeTimers();
+        const onRest = vi.fn();
+        const spring = createInteractiveSpring(() => {}, onRest);
+        try {
+            spring.setDrag(3, -2);
+            vi.advanceTimersByTime(1500);
+            expect(onRest).toHaveBeenCalledOnce();
+        } finally {
+            spring.destroy();
+        }
+    });
+
     it("safely handles NaN in stepSpring and catches onRest errors during destroy", () => {
         const res = stepSpring(NaN, 0, 5, 0.016, { stiffness: 300, gamma: 10 });
         expect(res.value).toBe(5);
@@ -796,7 +886,9 @@ describe("LiquidGlass controller and engine selection", () => {
         expect(await requestDeviceTiltPermission()).toBe(false);
 
         expect(registerLiquidGlassElement("liquid-glass-test")).toBe(true);
-        const customEl = document.createElement("liquid-glass-test") as LiquidGlassCustomElement;
+        const customEl = document.createElement("liquid-glass-test") as LiquidGlassCustomElement & {
+            connectedCallback(): void;
+        };
         customEl.setAttribute("role", "button");
         customEl.setAttribute("pill", "true");
         customEl.setAttribute("engine", "css");
@@ -804,12 +896,15 @@ describe("LiquidGlass controller and engine selection", () => {
         customEl.setAttribute("corner-style", "squircle");
         customEl.setAttribute("draggable", "free");
         document.body.appendChild(customEl);
-        expect(customEl.glassInstance).not.toBeNull();
+        const firstCustomInstance = customEl.glassInstance!;
+        expect(firstCustomInstance).not.toBeNull();
         expect(customEl.getAttribute("data-lg-draggable")).toBe("free");
         customEl.removeAttribute("corner-style");
         expect(customEl.getAttribute("data-lg-corner-style")).toBeNull();
         customEl.setDragOffset(35, -15, false);
         expect(customEl.style.getPropertyValue("--lg-drag-x")).toBe("24.00px");
+        customEl.connectedCallback();
+        expect(customEl.glassInstance).not.toBe(firstCustomInstance);
         customEl.remove();
         expect(customEl.glassInstance).toBeNull();
     });
@@ -967,5 +1062,176 @@ describe("LiquidGlass controller and engine selection", () => {
 
         inst.destroy();
         expect(el.hasAttribute("data-lg-theme")).toBe(false);
+    });
+
+    it("restores coalescence attributes after toggling coalesce off and back on", () => {
+        const first = document.createElement("div");
+        const second = document.createElement("div");
+        document.body.append(first, second);
+        vi.spyOn(first, "getBoundingClientRect").mockReturnValue(new DOMRect(100, 100, 80, 40));
+        vi.spyOn(second, "getBoundingClientRect").mockReturnValue(new DOMRect(190, 100, 80, 40));
+
+        const instA = createLiquidGlass(first, { engine: "css", coalesce: true });
+        const instB = createLiquidGlass(second, { engine: "css", coalesce: true });
+
+        expect(first.getAttribute("data-lg-coalescing")).toBe("1");
+        expect(first.style.getPropertyValue("--lg-bleed")).not.toBe("");
+
+        instA.update({ coalesce: false });
+        expect(first.hasAttribute("data-lg-coalescing")).toBe(false);
+        expect(first.style.getPropertyValue("--lg-bleed")).toBe("");
+
+        instA.update({ coalesce: true });
+        expect(first.getAttribute("data-lg-coalescing")).toBe("1");
+        expect(first.style.getPropertyValue("--lg-bleed")).not.toBe("");
+
+        instA.destroy();
+        instB.destroy();
+    });
+
+    it("re-observes active resize targets when ResizeObserver constructor changes", () => {
+        const firstEl = document.createElement("div");
+        const secondEl = document.createElement("div");
+        document.body.append(firstEl, secondEl);
+
+        const observedByFirst = new Set<Element>();
+        const observedBySecond = new Set<Element>();
+        const secondCallbacks: ResizeObserverCallback[] = [];
+
+        class MockResizeObserverA {
+            observe(target: Element) {
+                observedByFirst.add(target);
+            }
+            unobserve(target: Element) {
+                observedByFirst.delete(target);
+            }
+            disconnect() {
+                observedByFirst.clear();
+            }
+        }
+        class MockResizeObserverB {
+            constructor(cb: ResizeObserverCallback) {
+                secondCallbacks.push(cb);
+            }
+            observe(target: Element) {
+                observedBySecond.add(target);
+            }
+            unobserve(target: Element) {
+                observedBySecond.delete(target);
+            }
+            disconnect() {
+                observedBySecond.clear();
+            }
+        }
+
+        const firstCb = vi.fn();
+        const secondCb = vi.fn();
+        vi.stubGlobal("ResizeObserver", MockResizeObserverA);
+        const stopFirst = observeSharedElementResize(firstEl, firstCb);
+        expect(observedByFirst.has(firstEl)).toBe(true);
+
+        vi.stubGlobal("ResizeObserver", MockResizeObserverB);
+        const stopSecond = observeSharedElementResize(secondEl, secondCb);
+        expect(observedBySecond.has(firstEl)).toBe(true);
+        expect(observedBySecond.has(secondEl)).toBe(true);
+
+        secondCallbacks[0]?.(
+            [{ target: firstEl } as unknown as ResizeObserverEntry],
+            {} as ResizeObserver,
+        );
+        expect(firstCb).toHaveBeenCalledTimes(1);
+
+        stopFirst();
+        stopSecond();
+        vi.unstubAllGlobals();
+    });
+
+    it("detects GPU-bound long animation frames without main-thread blocking and updates chromatic SVG filters in place", async () => {
+        resetTelemetryForTesting();
+        let observerCb: ((list: { getEntries: () => unknown[] }) => void) | null = null;
+        vi.stubGlobal(
+            "PerformanceObserver",
+            class {
+                static supportedEntryTypes = ["long-animation-frame"];
+                constructor(cb: (list: { getEntries: () => unknown[] }) => void) {
+                    observerCb = cb;
+                }
+                observe() {}
+                disconnect() {}
+            },
+        );
+        initLoafTelemetry();
+        for (let idx = 0; idx < 3; idx += 1) {
+            observerCb!({ getEntries: () => [{ duration: 96, blockingDuration: 0, startTime: idx * 120 }] });
+        }
+        expect(qualityTier).toBe(1);
+        resetTelemetryForTesting();
+        vi.unstubAllGlobals();
+
+        initWasmSimdModule();
+        setForcedChromium(true);
+        const origCreateUrl = URL.createObjectURL;
+        const origRevokeUrl = URL.revokeObjectURL;
+        let nextBlobId = 1;
+        URL.createObjectURL = vi.fn(() => `blob:mock-chroma-inplace-${nextBlobId++}`);
+        URL.revokeObjectURL = vi.fn();
+        vi.stubGlobal(
+            "Image",
+            class {
+                decoding = "";
+                onload: (() => void) | null = null;
+                onerror: (() => void) | null = null;
+                set src(_val: string) {
+                    queueMicrotask(() => this.onload?.());
+                }
+                removeAttribute() {}
+                decode() {
+                    return Promise.resolve();
+                }
+            },
+        );
+
+        const el = document.createElement("div");
+        Object.defineProperty(el, "offsetWidth", { value: 220, configurable: true });
+        Object.defineProperty(el, "offsetHeight", { value: 72, configurable: true });
+        document.body.appendChild(el);
+
+        const instance = createLiquidGlass(el, {
+            engine: "wasm-svg",
+            alwaysOn: true,
+            blur: 2,
+            chromaticAberration: 0.2,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        const initialFilterVal = el.style.getPropertyValue("--lg-filter");
+        const initialFilterId = initialFilterVal.match(/url\(#([^)]+)\)/)?.[1];
+        expect(initialFilterId).toBeTruthy();
+        const initialFilterNode = document.getElementById(initialFilterId!);
+        expect(initialFilterNode).not.toBeNull();
+        const initialWarmScale = initialFilterNode!
+            .querySelectorAll("feDisplacementMap")[0]!
+            .getAttribute("scale");
+
+        const computedStyleSpy = vi.spyOn(window, "getComputedStyle");
+        const rafSpy = vi.spyOn(window, "requestAnimationFrame");
+        instance.update({ chromaticAberration: 0.7 });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        expect(el.style.getPropertyValue("--lg-filter")).toBe(initialFilterVal);
+        expect(document.getElementById(initialFilterId!)).toBe(initialFilterNode);
+        const updatedWarmScale = initialFilterNode!
+            .querySelectorAll("feDisplacementMap")[0]!
+            .getAttribute("scale");
+        expect(updatedWarmScale).not.toBe(initialWarmScale);
+        expect(computedStyleSpy).not.toHaveBeenCalled();
+        expect(rafSpy).not.toHaveBeenCalled();
+
+        instance.destroy();
+        el.remove();
+        URL.createObjectURL = origCreateUrl;
+        URL.revokeObjectURL = origRevokeUrl;
+        vi.unstubAllGlobals();
+        setForcedChromium(undefined);
     });
 });

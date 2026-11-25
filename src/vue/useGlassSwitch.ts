@@ -38,6 +38,16 @@ export function useGlassSwitch(
     let instance: LiquidGlassSwitchInstance | null = null;
     let prevMergedOptions: LiquidGlassSwitchOptions | null = null;
 
+    const handleChange = (nextValue: string, nextIndex: number, itemElement: HTMLElement) => {
+        value.value = nextValue;
+        activeIndex.value = nextIndex;
+        toValue(options).onChange?.(nextValue, nextIndex, itemElement);
+    };
+    const handleEngineChange = (nextEngine: GlassEngine) => {
+        engine.value = nextEngine;
+        toValue(options).onEngineChange?.(nextEngine);
+    };
+
     const syncInstance = () => {
         const element = targetRef.value;
         if (!element) {
@@ -57,19 +67,19 @@ export function useGlassSwitch(
         }
 
         const sceneElement = currentOptions.sceneElement ?? context?.sceneElement.value ?? null;
+        const sceneCanvas =
+            currentOptions.sceneCanvas ??
+            (currentOptions.sceneElement &&
+            currentOptions.sceneElement !== context?.sceneElement.value
+                ? null
+                : context?.sceneCanvas.value) ??
+            null;
         const mergedOptions: LiquidGlassSwitchOptions = {
             ...mergeGlassOptions(context?.defaults.value, currentOptions),
-            sceneCanvas: currentOptions.sceneCanvas ?? (sceneElement ? null : context?.sceneCanvas.value) ?? null,
+            sceneCanvas,
             sceneElement,
-            onChange: (nextValue, nextIndex, itemElement) => {
-                value.value = nextValue;
-                activeIndex.value = nextIndex;
-                currentOptions.onChange?.(nextValue, nextIndex, itemElement);
-            },
-            onEngineChange: (nextEngine) => {
-                engine.value = nextEngine;
-                currentOptions.onEngineChange?.(nextEngine);
-            },
+            onChange: handleChange,
+            onEngineChange: handleEngineChange,
         };
 
         if (!instance || instance.element !== element) {
@@ -82,7 +92,9 @@ export function useGlassSwitch(
         } else {
             const patch = computeMergedOptionPatch(prevMergedOptions, mergedOptions);
             prevMergedOptions = mergedOptions;
-            instance.update(patch);
+            if (Object.keys(patch).length > 0) {
+                instance.update(patch);
+            }
             engine.value = instance.engine;
             value.value = instance.value;
             activeIndex.value = instance.activeIndex;

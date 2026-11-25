@@ -1,12 +1,21 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DEFAULT_GLASS_CONFIG, MAP_PRELOAD_TIMEOUT_MS, SVG_NS, resolveGlassConfig } from "../src/core/config.js";
+import {
+    DEFAULT_GLASS_CONFIG,
+    MAP_PRELOAD_TIMEOUT_MS,
+    SVG_NS,
+    resolveChromaticChannelScales,
+    resolveEffectiveChromaticAberration,
+    resolveGlassConfig,
+} from "../src/core/config.js";
 import {
     acquireSharedFilter,
     buildFilterElement,
+    clearFilterElementPools,
     disposeSharedFilter,
     releaseSharedFilter,
     sharedFilters,
     startMapPreload,
+    tryUpdateFilterScalesInPlace,
 } from "../src/core/filter.js";
 
 describe("SVG displacement filter builder", () => {
@@ -202,6 +211,36 @@ describe("SVG displacement filter builder", () => {
         releaseSharedFilter("ca_t0_off_test", offRecord ?? undefined);
         releaseSharedFilter("ca_t0_test", t0Record ?? undefined);
         releaseSharedFilter("ca_t1_test", t1Record ?? undefined);
+    });
+
+    it("bounds the strongest chromatic pass and reuses the bitmap across scale settings", () => {
+        const svgDefs = document.createElementNS(SVG_NS, "defs") as SVGDefsElement;
+        const baseOptions = { bezel: 10, scaleRatio: 100, chromaticAberration: 1 };
+        const acquire = (sharedKey: string, maxScaleMultiplier: number, maxRefractionPx?: number) =>
+            acquireSharedFilter({
+                sharedKey,
+                config: resolveGlassConfig({ ...baseOptions, maxScaleMultiplier, maxRefractionPx }),
+                w: 200,
+                h: 48,
+                radius: 18,
+                surface: "convex_squircle",
+                rasterScale: 1.5,
+                halfMinDim: 24,
+                svgDefs,
+            }, 0)!;
+        const records = [acquire("chroma_bezel_cap", 1), acquire("chroma_pixel_cap", 2, 3)];
+        try {
+            expect(records[0]!.archetype).toBe(records[1]!.archetype);
+            for (const [index, cap] of [10, 6].entries()) {
+                const passes = records[index]!.node!.querySelectorAll("feDisplacementMap");
+                expect(passes).toHaveLength(2);
+                const strongestScale = Math.max(...Array.from(passes, (pass) => Number(pass.getAttribute("scale"))));
+                expect(strongestScale).toBeLessThanOrEqual(cap);
+                expect(strongestScale).toBeGreaterThan(cap - 0.03);
+            }
+        } finally {
+            for (const record of records) disposeSharedFilter(record.key, false);
+        }
     });
 
     it("uses crisp 2x HiDPI displacement maps without blurring T0 rounded SVG surfaces", () => {
@@ -475,4 +514,298 @@ describe("SVG displacement filter builder", () => {
         expect(first.preloadImage).toBeNull();
     });
 
+    it("resolves sharedKey dimension collisions iteratively without mutating caller options", () => {
+        const svgDefs = document.createElementNS(SVG_NS, "defs");
+        const cfg = resolveGlassConfig({ radius: 16, blur: 0 });
+        const baseOptions = {
+            sharedKey: "collision_key",
+            config: cfg,
+            w: 120,
+            h: 48,
+            actualW: 120,
+            actualH: 48,
+            radius: 16,
+            surface: "convex_squircle" as const,
+            rasterScale: 1,
+            halfMinDim: 24,
+            svgDefs,
+        };
+        const recA = acquireSharedFilter(baseOptions)!;
+        const recB = acquireSharedFilter({ ...baseOptions, actualW: 124, actualH: 50 })!;
+        const recBReuse = acquireSharedFilter({ ...baseOptions, actualW: 124, actualH: 50 })!;
+
+        expect(recA.key).toBe("collision_key");
+        expect(recB.key).toBe("collision_key_124x50");
+        expect(recBReuse).toBe(recB);
+        expect(recB.refCount).toBe(2);
+
+        disposeSharedFilter(recA.key, true);
+        disposeSharedFilter(recB.key, true);
+    });
+
+    it("matches unified IOR/Abbe dispersion scaling and preserves travel caps at high IOR", () => {
+        const { filterNode: lowIorFilter } = buildFilterElement(
+            "lg-ca-low-ior",
+            "0%",
+            "0%",
+            "100%",
+            "100%",
+            "blob:mock",
+            160,
+            64,
+            "40.00",
+            undefined,
+            0,
+            false,
+            0,
+            true,
+            28,
+            1.333,
+        );
+        const { filterNode: highIorFilter } = buildFilterElement(
+            "lg-ca-high-ior",
+            "0%",
+            "0%",
+            "100%",
+            "100%",
+            "blob:mock",
+            160,
+            64,
+            "40.00",
+            undefined,
+            0,
+            false,
+            0,
+            true,
+            28,
+            2.417,
+        );
+
+        const lowPasses = Array.from(lowIorFilter.querySelectorAll("feDisplacementMap"), (node) =>
+            Number(node.getAttribute("scale")),
+        );
+        const highPasses = Array.from(highIorFilter.querySelectorAll("feDisplacementMap"), (node) =>
+            Number(node.getAttribute("scale")),
+        );
+        const expectedLow = resolveChromaticChannelScales(40, resolveEffectiveChromaticAberration(true, 28, 1.333));
+        const expectedHigh = resolveChromaticChannelScales(40, resolveEffectiveChromaticAberration(true, 28, 2.417));
+
+        expect(lowPasses[0]).toBeCloseTo(expectedLow.redScale, 2);
+        expect(lowPasses[1]).toBeCloseTo(expectedLow.blueScale, 2);
+        expect(highPasses[0]).toBeCloseTo(expectedHigh.redScale, 2);
+        expect(highPasses[1]).toBeCloseTo(expectedHigh.blueScale, 2);
+        expect(highPasses[1]! - highPasses[0]!).toBeGreaterThan(lowPasses[1]! - lowPasses[0]!);
+
+        // High-IOR effectiveChroma > 1 must not be re-clamped and must remain within travel caps.
+        const svgDefs = document.createElementNS(SVG_NS, "defs");
+        const diamondCapRecord = acquireSharedFilter({
+            sharedKey: "diamond_high_chroma_cap",
+            config: resolveGlassConfig({
+                ior: 2.417,
+                bezel: 10,
+                scaleRatio: 100,
+                maxRefractionPx: 5,
+                chromaticAberration: 1,
+                abbeNumber: 55.3,
+            }),
+            w: 180,
+            h: 54,
+            radius: 18,
+            surface: "convex_squircle",
+            rasterScale: 1.5,
+            halfMinDim: 27,
+            svgDefs,
+        })!;
+        try {
+            const scales = Array.from(diamondCapRecord.node!.querySelectorAll("feDisplacementMap"), (node) =>
+                Number(node.getAttribute("scale")),
+            );
+            expect(scales).toHaveLength(2);
+            expect(Math.max(...scales)).toBeLessThanOrEqual(10);
+            expect(Math.max(...scales)).toBeGreaterThan(9.9);
+        } finally {
+            disposeSharedFilter(diamondCapRecord.key, true);
+        }
+    });
+
+    it("preserves full HiDPI WASM displacement map resolution at T1 when blur is 0 or sharpness is active", () => {
+        const svgDefs = document.createElementNS(SVG_NS, "defs");
+        const blurredT1 = acquireSharedFilter(
+            {
+                sharedKey: "sharp_blurred_t1",
+                config: resolveGlassConfig({ blur: 4, chromaticAberration: true }),
+                w: 160,
+                h: 64,
+                radius: 20,
+                surface: "convex_squircle",
+                rasterScale: 2,
+                halfMinDim: 32,
+                svgDefs,
+            },
+            1,
+        )!;
+        expect(blurredT1.archetype?.effectiveScale).toBeLessThan(1);
+
+        const clearAutoT1 = acquireSharedFilter(
+            {
+                sharedKey: "sharp_clear_auto_t1",
+                config: resolveGlassConfig({ blur: 0, chromaticAberration: true }),
+                w: 160,
+                h: 64,
+                radius: 20,
+                surface: "convex_squircle",
+                rasterScale: 3.3,
+                halfMinDim: 32,
+                svgDefs,
+            },
+            1,
+        )!;
+        expect(clearAutoT1.archetype?.effectiveScale).toBeGreaterThan(2.5);
+
+        const explicitMaxT1 = acquireSharedFilter(
+            {
+                sharedKey: "sharp_explicit_max_t1",
+                config: resolveGlassConfig({ blur: 4, sharpness: 1, chromaticAberration: true }),
+                w: 160,
+                h: 64,
+                radius: 20,
+                surface: "convex_squircle",
+                rasterScale: 4,
+                halfMinDim: 32,
+                svgDefs,
+            },
+            1,
+        )!;
+        expect(explicitMaxT1.archetype?.effectiveScale).toBeGreaterThan(3.5);
+
+        disposeSharedFilter(blurredT1.key, true);
+        disposeSharedFilter(clearAutoT1.key, true);
+        disposeSharedFilter(explicitMaxT1.key, true);
+    });
+
+    it("pools chromatic SVG filter subtrees, updates exclusive scales in place, and collapses chromatic splitting at T2", () => {
+        Object.defineProperty(URL, "createObjectURL", {
+            value: vi.fn(() => "blob:lg-chroma-opt"),
+            configurable: true,
+            writable: true,
+        });
+        Object.defineProperty(URL, "revokeObjectURL", {
+            value: vi.fn(),
+            configurable: true,
+            writable: true,
+        });
+
+        clearFilterElementPools();
+        const svgRoot = document.createElementNS(SVG_NS, "svg");
+        const svgDefs = document.createElementNS(SVG_NS, "defs") as unknown as SVGDefsElement;
+        svgRoot.appendChild(svgDefs);
+        document.body.appendChild(svgRoot);
+
+        try {
+            const baseKey = "chroma_opt_base";
+            const lowChromaCfg = resolveGlassConfig({ radius: 18, blur: 2, chromaticAberration: 0.15 });
+            const highChromaCfg = resolveGlassConfig({ radius: 18, blur: 2, chromaticAberration: 0.75 });
+
+            const firstRec = acquireSharedFilter(
+                {
+                    sharedKey: "chroma_pool_1",
+                    baseKey,
+                    config: lowChromaCfg,
+                    w: 180,
+                    h: 64,
+                    radius: 18,
+                    surface: "convex_squircle",
+                    rasterScale: 2,
+                    halfMinDim: 32,
+                    svgDefs,
+                },
+                0,
+            )!;
+            const pooledNode = firstRec.node!;
+            expect(pooledNode.querySelectorAll("feDisplacementMap")).toHaveLength(2);
+            const initialCoolScale = Number(
+                pooledNode.querySelectorAll("feDisplacementMap")[1]!.getAttribute("scale"),
+            );
+
+            firstRec.ready = true;
+            const updatedRec = tryUpdateFilterScalesInPlace(
+                "chroma_pool_1",
+                "chroma_pool_1_high",
+                baseKey,
+                highChromaCfg,
+                180,
+                64,
+                0,
+            );
+            expect(updatedRec).toBe(firstRec);
+            expect(updatedRec?.node).toBe(pooledNode);
+            expect(updatedRec?.filterId).toBe(firstRec.filterId);
+            expect(sharedFilters.has("chroma_pool_1")).toBe(false);
+            expect(sharedFilters.get("chroma_pool_1_high")).toBe(firstRec);
+            const updatedCoolScale = Number(
+                pooledNode.querySelectorAll("feDisplacementMap")[1]!.getAttribute("scale"),
+            );
+            expect(updatedCoolScale).toBeGreaterThan(initialCoolScale);
+
+            firstRec.refCount = 2;
+            expect(
+                tryUpdateFilterScalesInPlace(
+                    "chroma_pool_1_high",
+                    "chroma_pool_1_shared_blocked",
+                    baseKey,
+                    lowChromaCfg,
+                    180,
+                    64,
+                    0,
+                ),
+            ).toBeNull();
+            firstRec.refCount = 1;
+
+            releaseSharedFilter("chroma_pool_1_high", firstRec);
+            disposeSharedFilter("chroma_pool_1_high", false);
+
+            const recycledRec = acquireSharedFilter(
+                {
+                    sharedKey: "chroma_pool_2",
+                    baseKey,
+                    config: highChromaCfg,
+                    w: 200,
+                    h: 72,
+                    radius: 18,
+                    surface: "convex_squircle",
+                    rasterScale: 2,
+                    halfMinDim: 36,
+                    svgDefs,
+                },
+                0,
+            )!;
+            expect(recycledRec.node).toBe(pooledNode);
+            expect(recycledRec.feImage?.getAttribute("width")).toBe("200");
+            expect(recycledRec.feImage?.getAttribute("height")).toBe("72");
+            disposeSharedFilter(recycledRec.key, true);
+
+            const t2Rec = acquireSharedFilter(
+                {
+                    sharedKey: "chroma_t2_single_pass",
+                    baseKey: "chroma_t2_base",
+                    config: highChromaCfg,
+                    w: 200,
+                    h: 72,
+                    radius: 18,
+                    surface: "convex_squircle",
+                    rasterScale: 2,
+                    halfMinDim: 36,
+                    svgDefs,
+                },
+                2,
+            )!;
+            expect(t2Rec.node?.querySelectorAll("feDisplacementMap")).toHaveLength(1);
+            expect(t2Rec.node?.querySelectorAll("feColorMatrix")).toHaveLength(0);
+            expect(t2Rec.node?.querySelector("feComposite")).toBeNull();
+            disposeSharedFilter(t2Rec.key, true);
+        } finally {
+            svgRoot.remove();
+            clearFilterElementPools();
+        }
+    });
 });

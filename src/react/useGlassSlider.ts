@@ -40,25 +40,33 @@ export function useGlassSlider(
     const [value, setValueState] = useState<number>(0);
 
     const sceneElement = options.sceneElement ?? context?.sceneElement ?? null;
-    const sceneCanvas = options.sceneCanvas ?? (sceneElement ? null : context?.sceneCanvas) ?? null;
+    const sceneCanvas =
+        options.sceneCanvas ??
+        (options.sceneElement && options.sceneElement !== context?.sceneElement
+            ? null
+            : context?.sceneCanvas) ??
+        null;
     const onChangeRef = useRef(options.onChange);
     onChangeRef.current = options.onChange;
     const onEngineChangeRef = useRef(options.onEngineChange);
     onEngineChangeRef.current = options.onEngineChange;
+
+    const handleChange = useCallback((nextValue: number, inputElement: HTMLInputElement) => {
+        setValueState(nextValue);
+        onChangeRef.current?.(nextValue, inputElement);
+    }, []);
+    const handleEngineChange = useCallback((nextEngine: GlassEngine) => {
+        setEngine(nextEngine);
+        onEngineChangeRef.current?.(nextEngine);
+    }, []);
 
     const latestMergedOptionsRef = useRef<LiquidGlassSliderOptions>({});
     latestMergedOptionsRef.current = {
         ...mergeGlassOptions(context?.defaults, options),
         sceneCanvas,
         sceneElement,
-        onChange: (nextValue, inputEl) => {
-            setValueState(nextValue);
-            onChangeRef.current?.(nextValue, inputEl);
-        },
-        onEngineChange: (nextEngine) => {
-            setEngine(nextEngine);
-            onEngineChangeRef.current?.(nextEngine);
-        },
+        onChange: handleChange,
+        onEngineChange: handleEngineChange,
     };
 
     const syncTargetElement = useCallback(() => {
@@ -80,7 +88,9 @@ export function useGlassSlider(
         } else {
             const patch = computeMergedOptionPatch(prevMergedOptionsRef.current, mergedOptions);
             prevMergedOptionsRef.current = mergedOptions;
-            instanceRef.current.update(patch);
+            if (Object.keys(patch).length > 0) {
+                instanceRef.current.update(patch);
+            }
             setEngine(instanceRef.current.engine);
             setValueState(instanceRef.current.value);
         }
@@ -125,6 +135,7 @@ export function useGlassSlider(
         options.highlight,
         tiltKey,
         options.pixelRatio,
+        options.sharpness,
         options.saturation,
         options.chromaticAberration,
         options.abbeNumber,

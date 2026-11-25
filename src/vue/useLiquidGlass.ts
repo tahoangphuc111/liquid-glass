@@ -32,6 +32,14 @@ export function useLiquidGlass(
     let instance: LiquidGlassInstance | null = null;
     let prevMergedOptions: LiquidGlassOptions | null = null;
 
+    const handleDragChange = (offsetX: number, offsetY: number, isDragging: boolean) => {
+        toValue(options).onDragChange?.(offsetX, offsetY, isDragging);
+    };
+    const handleEngineChange = (nextEngine: GlassEngine) => {
+        engine.value = nextEngine;
+        toValue(options).onEngineChange?.(nextEngine);
+    };
+
     const syncInstance = () => {
         const element = targetRef.value;
         if (!element) {
@@ -51,14 +59,19 @@ export function useLiquidGlass(
         }
 
         const sceneElement = currentOptions.sceneElement ?? context?.sceneElement.value ?? null;
+        const sceneCanvas =
+            currentOptions.sceneCanvas ??
+            (currentOptions.sceneElement &&
+            currentOptions.sceneElement !== context?.sceneElement.value
+                ? null
+                : context?.sceneCanvas.value) ??
+            null;
         const mergedOptions: LiquidGlassOptions = {
             ...mergeGlassOptions(context?.defaults.value, currentOptions),
-            sceneCanvas: currentOptions.sceneCanvas ?? (sceneElement ? null : context?.sceneCanvas.value) ?? null,
+            sceneCanvas,
             sceneElement,
-            onEngineChange: (nextEngine) => {
-                engine.value = nextEngine;
-                currentOptions.onEngineChange?.(nextEngine);
-            },
+            onDragChange: handleDragChange,
+            onEngineChange: handleEngineChange,
         };
 
         if (!instance || instance.element !== element) {
@@ -69,7 +82,9 @@ export function useLiquidGlass(
         } else {
             const patch = computeMergedOptionPatch(prevMergedOptions, mergedOptions);
             prevMergedOptions = mergedOptions;
-            instance.update(patch);
+            if (Object.keys(patch).length > 0) {
+                instance.update(patch);
+            }
             engine.value = instance.engine;
         }
     };

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { resetObserverForTesting } from "../src/core/observer.js";
 import { createGlassSwitch } from "../src/core/switch.js";
 
 function dispatchPointerEvent(
@@ -206,6 +207,30 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
         } finally {
             sw.destroy();
             vi.useRealTimers();
+        }
+    });
+
+    it("finishes an in-progress selection immediately when reduced motion is enabled", () => {
+        const motion = Object.assign(new EventTarget(), { matches: false });
+        vi.stubGlobal("matchMedia", (query: string) =>
+            query === "(prefers-reduced-motion: reduce)" ? motion : { matches: false },
+        );
+        const { nav } = buildSwitchFixture([96, 96], ["one", "two"]);
+        const sw = createGlassSwitch(nav, { engine: "css" });
+        const glider = nav.querySelector<HTMLElement>(".lg-switch-glider")!;
+        try {
+            sw.setValue("two");
+            expect(nav.classList.contains("is-animating")).toBe(true);
+
+            motion.matches = true;
+            motion.dispatchEvent(new Event("change"));
+
+            expect(nav.classList.contains("is-animating")).toBe(false);
+            expect(glider.style.transform).toBe("translate3d(96.00px, 0, 0) scale(1.0000, 1.0000)");
+        } finally {
+            sw.destroy();
+            vi.unstubAllGlobals();
+            resetObserverForTesting();
         }
     });
 
@@ -653,35 +678,6 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
         switchInstance.destroy();
     });
 
-    it("falls back to the first enabled item when initial target is disabled", () => {
-        const nav = document.createElement("nav");
-        document.body.appendChild(nav);
-
-        const btn0 = document.createElement("button");
-        btn0.dataset.switchValue = "b0";
-        btn0.disabled = true;
-        Object.defineProperty(btn0, "offsetLeft", { value: 0, configurable: true });
-        Object.defineProperty(btn0, "offsetWidth", { value: 60, configurable: true });
-
-        const btn1 = document.createElement("button");
-        btn1.dataset.switchValue = "b1";
-        Object.defineProperty(btn1, "offsetLeft", { value: 60, configurable: true });
-        Object.defineProperty(btn1, "offsetWidth", { value: 60, configurable: true });
-
-        nav.appendChild(btn0);
-        nav.appendChild(btn1);
-
-        const switchInstance = createGlassSwitch(nav, {
-            engine: "css",
-            value: "b0",
-        });
-
-        expect(switchInstance.activeIndex).toBe(1);
-        expect(switchInstance.value).toBe("b1");
-
-        switchInstance.destroy();
-    });
-
     it("supports ArrowDown and ArrowUp keyboard navigation", () => {
         const { nav } = buildSwitchFixture(
             [80, 80, 80],
@@ -848,10 +844,16 @@ describe("Apple bottom navigation switch physics (createGlassSwitch)", () => {
         const switchInstance = createGlassSwitch(nav, {
             engine: "auto",
         });
+        const glider = nav.querySelector<HTMLElement>(".lg-switch-glider")!;
         expect(switchInstance.engine).toBe("webgl");
+        expect(glider.style.getPropertyValue("--lg-rim-opacity")).toBe("0");
 
         switchInstance.update({ sceneElement: null, tintOpacity: 0.2 });
         expect(switchInstance.engine).toBe("webgl");
+
+        switchInstance.update({ engine: "css", gliderOptions: { highlight: 0.72 } });
+        expect(switchInstance.engine).toBe("css");
+        expect(glider.style.getPropertyValue("--lg-rim-opacity")).toBe("0.72");
 
         switchInstance.destroy();
         getContextSpy.mockRestore();

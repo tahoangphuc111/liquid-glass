@@ -1,5 +1,5 @@
 export interface SpringController {
-    press(): void;
+    press(directTouch?: boolean): void;
     release(bounce?: boolean): void;
     setTilt(horizontal: number, vertical: number): void;
     setDrag(offsetX: number, offsetY: number, immediate?: boolean): void;
@@ -35,11 +35,12 @@ export interface SpringStepResult {
     settled: boolean;
 }
 
-const PRESS_TARGET = -0.028;
-const PRESS_STIFFNESS = 520;
-const PRESS_GAMMA = 14;
-const RELEASE_STIFFNESS = 380;
-const RELEASE_GAMMA = 6.75;
+const PRESS_TARGET = -0.024;
+const TOUCH_PRESS_TARGET = -0.038;
+const PRESS_STIFFNESS = 720;
+const PRESS_GAMMA = 21.5;
+const RELEASE_STIFFNESS = 420;
+const RELEASE_GAMMA = 9.5;
 const SETTLE_DISPLACEMENT = 0.0003;
 const SETTLE_VELOCITY = 0.003;
 const MAX_PROPAGATOR_DT_ENTRIES = 64;
@@ -66,15 +67,15 @@ const TILT_SPRING_PARAMS: DampedSpringParams = {
 };
 
 const DRAG_ACTIVE_PARAMS: DampedSpringParams = {
-    stiffness: 340,
-    gamma: 19,
+    stiffness: 920,
+    gamma: 28,
     settleDisplacement: 0.08,
     settleVelocity: 0.4,
 };
 
 const DRAG_RELEASE_PARAMS: DampedSpringParams = {
-    stiffness: 260,
-    gamma: 10.5,
+    stiffness: 320,
+    gamma: 14,
     settleDisplacement: 0.08,
     settleVelocity: 0.4,
 };
@@ -140,6 +141,16 @@ export function evaluateSpringEnergy(
     return 0.5 * safeStiffness * displacement * displacement + 0.5 * velocity * velocity;
 }
 
+/**
+ * Instantaneous mechanical energy dissipation rate dE/dt = -2 * gamma * v^2
+ * from the Rayleigh dissipation function F = gamma * v^2 (always <= 0).
+ */
+export function evaluateRayleighDissipationRate(velocity: number, gamma: number): number {
+    if (!Number.isFinite(velocity) || !Number.isFinite(gamma)) return 0;
+    const safeGamma = Math.max(0, gamma);
+    return -2 * safeGamma * velocity * velocity;
+}
+
 export function predictMomentumOffset(
     position: number,
     velocity: number,
@@ -180,11 +191,24 @@ export function buildSpringPropagator(safeDt: number, params: DampedSpringParams
         decayC0 = decay * Math.cos(phase);
         decayDtC1 = (decay * Math.sin(phase)) / omegaD;
     } else {
+        // Algebraic conjugate eigenvalue r+ = -k / (gamma + lambda) and expm1 avoid
+        // catastrophic cancellation when gamma >> sqrt(stiffness) or lambda * dt is small.
         const lambda = Math.sqrt(-discriminant);
-        const expFast = Math.exp((-gamma + lambda) * dt);
-        const expSlow = Math.exp((-gamma - lambda) * dt);
-        decayC0 = 0.5 * (expFast + expSlow);
-        decayDtC1 = (0.5 * (expFast - expSlow)) / lambda;
+        const sumRate = gamma + lambda;
+        const slowEigenvalue = -stiffness / sumRate;
+        const expSlow = Math.exp(slowEigenvalue * dt);
+        const expFast = Math.exp(-sumRate * dt);
+        const modeDiff = -Math.expm1(-2 * lambda * dt);
+        const invTwoLambda = 0.5 / lambda;
+        const c01 = expSlow * modeDiff * invTwoLambda;
+        return {
+            c00: expSlow * (1 - slowEigenvalue * modeDiff * invTwoLambda),
+            c01,
+            c10: -stiffness * c01,
+            c11: (slowEigenvalue * expSlow + sumRate * expFast) * invTwoLambda,
+            settleDisplacement,
+            settleVelocity,
+        };
     }
 
     return {
@@ -427,7 +451,9 @@ export function createInteractiveSpring(
                 scratchStretchMatrix[3] = baseScaleY * s22;
             }
         }
-        const glow = Math.min(0.18, Math.abs(displacement) * 2.4 + (pressed ? 0.1 : 0));
+        const glow = reducedMotion
+            ? (pressed ? 0.1 : 0)
+            : Math.min(0.18, Math.max(0, -displacement) * 4.8);
         scratchFrame.scaleX = baseScaleX * dropletFactorX;
         scratchFrame.scaleY = baseScaleY * dropletFactorY;
         scratchFrame.glow = glow;
@@ -453,13 +479,8 @@ export function createInteractiveSpring(
         Math.abs(springState[0]!) < SETTLE_DISPLACEMENT &&
         Math.abs(springState[2]!) < 0.002 &&
         Math.abs(springState[4]!) < 0.002 &&
-        (freeDragMode
-            ? Math.abs(springState[6]! - targetDragX) < 0.08 &&
-              Math.abs(springState[8]! - targetDragY) < 0.08
-            : Math.abs(targetDragX) < 0.08 &&
-              Math.abs(targetDragY) < 0.08 &&
-              Math.abs(springState[6]!) < 0.08 &&
-              Math.abs(springState[8]!) < 0.08) &&
+        Math.abs(springState[6]! - targetDragX) < 0.08 &&
+        Math.abs(springState[8]! - targetDragY) < 0.08 &&
         Math.abs(springState[7]!) < 0.4 &&
         Math.abs(springState[9]!) < 0.4;
 
@@ -480,7 +501,7 @@ export function createInteractiveSpring(
         rafId = null;
         if (destroyed) return;
 
-        const dtMs = lastTime > 0 ? now - lastTime : 16;
+        const dtMs = lastTime > 0 ? Math.max(1, now - lastTime) : 16;
         lastTime = now;
         const dtBucket = resolveQuantizedDtBucket(dtMs);
 
@@ -555,10 +576,10 @@ export function createInteractiveSpring(
     };
 
     return {
-        press() {
+        press(directTouch = false) {
             if (destroyed) return;
             pressed = true;
-            target = PRESS_TARGET;
+            target = directTouch ? TOUCH_PRESS_TARGET : PRESS_TARGET;
             if (reducedMotion) {
                 springState[0] = 0;
                 springState[1] = 0;
@@ -567,14 +588,12 @@ export function createInteractiveSpring(
         },
         release(bounce = true) {
             if (destroyed) return;
-            const wasPressed = pressed;
+            const pressDepth = pressed ? -target : 0;
             pressed = false;
             target = 0;
-            if (!reducedMotion && bounce && wasPressed) {
-                if (springState[0]! > -0.012) {
-                    springState[0] = Math.min(springState[0]!, -0.018);
-                }
-                springState[1] = Math.max(springState[1]!, 0.34);
+            if (!reducedMotion && bounce && pressDepth > 0 && springState[0]! > -pressDepth * 0.4) {
+                // Keep a brief tap visible even when it ends before the first frame.
+                springState[1] = Math.min(springState[1]!, -pressDepth * 14);
             }
             ensureRunning();
         },

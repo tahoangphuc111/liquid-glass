@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createGlassSlider, createLiquidGlass, destroyLiquidGlass } from "../src/index.js";
 import * as renderBudget from "../src/core/renderBudget.js";
-import { createInteractiveSpring } from "../src/core/spring.js";
+import * as springPhysics from "../src/core/spring.js";
+import { createSceneCaptureController } from "../src/core/sceneCapture.js";
 import {
     acquireWebglSlot,
     getWebglPoolStats,
@@ -9,7 +10,7 @@ import {
     resetWebglPoolForTesting,
     setMaxActiveWebglContextsForTesting,
 } from "../src/core/webglPool.js";
-import { GlassWebglRenderer, parseCssColorToRgb } from "../src/core/webglRenderer.js";
+import { GlassWebglRenderer, parseCssColorToRgb, type GlassFrameParams } from "../src/core/webglRenderer.js";
 
 function createMockGl() {
     const uniforms = new Map<string, number>();
@@ -262,7 +263,7 @@ describe("WebGL pool, dynamic light tilt, and Kawase blur", () => {
         });
         vi.spyOn(globalThis, "cancelAnimationFrame").mockImplementation(() => {});
 
-        const spring = createInteractiveSpring(
+        const spring = springPhysics.createInteractiveSpring(
             (frame) => {
                 frames.push({
                     tiltHorizontal: frame.tiltHorizontal,
@@ -323,6 +324,36 @@ describe("WebGL pool, dynamic light tilt, and Kawase blur", () => {
         const lightUniforms = uniform2fCalls.filter((call) => call.name === "uLightTilt");
         expect(lightUniforms.some((call) => call.x > 0.1 && call.y > 0.1)).toBe(true);
         glass.destroy();
+    });
+
+    it("reuses the uploaded optical LUT while the refractive index stays in the same rounded bucket", () => {
+        const { gl } = createMockGl();
+        const canvas = document.createElement("canvas");
+        vi.spyOn(canvas, "getContext").mockReturnValue(gl);
+        const renderer = GlassWebglRenderer.create(canvas)!;
+        const frame = {
+            width: 80,
+            height: 32,
+            radius: 8,
+            bezel: 7,
+            thickness: 40,
+            scaleRatio: 2,
+            blur: 0,
+            surface: "convex_squircle" as const,
+            tintColor: [1, 1, 1] as [number, number, number],
+            tintOpacity: 0.12,
+            highlight: 0.72,
+        };
+        try {
+            for (let index = 0; index <= 20; index++) {
+                renderer.render({ ...frame, ior: 1.5 + index * 0.00002 });
+            }
+            expect(gl.texImage2D).toHaveBeenCalledTimes(1);
+            renderer.render({ ...frame, ior: 1.501 });
+            expect(gl.texImage2D).toHaveBeenCalledTimes(2);
+        } finally {
+            renderer.dispose();
+        }
     });
 
     it("activates lazy 2-pass half-res Kawase downsample FBOs above blur > 6 and disposes cleanly", () => {
@@ -427,6 +458,243 @@ describe("WebGL pool, dynamic light tilt, and Kawase blur", () => {
         expect(parseCssColorToRgb("rgb(100%, 50%, 0%)")).toEqual([1, 0.5, 0]);
         expect(parseCssColorToRgb("rgba(0%, 100%, 50%, 0.5)")).toEqual([0, 1, 0.5]);
         expect(parseCssColorToRgb("#ff8000")).toEqual([1, 128 / 255, 0]);
+    });
+
+    it("uploads resized scene canvases and keeps the CSS backdrop when upload is unavailable", () => {
+        vi.useFakeTimers();
+        const { gl } = createMockGl();
+        vi.spyOn(renderBudget, "useSmallMemoryBudget").mockReturnValue(true);
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation((type: string) =>
+            type === "webgl2" || type === "webgl" ? gl : null,
+        );
+        const element = document.body.appendChild(document.createElement("div"));
+        setBox(element, 80, 32);
+        const scene = document.createElement("canvas");
+        scene.width = 0;
+        const glass = createLiquidGlass(element, { engine: "webgl", sceneCanvas: scene, coalesce: false });
+        const sceneState = () => element.getAttribute("data-lg-webgl-scene");
+        const countUploads = () => vi.mocked(gl.texImage2D).mock.calls
+            .filter((args) => (args.at(-1) as unknown) === scene).length;
+        const refresh = () => {
+            glass.refresh();
+            vi.advanceTimersByTime(32);
+        };
+        try {
+            vi.advanceTimersByTime(32);
+            expect(sceneState()).toBe("0");
+            scene.width = 400;
+            refresh();
+            expect(sceneState()).toBe("1");
+            expect(countUploads()).toBe(1);
+            refresh();
+            expect(countUploads()).toBe(1);
+            scene.width = 2048;
+            refresh();
+            expect(sceneState()).toBe("0");
+            expect(element.style.getPropertyValue("--lg-filter")).toContain("blur(");
+            scene.width = 400;
+            refresh();
+            expect(sceneState()).toBe("1");
+            scene.height = 0;
+            refresh();
+            expect(sceneState()).toBe("0");
+        } finally {
+            glass.destroy();
+            vi.useRealTimers();
+        }
+    });
+
+    it("keeps the drawing buffer at one reduced size through a drag reversal", () => {
+        vi.useFakeTimers();
+        const { gl } = createMockGl();
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(gl);
+        let emit!: Parameters<typeof springPhysics.createInteractiveSpring>[0];
+        let settle!: () => void;
+        vi.spyOn(springPhysics, "createInteractiveSpring").mockImplementation((onFrame, onRest) => {
+            emit = onFrame;
+            settle = onRest;
+            return {
+                press() {}, release() {}, setTilt() {}, setDrag() {}, impulseDrag() {}, setReducedMotion() {}, destroy() {},
+            };
+        });
+        const element = document.body.appendChild(document.createElement("button"));
+        setBox(element, 100, 48);
+        const glass = createLiquidGlass(element, { engine: "webgl", pixelRatio: 2, pill: true, draggable: true });
+        const canvas = element.querySelector<HTMLCanvasElement>(".lg-webgl-canvas")!;
+        const motion = (dragX: number, velocityX: number) => {
+            emit({ scaleX: 1, scaleY: 1, glow: 0, tiltHorizontal: 0, tiltVertical: 0,
+                dragX, dragY: 0, velocityX, velocityY: 0, stretchMatrix: [1, 0, 0, 1] });
+            vi.advanceTimersByTime(32);
+        };
+        try {
+            vi.advanceTimersByTime(32);
+            expect(canvas.width).toBe(200);
+            motion(0, 10);
+            const reducedWidth = canvas.width;
+            expect(reducedWidth).toBeLessThan(200);
+            motion(1, 0.2);
+            expect(canvas.width).toBe(reducedWidth);
+            motion(0, -10);
+            expect(canvas.width).toBe(reducedWidth);
+            motion(0, 0);
+            settle();
+            vi.advanceTimersByTime(32);
+            expect(canvas.width).toBe(200);
+        } finally {
+            glass.destroy();
+            vi.useRealTimers();
+        }
+    });
+
+    it("refreshes glass and slider textures when a captured backdrop repaints the same canvas", () => {
+        vi.useFakeTimers();
+        const panelGl = createMockGl().gl;
+        const sliderGl = createMockGl().gl;
+        const drawImage = vi.fn();
+        const scene2d = { setTransform() {}, fillRect() {}, drawImage } as unknown as CanvasRenderingContext2D;
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(function (
+            this: HTMLCanvasElement,
+            type: string,
+        ) {
+            if (type === "2d") return scene2d;
+            return this.parentElement?.classList.contains("lg-slider-thumb") ? sliderGl : panelGl;
+        });
+        const source = document.body.appendChild(document.createElement("section"));
+        setBox(source, 300, 200);
+        const capture = createSceneCaptureController(source, () => 1);
+        const panel = document.body.appendChild(document.createElement("div"));
+        setBox(panel, 80, 32);
+        const input = document.body.appendChild(document.createElement("input"));
+        input.type = "range";
+        let glass: ReturnType<typeof createLiquidGlass> | undefined;
+        let slider: ReturnType<typeof createGlassSlider> | undefined;
+        try {
+            vi.advanceTimersByTime(32);
+            const scene = capture.canvas!;
+            glass = createLiquidGlass(panel, { engine: "webgl", sceneElement: source, sceneCanvas: scene, coalesce: false });
+            slider = createGlassSlider(input, { engine: "webgl", sceneElement: source, sceneCanvas: scene, coalesce: false });
+            const wrapper = input.parentElement!;
+            setBox(wrapper, 200, 40);
+            setBox(wrapper.querySelector(".lg-slider-thumb")!, 48, 28);
+            slider.refresh();
+            vi.advanceTimersByTime(48);
+            vi.mocked(panelGl.texImage2D).mockClear();
+            vi.mocked(sliderGl.texImage2D).mockClear();
+            drawImage.mockClear();
+
+            capture.scheduleCapture();
+            vi.advanceTimersByTime(48);
+
+            expect(capture.canvas).toBe(scene);
+            expect(vi.mocked(panelGl.texImage2D).mock.calls.some((args) => (args.at(-1) as unknown) === scene)).toBe(true);
+            expect(drawImage.mock.calls.some(([canvas]) => canvas === scene)).toBe(true);
+            expect(vi.mocked(sliderGl.texImage2D).mock.calls.some((args) => args.at(-1) instanceof HTMLCanvasElement)).toBe(true);
+
+            drawImage.mockClear();
+            vi.mocked(sliderGl.texImage2D).mockClear();
+            slider.update({ highlight: 0.2 });
+            vi.advanceTimersByTime(48);
+            expect(drawImage).not.toHaveBeenCalled();
+            expect(vi.mocked(sliderGl.texImage2D).mock.calls.some((args) => args.at(-1) instanceof HTMLCanvasElement)).toBe(false);
+        } finally {
+            slider?.destroy();
+            glass?.destroy();
+            capture.destroy();
+            vi.useRealTimers();
+        }
+    });
+
+    it("uses CSS while a backdrop has no drawable bounds and restores the texture when its bounds return", () => {
+        vi.useFakeTimers();
+        const { gl } = createMockGl();
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(gl);
+        const source = document.body.appendChild(document.createElement("div"));
+        const element = document.body.appendChild(document.createElement("div"));
+        const scene = document.createElement("canvas");
+        setBox(element, 80, 32);
+        setBox(source, 0, 0);
+        const glass = createLiquidGlass(element, { engine: "webgl", sceneElement: source, sceneCanvas: scene, coalesce: false });
+        const sceneUploads = () => vi.mocked(gl.texImage2D).mock.calls.filter((args) => (args.at(-1) as unknown) === scene);
+        try {
+            vi.advanceTimersByTime(32);
+            expect(element.getAttribute("data-lg-webgl-scene")).toBe("0");
+            expect(sceneUploads()).toHaveLength(0);
+
+            setBox(source, 320, 240);
+            glass.refresh();
+            vi.advanceTimersByTime(32);
+            expect(element.getAttribute("data-lg-webgl-scene")).toBe("1");
+            expect(sceneUploads()).toHaveLength(1);
+
+            source.remove();
+            glass.refresh();
+            vi.advanceTimersByTime(32);
+            expect(element.getAttribute("data-lg-webgl-scene")).toBe("0");
+            expect(sceneUploads()).toHaveLength(1);
+        } finally {
+            glass.destroy();
+            vi.useRealTimers();
+        }
+    });
+
+    it("keeps slider shape overrides and reapplies slider defaults when changing presets", () => {
+        const input = document.body.appendChild(document.createElement("input"));
+        input.type = "range";
+        const slider = createGlassSlider(input, { engine: "css", pill: false });
+        const thumb = input.parentElement!.querySelector<HTMLElement>(".lg-slider-thumb")!;
+        const directInput = document.body.appendChild(document.createElement("input"));
+        directInput.type = "range";
+        const directSlider = createGlassSlider(directInput, { engine: "css", preset: "frosted", pill: false });
+        const directThumb = directInput.parentElement!.querySelector<HTMLElement>(".lg-slider-thumb")!;
+        const initialFilter = thumb.style.getPropertyValue("--lg-filter");
+        try {
+            slider.update({ preset: "frosted" });
+            expect(thumb.style.getPropertyValue("--lg-filter")).not.toBe(initialFilter);
+            expect(thumb.style.getPropertyValue("--lg-filter")).toBe(directThumb.style.getPropertyValue("--lg-filter"));
+            expect(thumb.hasAttribute("data-lg-pill")).toBe(false);
+            slider.update({ preset: undefined });
+            expect(thumb.style.getPropertyValue("--lg-filter")).toBe(initialFilter);
+            expect(thumb.hasAttribute("data-lg-pill")).toBe(false);
+        } finally {
+            directSlider.destroy();
+            slider.destroy();
+        }
+    });
+
+    it("restores the CSS backdrop during WebGL context loss and reuploads the scene on recovery", () => {
+        vi.useFakeTimers();
+        const { gl } = createMockGl();
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(gl);
+        const panel = document.body.appendChild(document.createElement("div"));
+        setBox(panel, 80, 32);
+        const scene = document.createElement("canvas");
+        const glass = createLiquidGlass(panel, { engine: "webgl", sceneCanvas: scene, coalesce: false });
+        const canvas = panel.querySelector("canvas")!;
+        try {
+            vi.advanceTimersByTime(32);
+            expect(panel.getAttribute("data-lg-webgl-scene")).toBe("1");
+            vi.mocked(gl.drawArrays).mockClear();
+
+            const lost = new Event("webglcontextlost", { cancelable: true });
+            canvas.dispatchEvent(lost);
+            expect(lost.defaultPrevented).toBe(true);
+            expect(panel.getAttribute("data-lg-webgl-scene")).toBe("0");
+            expect(panel.style.getPropertyValue("--lg-filter")).toContain("blur(");
+            glass.update({ blur: 3 });
+            vi.advanceTimersByTime(48);
+            expect(panel.querySelector("canvas")).toBe(canvas);
+            expect(gl.drawArrays).not.toHaveBeenCalled();
+
+            vi.mocked(gl.texImage2D).mockClear();
+            canvas.dispatchEvent(new Event("webglcontextrestored"));
+            vi.advanceTimersByTime(48);
+            expect(vi.mocked(gl.texImage2D).mock.calls.some((args) => (args.at(-1) as unknown) === scene)).toBe(true);
+            expect(gl.drawArrays).toHaveBeenCalled();
+            expect(panel.getAttribute("data-lg-webgl-scene")).toBe("1");
+        } finally {
+            glass.destroy();
+            vi.useRealTimers();
+        }
     });
 
     it("transitions properly to WebGL when setSceneCanvas is called dynamically", () => {
@@ -806,6 +1074,50 @@ describe("WebGL pool, dynamic light tilt, and Kawase blur", () => {
         renderer.dispose();
     });
 
+    it("skips coarse 0.4x interior pass when sharpness is positive even on large blurred panels", () => {
+        const { gl, viewportCalls, uniform1fCalls } = (() => {
+            const base = createMockGl();
+            const vpCalls: Array<[number, number, number, number]> = [];
+            base.gl.viewport = vi.fn((x: number, y: number, w: number, h: number) => {
+                vpCalls.push([x, y, w, h]);
+            });
+            return { ...base, viewportCalls: vpCalls };
+        })();
+
+        const canvas = document.createElement("canvas");
+        vi.spyOn(canvas, "getContext").mockReturnValue(gl);
+        const renderer = GlassWebglRenderer.create(canvas)!;
+
+        const sceneCanvas = document.createElement("canvas");
+        sceneCanvas.width = 800;
+        sceneCanvas.height = 600;
+        renderer.setSceneCanvas(sceneCanvas, 1);
+
+        renderer.render({
+            width: 400,
+            height: 300,
+            radius: 24,
+            bezel: 14,
+            thickness: 48,
+            scaleRatio: 2.35,
+            ior: 2.15,
+            blur: 4,
+            sharpness: 1,
+            surface: "convex_squircle",
+            tintColor: [1, 1, 1],
+            tintOpacity: 0.12,
+            highlight: 0.72,
+            pixelRatio: 3,
+            sceneRect: { relX: 0.1, relY: 0.1, relW: 0.5, relH: 0.5 },
+        });
+
+        expect(viewportCalls).not.toContainEqual([0, 0, 200, 150]);
+        expect(uniform1fCalls.some((c) => c.name === "uUseInteriorTex" && c.val === 1)).toBe(false);
+        expect(uniform1fCalls.some((c) => c.name === "uSharpness" && c.val === 1)).toBe(true);
+
+        renderer.dispose();
+    });
+
     it("compiles WebGL2 transfer/interior shaders with 16-bit NEAREST LUT, C^2 sminPoly, rational GGX, Nyquist downsample, and tightened rim", () => {
         const shaderSources: string[] = [];
         const uploadedUniforms: Array<{ name: string; args: number[] }> = [];
@@ -888,12 +1200,18 @@ describe("WebGL pool, dynamic light tilt, and Kawase blur", () => {
         expect(transferSampleFrag).not.toContain("pow(dynamicNdh, 5.0)");
         expect(joined).toContain("sampleOpticalLut16");
         expect(joined).toContain("(safeK / 6.0) * h * h * h");
-        expect(joined).toContain("smoothstep(0.48, 0.985, rimY)");
-        expect(joined).toContain("cornerArc * cornerArc * 0.14");
+        expect(joined).toContain("clamp((rimY - 0.68) / 0.32, 0.0, 1.0)");
+        expect(joined).toContain("cornerArc * cornerArc * 0.08 * rimSmooth");
         expect(joined).toContain("evalSquircleGeom(peerQPlus, peerProps.x)");
         expect(joined).toContain("saddlePerp = vec2(-saddleAxis.y, saddleAxis.x)");
-        expect(joined).toContain("fresnelSq * fresnelSq * fresnelComplement");
-        expect(joined).toContain("opticalTransmittance = exp(");
+        expect(joined).toContain("fresnelRs * fresnelRs + fresnelRp * fresnelRp");
+        expect(joined).toContain("HALF_SECONDARY");
+        expect(joined).toContain("meniscusSpecMask");
+        expect(joined).toContain("bevelDepthShade");
+        expect(joined).toContain("verticalRimBias");
+        expect(joined).toContain("vec3(0.8185, 1.0, 1.1565) * interferencePhase");
+        expect(joined).toContain("vibrantScene * uMedium.rgb + uTint.rgb * uMedium.a");
+        expect(joined).not.toContain("opticalTransmittance = exp(");
         expect(joined).toContain("chromaSpread * 0.72");
         expect(joined).toContain("chromaSpread * 1.28");
 
@@ -908,47 +1226,6 @@ describe("WebGL pool, dynamic light tilt, and Kawase blur", () => {
         expect(uploadedUniforms.some((u) => u.name === "uHighlight" && u.args[1] > 0)).toBe(true);
 
         renderer.dispose();
-    });
-
-    it("supports programmatic setLightTilt and cleans localSceneCapture on setSceneCanvas(null, null)", () => {
-        const scene = document.createElement("div");
-        const target = document.createElement("div");
-        document.body.append(scene, target);
-        vi.spyOn(scene, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, 300, 300));
-        vi.spyOn(target, "getBoundingClientRect").mockReturnValue(new DOMRect(20, 20, 120, 50));
-
-        const { gl, uniform2fCalls } = createMockGl();
-        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation((type: string) => {
-            if (type === "webgl" || type === "experimental-webgl") return gl as unknown as RenderingContext;
-            if (type === "2d") {
-                return { setTransform: () => {}, clearRect: () => {}, fillRect: () => {}, save: () => {}, restore: () => {} } as unknown as CanvasRenderingContext2D;
-            }
-            return null;
-        });
-
-        const rafQueue: FrameRequestCallback[] = [];
-        vi.spyOn(globalThis, "requestAnimationFrame").mockImplementation((cb) => {
-            rafQueue.push(cb);
-            return rafQueue.length;
-        });
-
-        const instance = createLiquidGlass(target, {
-            engine: "webgl",
-            interactive: false,
-            sceneElement: scene,
-            lightTilt: { horizontal: 0.25, vertical: -0.5 },
-        });
-        while (rafQueue.length > 0) rafQueue.shift()!(16);
-        expect(uniform2fCalls.some((c) => c.name === "uLightTilt" && c.x === 0.25 && c.y === -0.5)).toBe(true);
-
-        instance.setLightTilt?.(-0.7, 0.35);
-        while (rafQueue.length > 0) rafQueue.shift()!(32);
-        expect(uniform2fCalls.some((c) => c.name === "uLightTilt" && c.x === -0.7 && c.y === 0.35)).toBe(true);
-
-        instance.setSceneCanvas(null, null);
-        while (rafQueue.length > 0) rafQueue.shift()!(48);
-        expect(target.getAttribute("data-lg-webgl-scene")).toBe("0");
-        instance.destroy();
     });
 
     it("skips redundant uPeerBounds/uPeerProps uniform4fv uploads when coalescence peers stay stationary", () => {
@@ -1048,5 +1325,208 @@ describe("WebGL pool, dynamic light tilt, and Kawase blur", () => {
         expect(restored).toEqual(["failing", "healthy"]);
         expect(getWebglPoolStats().activeCount).toBe(1);
         resetWebglPoolForTesting();
+    });
+
+    it("recaptures an external sceneElement when a WebGL slider updates pixelRatio", () => {
+        vi.useFakeTimers();
+        const { gl } = createMockGl();
+        const drawnSources: Array<{ width: number; height: number }> = [];
+        const context2d = {
+            setTransform: vi.fn(),
+            fillRect: vi.fn(),
+            drawImage: vi.fn((sourceCanvas: HTMLCanvasElement) => {
+                drawnSources.push({ width: sourceCanvas.width, height: sourceCanvas.height });
+            }),
+        } as unknown as CanvasRenderingContext2D;
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation((type) =>
+            type === "2d" ? context2d : gl);
+        const source = document.body.appendChild(document.createElement("section"));
+        const input = source.appendChild(document.createElement("input"));
+        input.type = "range";
+        setBox(source, 200, 100);
+        const slider = createGlassSlider(input, {
+            engine: "webgl",
+            sceneElement: source,
+            pixelRatio: 1,
+        });
+        const wrapper = input.parentElement!;
+        const thumb = wrapper.querySelector<HTMLElement>(".lg-slider-thumb")!;
+        setBox(wrapper, 160, 32, 10, 20);
+        setBox(thumb, 40, 30, 50, 21);
+        try {
+            vi.advanceTimersByTime(32);
+            expect(drawnSources.at(-1)).toEqual({ width: 200, height: 100 });
+
+            drawnSources.length = 0;
+            slider.update({ pixelRatio: 2 });
+            vi.advanceTimersByTime(32);
+            expect(drawnSources.at(-1)).toEqual({ width: 400, height: 200 });
+        } finally {
+            slider.destroy();
+            vi.useRealTimers();
+        }
+    });
+
+    it("scales and recaptures an external sceneElement for WebGL slider when sharpness or blur changes", () => {
+        vi.useFakeTimers();
+        const { gl } = createMockGl();
+        const drawnSources: Array<{ width: number; height: number }> = [];
+        const context2d = {
+            setTransform: vi.fn(),
+            fillRect: vi.fn(),
+            drawImage: vi.fn((sourceCanvas: HTMLCanvasElement) => {
+                drawnSources.push({ width: sourceCanvas.width, height: sourceCanvas.height });
+            }),
+        } as unknown as CanvasRenderingContext2D;
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation((type) =>
+            type === "2d" ? context2d : gl);
+        const source = document.body.appendChild(document.createElement("section"));
+        const input = source.appendChild(document.createElement("input"));
+        input.type = "range";
+        setBox(source, 200, 100);
+        const slider = createGlassSlider(input, {
+            engine: "webgl",
+            sceneElement: source,
+        });
+        const wrapper = input.parentElement!;
+        const thumb = wrapper.querySelector<HTMLElement>(".lg-slider-thumb")!;
+        setBox(wrapper, 160, 32, 10, 20);
+        setBox(thumb, 40, 30, 50, 21);
+        try {
+            vi.advanceTimersByTime(32);
+            const autoClearSize = drawnSources.at(-1)!;
+            expect(autoClearSize.width).toBeGreaterThan(200);
+
+            drawnSources.length = 0;
+            slider.update({ sharpness: 1 });
+            vi.advanceTimersByTime(32);
+            const maxSharpSize = drawnSources.at(-1)!;
+            expect(maxSharpSize.width).toBeGreaterThan(autoClearSize.width);
+
+            drawnSources.length = 0;
+            slider.update({ blur: 8, sharpness: undefined });
+            vi.advanceTimersByTime(32);
+            const blurredSize = drawnSources.at(-1)!;
+            expect(blurredSize.width).toBeLessThan(autoClearSize.width);
+        } finally {
+            slider.destroy();
+            vi.useRealTimers();
+        }
+    });
+
+    it("uses framebuffer pixel coverage, rotated-grid bezel supersampling, and trilinear scene mipmaps on WebGL2", () => {
+        const { gl, uniform2fCalls } = createMockGl();
+        const generateMipmap = vi.fn();
+        const texSubImage2D = vi.fn();
+        Object.assign(gl, {
+            LINEAR_MIPMAP_LINEAR: 0x2703,
+            generateMipmap,
+            texSubImage2D,
+        });
+        const canvas = document.createElement("canvas");
+        vi.spyOn(canvas, "getContext").mockImplementation((contextType) =>
+            contextType === "webgl2" ? gl : null);
+
+        const renderer = GlassWebglRenderer.create(canvas)!;
+        const fragmentSource = vi
+            .mocked(gl.shaderSource)
+            .mock.calls.map(([, src]) => src)
+            .find((src) => src.includes("edgeAA"))!;
+        expect(fragmentSource).toContain("edgeCoverage(sd, coverageGradient)");
+        expect(fragmentSource).toContain("float curveBlend = smoothstep(0.0, 0.35, rawMinor / rawMajor);");
+        expect(fragmentSource).toContain("float edgeAaLimit = 0.78 * length(uPixelSize);");
+        expect(fragmentSource).toContain("textureGrad(uSceneTex, uv, gradX, gradY)");
+        expect(fragmentSource).toContain("rgssSample");
+        expect(fragmentSource).toContain("mix(1.0, 0.48, uSharpness)");
+
+        const frame: GlassFrameParams = {
+            width: 61,
+            height: 41,
+            radius: 20,
+            bezel: 10,
+            thickness: 20,
+            scaleRatio: 1,
+            ior: 1.5,
+            blur: 0,
+            surface: "convex_circle",
+            tintColor: [1, 1, 1],
+            tintOpacity: 0.2,
+            highlight: 0.3,
+            pixelRatio: 0.5,
+        };
+        renderer.render(frame);
+        renderer.render(frame);
+        renderer.render(frame);
+        renderer.render(frame);
+        expect(uniform2fCalls.filter(({ name }) => name === "uPixelSize")).toEqual([
+            { name: "uPixelSize", x: 61 / 30, y: 41 / 20 },
+            { name: "uPixelSize", x: 61 / 30, y: 41 / 20 },
+            { name: "uPixelSize", x: 61 / 30, y: 41 / 20 },
+        ]);
+
+        const sceneCanvas = document.createElement("canvas");
+        sceneCanvas.width = 640;
+        sceneCanvas.height = 360;
+        renderer.setSceneCanvas(sceneCanvas, 1);
+
+        expect(vi.mocked(gl.texParameteri)).toHaveBeenCalledWith(0x0de1, 0x2801, 0x2703);
+        expect(generateMipmap).toHaveBeenCalledTimes(1);
+
+        renderer.setSceneCanvas(sceneCanvas, 1);
+        expect(texSubImage2D).toHaveBeenCalledTimes(1);
+        expect(generateMipmap).toHaveBeenCalledTimes(2);
+
+        renderer.dispose();
+    });
+
+    it("uses perceptual deadzone, adaptive 2-tap/4-tap dispersion, and mipmapped WebGL2 spectral blur", () => {
+        const { gl } = createMockGl();
+        const generateMipmap = vi.fn();
+        Object.assign(gl, {
+            LINEAR_MIPMAP_LINEAR: 0x2703,
+            generateMipmap,
+        });
+        const canvas = document.createElement("canvas");
+        vi.spyOn(canvas, "getContext").mockImplementation((contextType) =>
+            contextType === "webgl2" ? gl : null,
+        );
+
+        const renderer = GlassWebglRenderer.create(canvas)!;
+        const fragmentSource = vi
+            .mocked(gl.shaderSource)
+            .mock.calls.map(([, src]) => src)
+            .find((src) => src.includes("sampleSpectralBlur5Tap"))!;
+
+        expect(fragmentSource).toContain("smoothstep(0.0625, 0.5625, dot(shiftPx, shiftPx))");
+        expect(fragmentSource).toContain("if (dispersionPxSq <= 2.25)");
+        expect(fragmentSource).toContain("smoothstep(2.25, 6.25, dispersionPxSq)");
+        expect(fragmentSource).toContain("textureGrad(uSceneTex, clamp(uvR, 0.002, 0.998), blurGradX, blurGradY)");
+        expect(fragmentSource).toContain("dipoleGradX, dipoleGradY");
+
+        const sceneCanvas = document.createElement("canvas");
+        sceneCanvas.width = 400;
+        sceneCanvas.height = 300;
+        renderer.setSceneCanvas(sceneCanvas);
+        expect(generateMipmap).toHaveBeenCalledTimes(1);
+
+        renderer.render({
+            width: 240,
+            height: 120,
+            radius: 20,
+            bezel: 14,
+            thickness: 40,
+            scaleRatio: 2,
+            ior: 1.5,
+            blur: 8,
+            chromaticAberration: 0.4,
+            surface: "convex_squircle",
+            tintColor: [1, 1, 1],
+            tintOpacity: 0.12,
+            highlight: 0.72,
+            pixelRatio: 2,
+            sceneRect: { relX: 0.1, relY: 0.1, relW: 0.5, relH: 0.4 },
+        });
+        expect(generateMipmap).toHaveBeenCalledTimes(2);
+        renderer.dispose();
     });
 });

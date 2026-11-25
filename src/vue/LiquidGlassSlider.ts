@@ -144,6 +144,10 @@ export const LiquidGlassSlider = defineComponent({
             type: Number,
             default: undefined,
         },
+        sharpness: {
+            type: Number,
+            default: undefined,
+        },
         saturation: {
             type: Number,
             default: undefined,
@@ -212,6 +216,7 @@ export const LiquidGlassSlider = defineComponent({
             highlight: props.highlight,
             lightTilt: props.lightTilt,
             pixelRatio: props.pixelRatio,
+            sharpness: props.sharpness,
             saturation: props.saturation,
             chromaticAberration: props.chromaticAberration,
             abbeNumber: props.abbeNumber,

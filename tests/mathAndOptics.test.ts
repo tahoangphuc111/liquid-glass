@@ -1,16 +1,24 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
     GLASS_PRESETS,
+    SCHOTT_BK7_SELLMEIER,
+    SCHOTT_SF11_SELLMEIER,
     buildOpticalLut,
     computeRelativeLuminance,
     computeWcagContrastRatio,
+    evaluateBeerLambertTransmittance,
     evaluateBrewsterAngle,
     evaluateCauchyIndex,
     evaluateChromaticDispersion,
     evaluateCriticalAngle,
+    evaluateDerjaguinEffectiveRadius,
     evaluateFresnelReflectance,
     evaluateOpticalProfile,
+    evaluateRayleighDissipationRate,
+    evaluateSellmeierIndex,
     evaluateSpectralRefraction,
+    evaluateThinFilmInterference,
+    evaluateYoungLaplacePressure,
     parseCssColorToRgb,
     parseCssColorToRgba,
     predictMomentumOffset,
@@ -19,7 +27,7 @@ import {
     resolveSurfaceId,
     solveRefractionRay,
 } from "../src/index.js";
-import { resetOpticalLutCacheForTesting } from "../src/core/optics.js";
+import { resetOpticalLutCacheForTesting, resolveGlassMedium } from "../src/core/optics.js";
 import {
     buildSpringPropagator,
     createInteractiveSpring,
@@ -36,6 +44,30 @@ describe("Optical physics, exact spring propagators, and CSS Color 4/5", () => {
     afterEach(() => {
         resetOpticalLutCacheForTesting();
         vi.restoreAllMocks();
+    });
+
+    it("matches per-pixel tint and absorption with precomputed medium coefficients", () => {
+        for (const [tint, opacity, thickness] of [
+            [[1, 1, 1], 0.12, 60],
+            [[0.1, 0.1, 0.1], 0.24, 40],
+            [[0.2, 0.55, 0.9], 0.48, 82],
+            [[0, 0.8, 1], 1, 200],
+            [[0.1, 0.5, 0.2], 0, 0],
+        ] as const) {
+            const [red, green, blue] = tint;
+            const coefficients = resolveGlassMedium(red, green, blue, opacity, thickness);
+            const a = Math.min(opacity, 0.85);
+            const path = 0.75 + Math.min(thickness, 160) * 0.014;
+            const weight = Math.min((Math.max(...tint) - Math.min(...tint)) * 1.1, 0.85);
+            for (const [channel, tintValue] of tint.entries()) {
+                for (const scene of [0, 0.13, 0.53, 1]) {
+                    const frosted = scene * (1 - a) + tintValue * a;
+                    const absorbed = scene * Math.exp(-a * path * (1 - tintValue));
+                    const expected = frosted * (1 - weight) + absorbed * weight;
+                    expect(scene * coefficients[channel]! + tintValue * coefficients[3]).toBeCloseTo(expected, 14);
+                }
+            }
+        }
     });
 
     it("satisfies exact Fresnel equations, Brewster/TIR angles, 3D Snell refraction, and Fraunhofer Cauchy-Abbe identities", () => {
@@ -105,8 +137,10 @@ describe("Optical physics, exact spring propagators, and CSS Color 4/5", () => {
         expect(flint.blueShift - flint.displacement).toBeCloseTo(0.64 * flint.lateralSpread, 5);
         expect(flint.displacement - flint.redShift).toBeCloseTo(0.36 * flint.lateralSpread, 5);
 
-        expect(resolveChromaticAberration(true)).toBe(0.085);
-        expect(resolveChromaticAberration(true, 28)).toBeGreaterThan(0.085);
+        const defaultChroma = resolveChromaticAberration(true);
+        expect(defaultChroma).toBeGreaterThan(0.1);
+        expect(defaultChroma).toBeLessThan(0.25);
+        expect(resolveChromaticAberration(true, 28)).toBeGreaterThan(defaultChroma);
         expect(resolveChromaticAberration(false, 28)).toBe(0);
 
         expect(resolveSurfaceId("concave")).toBe(4);
@@ -313,5 +347,87 @@ describe("Optical physics, exact spring propagators, and CSS Color 4/5", () => {
             if (i % 100 === 0) parseCssColorToRgba(hotColor);
         }
         expect(parseCssColorToRgba(hotColor)).toEqual([17 / 255, 134 / 255, 211 / 255, 1]);
+    });
+
+    it("satisfies extreme overdamped stability, Rayleigh dissipation, Airy thin-film theorems, and Young-Laplace capillary law", () => {
+        // Extreme overdamped regime where naive -gamma + sqrt(gamma^2 - k) suffers catastrophic cancellation.
+        const extremeOverdamped = { stiffness: 1, gamma: 1e5, settleDisplacement: 0, settleVelocity: 0 };
+        const p1 = buildSpringPropagator(10, extremeOverdamped);
+        const p2 = buildSpringPropagator(20, extremeOverdamped);
+        const pSum = buildSpringPropagator(30, extremeOverdamped);
+        const exactLambda = Math.sqrt(1e10 - 1);
+        const exactSlowRate = -1 / (1e5 + exactLambda);
+        const exactC00 = ((1e5 + exactLambda) / (2 * exactLambda)) * Math.exp(exactSlowRate * 10);
+        expect(p1.c00).toBeCloseTo(exactC00, 14);
+        expect(p1.c00).toBeLessThan(1);
+        expect(p2.c00 * p1.c00 + p2.c01 * p1.c10).toBeCloseTo(pSum.c00, 14);
+        expect(p1.c11).toBeLessThan(0);
+
+        // Rayleigh dissipation function: dE/dt = -2 * gamma * v^2 matches finite-difference dE/dt.
+        const springParams = { stiffness: 380, gamma: 6.75 };
+        const x0 = 0.8;
+        const v0 = -4.2;
+        const epsDt = 1e-6;
+        const stepFwd = stepSpring(x0, v0, 0, epsDt, springParams);
+        const dEdtNumeric =
+            (evaluateSpringEnergy(stepFwd.value, stepFwd.velocity, springParams.stiffness) -
+                evaluateSpringEnergy(x0, v0, springParams.stiffness)) /
+            epsDt;
+        const rayleighRate = evaluateRayleighDissipationRate(
+            0.5 * (v0 + stepFwd.velocity),
+            springParams.gamma,
+        );
+        expect(rayleighRate).toBeLessThan(0);
+        expect(dEdtNumeric).toBeCloseTo(rayleighRate, 4);
+
+        // Airy / Fabry-Perot thin-film interference theorems:
+        // 1. Quarter-wave anti-reflection (AR) coating: n1 = sqrt(n0 * n2), d = lambda_e / (4 * n1) -> R(lambda_e) = 0.
+        const nSubstrate = 1.52;
+        const nArFilm = Math.sqrt(1.0 * nSubstrate);
+        const quarterWaveGreenNm = 546.074 / (4 * nArFilm);
+        const arSample = evaluateThinFilmInterference(quarterWaveGreenNm, 1.0, nArFilm, nSubstrate, 1.0);
+        expect(arSample.greenReflectance).toBeLessThan(1e-12);
+        expect(arSample.redReflectance + arSample.transmittanceRgb[0]).toBeCloseTo(1, 12);
+        expect(arSample.greenReflectance + arSample.transmittanceRgb[1]).toBeCloseTo(1, 12);
+        expect(arSample.blueReflectance + arSample.transmittanceRgb[2]).toBeCloseTo(1, 12);
+
+        // 2. Half-wave absentee-layer theorem: d = lambda_e / (2 * n1) -> R(lambda_e) equals bare air-substrate Fresnel reflectance.
+        const halfWaveGreenNm = 546.074 / (2 * 1.38);
+        const absentee = evaluateThinFilmInterference(halfWaveGreenNm, 1.0, 1.38, nSubstrate, 1.0);
+        const bareFresnel = evaluateFresnelReflectance(1.0, nSubstrate);
+        expect(absentee.greenReflectance).toBeCloseTo(bareFresnel.reflectance, 12);
+
+        // Young-Laplace capillary pressure & Derjaguin effective curvature radius:
+        expect(evaluateDerjaguinEffectiveRadius(12, 12)).toBeCloseTo(12, 12);
+        expect(evaluateDerjaguinEffectiveRadius(12, 24)).toBeCloseTo(16, 12);
+        expect(evaluateYoungLaplacePressure(0.01, 0.01, 0.0728)).toBeCloseTo(2 * 0.0728 / 0.01, 10);
+        expect(evaluateYoungLaplacePressure(0.01, Infinity, 0.0728)).toBeCloseTo(0.0728 / 0.01, 10);
+        // Minimal catenoid saddle meniscus (R1 = -R2) has zero net Laplace pressure jump.
+        expect(evaluateYoungLaplacePressure(0.02, -0.02, 0.0728)).toBeCloseTo(0, 12);
+
+        // 3-term Sellmeier dispersion vs Schott datasheet values (N-BK7 & N-SF11):
+        const bk7Nd = evaluateSellmeierIndex(587.5618, SCHOTT_BK7_SELLMEIER);
+        const bk7Nf = evaluateSellmeierIndex(486.1327, SCHOTT_BK7_SELLMEIER);
+        const bk7Nc = evaluateSellmeierIndex(656.2725, SCHOTT_BK7_SELLMEIER);
+        expect(bk7Nd).toBeCloseTo(1.5168, 4);
+        expect((bk7Nd - 1) / (bk7Nf - bk7Nc)).toBeCloseTo(64.17, 1);
+
+        const sf11Nd = evaluateSellmeierIndex(587.5618, SCHOTT_SF11_SELLMEIER);
+        const sf11Nf = evaluateSellmeierIndex(486.1327, SCHOTT_SF11_SELLMEIER);
+        const sf11Nc = evaluateSellmeierIndex(656.2725, SCHOTT_SF11_SELLMEIER);
+        expect(sf11Nd).toBeCloseTo(1.7847, 4);
+        expect((sf11Nd - 1) / (sf11Nf - sf11Nc)).toBeCloseTo(25.68, 2);
+
+        // Bouguer-Beer-Lambert refracted optical path transmittance:
+        const sigma: readonly [number, number, number] = [0.2, 0.05, 0.01];
+        const tNormal = evaluateBeerLambertTransmittance(sigma, 2.0, 1.0, 1.52);
+        const tOblique = evaluateBeerLambertTransmittance(sigma, 2.0, 0.5, 1.52);
+        expect(tNormal[0]).toBeCloseTo(Math.exp(-0.4), 12);
+        expect(tOblique[0]).toBeLessThan(tNormal[0]);
+        // Multiplicative semigroup property T(d1 + d2) = T(d1) * T(d2)
+        const tHalf = evaluateBeerLambertTransmittance(sigma, 1.0, 0.5, 1.52);
+        expect(tHalf[0] * tHalf[0]).toBeCloseTo(tOblique[0], 12);
+        expect(tHalf[1] * tHalf[1]).toBeCloseTo(tOblique[1], 12);
+        expect(tHalf[2] * tHalf[2]).toBeCloseTo(tOblique[2], 12);
     });
 });

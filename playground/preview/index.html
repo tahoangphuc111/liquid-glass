@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="vi">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#f9f7f5" />
+    <link
+        rel="icon"
+        type="image/svg+xml"
+        href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0%25' stop-color='%2360a5fa'/%3E%3Cstop offset='50%25' stop-color='%23a855f7'/%3E%3Cstop offset='100%25' stop-color='%23f472b6'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='32' cy='32' r='26' fill='url(%23g)'/%3E%3Ccircle cx='32' cy='32' r='18' fill='rgba(255,255,255,0.28)' stroke='rgba(255,255,255,0.8)' stroke-width='2'/%3E%3C/svg%3E"
+    />
+    <title>Velun — Ánh sáng chuyển động</title>
+</head>
+<body>
+    <main class="stage">
+        <header class="topbar">
+            <a class="nav-pill" href="../"><span aria-hidden="true">←</span> Playground</a>
+        </header>
+        <h1 class="sr-only">Velun — studio ánh sáng độc lập</h1>
+        <canvas id="art" aria-hidden="true"></canvas>
+        <button class="lens" data-lenis-prevent-touch aria-label="Nâng lớp kính để khám phá Velun"></button>
+        <span class="hint" aria-hidden="true">Kéo hoặc cuộn lên để khám phá</span>
+        <div class="actions" data-visible="false" inert>
+            <button id="studio" aria-haspopup="dialog" aria-controls="studio-dialog">Về studio</button>
+            <button id="replay" aria-label="Xem lại hiệu ứng"><span aria-hidden="true">↺</span> Xem lại</button>
+        </div>
+        <p role="status" class="sr-only"></p>
+    </main>
+    <dialog id="studio-dialog" aria-labelledby="studio-title" aria-describedby="studio-description">
+        <h2 id="studio-title">Velun</h2>
+        <p id="studio-description">Chúng tôi là một studio ánh sáng độc lập, khám phá ranh giới giữa lớp kính trong suốt và sắc màu ẩn chứa bên trong.</p>
+        <form method="dialog"><button>Đóng</button></form>
+    </dialog>
+    <script type="module" src="./main.ts"></script>
+</body>
+</html>

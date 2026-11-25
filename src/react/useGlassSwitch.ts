@@ -36,26 +36,37 @@ export function useGlassSwitch(
     const [activeIndex, setActiveIndexState] = useState<number>(0);
 
     const sceneElement = options.sceneElement ?? context?.sceneElement ?? null;
-    const sceneCanvas = options.sceneCanvas ?? (sceneElement ? null : context?.sceneCanvas) ?? null;
+    const sceneCanvas =
+        options.sceneCanvas ??
+        (options.sceneElement && options.sceneElement !== context?.sceneElement
+            ? null
+            : context?.sceneCanvas) ??
+        null;
     const onChangeRef = useRef(options.onChange);
     onChangeRef.current = options.onChange;
     const onEngineChangeRef = useRef(options.onEngineChange);
     onEngineChangeRef.current = options.onEngineChange;
+
+    const handleChange = useCallback(
+        (nextValue: string, nextIndex: number, itemElement: HTMLElement) => {
+            setValueState(nextValue);
+            setActiveIndexState(nextIndex);
+            onChangeRef.current?.(nextValue, nextIndex, itemElement);
+        },
+        [],
+    );
+    const handleEngineChange = useCallback((nextEngine: GlassEngine) => {
+        setEngine(nextEngine);
+        onEngineChangeRef.current?.(nextEngine);
+    }, []);
 
     const latestMergedOptionsRef = useRef<LiquidGlassSwitchOptions>({});
     latestMergedOptionsRef.current = {
         ...mergeGlassOptions(context?.defaults, options),
         sceneCanvas,
         sceneElement,
-        onChange: (nextValue, nextIndex, itemElement) => {
-            setValueState(nextValue);
-            setActiveIndexState(nextIndex);
-            onChangeRef.current?.(nextValue, nextIndex, itemElement);
-        },
-        onEngineChange: (nextEngine) => {
-            setEngine(nextEngine);
-            onEngineChangeRef.current?.(nextEngine);
-        },
+        onChange: handleChange,
+        onEngineChange: handleEngineChange,
     };
 
     const syncTargetElement = useCallback(() => {
@@ -78,7 +89,9 @@ export function useGlassSwitch(
         } else {
             const patch = computeMergedOptionPatch(prevMergedOptionsRef.current, mergedOptions);
             prevMergedOptionsRef.current = mergedOptions;
-            instanceRef.current.update(patch);
+            if (Object.keys(patch).length > 0) {
+                instanceRef.current.update(patch);
+            }
             setEngine(instanceRef.current.engine);
             setValueState(instanceRef.current.value);
             setActiveIndexState(instanceRef.current.activeIndex);
@@ -130,6 +143,7 @@ export function useGlassSwitch(
         options.highlight,
         tiltKey,
         options.pixelRatio,
+        options.sharpness,
         options.saturation,
         options.chromaticAberration,
         options.abbeNumber,

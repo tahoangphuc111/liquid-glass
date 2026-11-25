@@ -228,4 +228,71 @@ export function resetObserverForTesting(): void {
     onDprResize = null;
     isDocumentIdle = false;
     lastActivityTick = 0;
+    sharedResizeObserver?.disconnect();
+    sharedResizeObserver = null;
+    sharedResizeObserverCtor = null;
+    for (const element of observedResizeElements) {
+        resizeHandlers.delete(element);
+    }
+    observedResizeElements.clear();
+}
+
+const resizeHandlers = new WeakMap<Element, Set<() => void>>();
+const observedResizeElements = new Set<Element>();
+let sharedResizeObserver: ResizeObserver | null = null;
+let sharedResizeObserverCtor: typeof ResizeObserver | null = null;
+
+export function observeSharedElementResize(
+    targetElement: Element,
+    onResize: () => void,
+): () => void {
+    if (typeof ResizeObserver !== "function") {
+        return () => {};
+    }
+    if (!sharedResizeObserver || sharedResizeObserverCtor !== ResizeObserver) {
+        sharedResizeObserver?.disconnect();
+        sharedResizeObserverCtor = ResizeObserver;
+        sharedResizeObserver = new ResizeObserver((entries) => {
+            for (let index = 0; index < entries.length; index++) {
+                const callbacks = resizeHandlers.get(entries[index]!.target);
+                if (!callbacks || callbacks.size === 0) continue;
+                if (callbacks.size === 1) {
+                    for (const cb of callbacks) cb();
+                } else {
+                    for (const cb of Array.from(callbacks)) cb();
+                }
+            }
+        });
+        for (const existingElement of observedResizeElements) {
+            sharedResizeObserver.observe(existingElement, { box: "border-box" });
+        }
+    }
+    let callbacks = resizeHandlers.get(targetElement);
+    if (!callbacks) {
+        callbacks = new Set();
+        resizeHandlers.set(targetElement, callbacks);
+        observedResizeElements.add(targetElement);
+        sharedResizeObserver.observe(targetElement, { box: "border-box" });
+    }
+    callbacks.add(onResize);
+
+    let active = true;
+    return () => {
+        if (!active) return;
+        active = false;
+        const set = resizeHandlers.get(targetElement);
+        if (set) {
+            set.delete(onResize);
+            if (set.size === 0) {
+                resizeHandlers.delete(targetElement);
+                observedResizeElements.delete(targetElement);
+                sharedResizeObserver?.unobserve(targetElement);
+                if (observedResizeElements.size === 0) {
+                    sharedResizeObserver?.disconnect();
+                    sharedResizeObserver = null;
+                    sharedResizeObserverCtor = null;
+                }
+            }
+        }
+    };
 }

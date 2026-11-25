@@ -2,6 +2,16 @@
 
 All notable changes to `@tahoangphuc111/liquid-glass` are documented in this file.
 
+## [0.5.0] - 2026-11-25
+
+### Added
+- `sharpness` option (`0` to `1`, auto-enabled when `blur <= 0`) for up to `4x` WebGL supersampling, `4096px` scene capture, and HiDPI WASM displacement maps.
+- Optical & physics helpers exported from `src/index.ts` (Sellmeier dispersion, Beer-Lambert transmittance, thin-film interference, Young-Laplace / Derjaguin coalescence, and Rayleigh dissipation).
+
+### Changed
+- Refined glass edge highlights, dark hairline border, 3D bevel depth, and elevation shadows across CSS, WASM-SVG, WebGL, and switches.
+- Optimized chromatic aberration in WebGL and WASM-SVG to reduce GPU texture fetches, SVG filter DOM/Skia rebuilds, and thermal throttling.
+
 ## [0.4.0] - 2026-11-22
 
 ### Added

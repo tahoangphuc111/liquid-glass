@@ -213,7 +213,9 @@ export function glassEffect(
         }
     } else {
         for (const el of new Set(target as Iterable<HTMLElement>)) {
-            instances.push(applyGlassToElement(el, options));
+            if (typeof HTMLElement === "undefined" || el instanceof HTMLElement) {
+                instances.push(applyGlassToElement(el, options));
+            }
         }
     }
 

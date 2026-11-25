@@ -4,11 +4,14 @@ import {
     formatGlassCoreFilter,
     parseCssCornerRadiusPx,
     resolveGlassConfig,
+    resolveGlassSharpness,
     resolveGlassTheme,
     resolvePresetOptions,
+    resolveSharpnessPixelRatio,
 } from "./config.js";
 import {
     EMPTY_COALESCENCE_SNAPSHOT,
+    clearCoalescenceGeometry,
     collectCoalescenceSnapshot,
     registerCoalescenceParticipant,
     syncCoalescenceGeometry,
@@ -23,10 +26,11 @@ import {
 import {
     canUseSvgGlass,
     getMediaQueries,
+    observeSharedElementResize,
     resolveGlassEngine,
     subscribeBatteryChanges,
 } from "./observer.js";
-import { acquireSharedSceneCapture } from "./sceneCapture.js";
+import { acquireSharedSceneCapture, subscribeSceneCanvas } from "./sceneCapture.js";
 import { createInteractiveSpring, predictMomentumOffset, type SpringController } from "./spring.js";
 import type {
     GlassConfig,
@@ -46,10 +50,13 @@ import {
 } from "./webglPool.js";
 import { GlassWebglRenderer, parseCssColorToRgb, type GlassFrameParams } from "./webglRenderer.js";
 
-const visibilityHandlers = new WeakMap<Element, (isVisible: boolean) => void>();
+const DEFAULT_DARK_TINT_RGB: [number, number, number] = [28 / 255, 28 / 255, 30 / 255];
+const DEFAULT_DARK_GLIDER_TINT_RGB: [number, number, number] = [142 / 255, 142 / 255, 147 / 255];
+
+const visibilityHandlers = new WeakMap<Element, Set<(isVisible: boolean) => void>>();
+const observedVisibilityElements = new Set<Element>();
 let sharedVisibilityObserver: IntersectionObserver | null = null;
 let sharedVisibilityObserverCtor: typeof IntersectionObserver | null = null;
-let sharedVisibilityCount = 0;
 
 function observeElementVisibility(
     targetElement: Element,
@@ -64,31 +71,48 @@ function observeElementVisibility(
         sharedVisibilityObserver = new IntersectionObserver(
             (entries) => {
                 for (let index = 0; index < entries.length; index++) {
-                    const entry = entries[index];
-                    const handler = visibilityHandlers.get(entry.target);
-                    if (handler) {
-                        handler(entry.isIntersecting);
+                    const entry = entries[index]!;
+                    const handlers = visibilityHandlers.get(entry.target);
+                    if (!handlers || handlers.size === 0) continue;
+                    if (handlers.size === 1) {
+                        for (const handler of handlers) handler(entry.isIntersecting);
+                    } else {
+                        for (const handler of Array.from(handlers)) handler(entry.isIntersecting);
                     }
                 }
             },
             { rootMargin: "120px" },
         );
+        for (const existingElement of observedVisibilityElements) {
+            sharedVisibilityObserver.observe(existingElement);
+        }
     }
-    visibilityHandlers.set(targetElement, onVisibilityChange);
-    sharedVisibilityObserver.observe(targetElement);
-    sharedVisibilityCount += 1;
+    let handlers = visibilityHandlers.get(targetElement);
+    if (!handlers) {
+        handlers = new Set();
+        visibilityHandlers.set(targetElement, handlers);
+        observedVisibilityElements.add(targetElement);
+        sharedVisibilityObserver.observe(targetElement);
+    }
+    handlers.add(onVisibilityChange);
 
     let active = true;
     return () => {
         if (!active) return;
         active = false;
-        visibilityHandlers.delete(targetElement);
-        sharedVisibilityObserver?.unobserve(targetElement);
-        sharedVisibilityCount = Math.max(0, sharedVisibilityCount - 1);
-        if (sharedVisibilityCount === 0) {
-            sharedVisibilityObserver?.disconnect();
-            sharedVisibilityObserver = null;
-            sharedVisibilityObserverCtor = null;
+        const set = visibilityHandlers.get(targetElement);
+        if (set) {
+            set.delete(onVisibilityChange);
+            if (set.size === 0) {
+                visibilityHandlers.delete(targetElement);
+                observedVisibilityElements.delete(targetElement);
+                sharedVisibilityObserver?.unobserve(targetElement);
+                if (observedVisibilityElements.size === 0) {
+                    sharedVisibilityObserver?.disconnect();
+                    sharedVisibilityObserver = null;
+                    sharedVisibilityObserverCtor = null;
+                }
+            }
         }
     };
 }
@@ -238,62 +262,6 @@ function formatTintCssValue(
     return null;
 }
 
-const resizeHandlers = new WeakMap<Element, Set<() => void>>();
-let sharedResizeObserver: ResizeObserver | null = null;
-let sharedResizeObserverCtor: typeof ResizeObserver | null = null;
-let sharedResizeCount = 0;
-
-export function observeSharedElementResize(
-    targetElement: Element,
-    onResize: () => void,
-): () => void {
-    if (typeof ResizeObserver !== "function") {
-        return () => {};
-    }
-    if (!sharedResizeObserver || sharedResizeObserverCtor !== ResizeObserver) {
-        sharedResizeObserver?.disconnect();
-        sharedResizeObserverCtor = ResizeObserver;
-        sharedResizeObserver = new ResizeObserver((entries) => {
-            for (let index = 0; index < entries.length; index++) {
-                const callbacks = resizeHandlers.get(entries[index]!.target);
-                if (callbacks) {
-                    for (const cb of callbacks) {
-                        cb();
-                    }
-                }
-            }
-        });
-    }
-    let callbacks = resizeHandlers.get(targetElement);
-    if (!callbacks) {
-        callbacks = new Set();
-        resizeHandlers.set(targetElement, callbacks);
-        sharedResizeObserver.observe(targetElement);
-        sharedResizeCount += 1;
-    }
-    callbacks.add(onResize);
-
-    let active = true;
-    return () => {
-        if (!active) return;
-        active = false;
-        const set = resizeHandlers.get(targetElement);
-        if (set) {
-            set.delete(onResize);
-            if (set.size === 0) {
-                resizeHandlers.delete(targetElement);
-                sharedResizeObserver?.unobserve(targetElement);
-                sharedResizeCount = Math.max(0, sharedResizeCount - 1);
-                if (sharedResizeCount === 0) {
-                    sharedResizeObserver?.disconnect();
-                    sharedResizeObserver = null;
-                    sharedResizeObserverCtor = null;
-                }
-            }
-        }
-    };
-}
-
 interface ViewportSubscriber {
     prepareViewportFrame(viewportChanged: boolean): void;
     commitViewportFrame(): void;
@@ -420,7 +388,7 @@ function sameWebglFrame(frame: GlassFrameParams, previous: GlassFrameParams): bo
         frame.refractionEdgeFade !== previous.refractionEdgeFade ||
         frame.maxRefractionPx !== previous.maxRefractionPx ||
         frame.maxScaleMultiplier !== previous.maxScaleMultiplier ||
-        frame.blur !== previous.blur || frame.saturation !== previous.saturation || frame.surface !== previous.surface ||
+        frame.blur !== previous.blur || frame.sharpness !== previous.sharpness || frame.saturation !== previous.saturation || frame.surface !== previous.surface ||
         frame.tintColor !== previous.tintColor || frame.tintOpacity !== previous.tintOpacity ||
         frame.highlight !== previous.highlight || frame.darkRimScale !== previous.darkRimScale ||
         frame.pixelRatio !== previous.pixelRatio || frame.chromaticAberration !== previous.chromaticAberration ||
@@ -468,13 +436,22 @@ export function createLiquidGlassController(
     let cachedRadiusStr: string | null = null;
     let webglCanvas: HTMLCanvasElement | null = null;
     let webglRenderer: GlassWebglRenderer | null = null;
+    let webglContextLost = false;
     let unobserveResize: (() => void) | null = null;
     let unregisterViewport: (() => void) | null = null;
     let localSceneCapture: SceneCaptureController | null = null;
     let unsubscribeCapture: (() => void) | null = null;
     let externalSceneCanvas: HTMLCanvasElement | null = options.sceneCanvas ?? null;
+    let observedSceneCanvas: HTMLCanvasElement | null = null;
+    let unsubscribeSceneCanvas: (() => void) | null = null;
+    let observedSceneSource: HTMLElement | null = null;
+    let unobserveSceneSource: (() => void) | null = null;
     let capturedSceneCanvas: HTMLCanvasElement | null = null;
     let sceneUploadPending = false;
+    let lastSceneWidth = 0;
+    let lastSceneHeight = 0;
+    let lastSceneSharpness = 0;
+    let lastCaptureQualityKey = "";
     let sceneEl: HTMLElement | null = options.sceneElement ?? null;
     let notifyPeersOnRender = false;
     let lastSceneBackdropKey = "";
@@ -523,6 +500,7 @@ export function createLiquidGlassController(
     let pendingAmbientLightSync = false;
     let unsubWasmReady: (() => void) | null = null;
     let dragMotionSpeed = 0;
+    let useDragResolution = false;
     let lastSpringDragX = 0;
     let lastSpringDragY = 0;
     let isPointerDragging = false;
@@ -543,7 +521,9 @@ export function createLiquidGlassController(
     let activeDragMode: "elastic" | "free" | null = null;
     let lastConfiguredDragMode: "elastic" | "free" | null = null;
     let unregisterCoalescence: (() => void) | null = null;
+    let unobserveCoalescenceResize: (() => void) | null = null;
 
+    const hadSurfaceClass = element.classList.contains("lg-surface");
     element.setAttribute("data-lg-surface", "");
     element.classList.add("lg-surface");
     registerControllerOwnedElement(element);
@@ -555,53 +535,106 @@ export function createLiquidGlassController(
         const changed = !hasInitializedEngine || activeEngine !== engine;
         hasInitializedEngine = true;
         activeEngine = engine;
-        element.setAttribute("data-lg-engine", engine);
-        if (changed) {
-            options.onEngineChange?.(engine);
-        }
+        if (element.getAttribute("data-lg-engine") !== engine) element.setAttribute("data-lg-engine", engine);
+        return changed;
     };
 
     let resolvedTheme: "light" | "dark" = resolveGlassTheme(effectiveOptions.theme, element);
+    let lastThemeAttr = "";
+    let lastThemeSig = "";
+    let lastRefractionAxisAttr = "";
+    let lastRefractionFadeCss: string | null = null;
+    let lastPillAttr: boolean | null = null;
+    let lastRadiusCss: string | null | undefined = undefined;
+    let lastCornerStyleAttr = "";
+    let lastRimOpacityCss: string | null | undefined = undefined;
+    let lastSvgBgCss: string | null | undefined = undefined;
+    let lastSvgGeometrySig = "";
 
-    const syncThemeAttribute = () => {
+    const syncThemeAttribute = (force = false) => {
+        const docEl = typeof document !== "undefined" ? document.documentElement : null;
+        const bodyEl = typeof document !== "undefined" ? document.body : null;
+        const nextThemeSig = `${effectiveOptions.theme ?? "auto"}|${docEl?.className ?? ""}|${docEl?.getAttribute("data-theme") ?? ""}|${docEl?.getAttribute("data-color-scheme") ?? ""}|${docEl?.getAttribute("style") ?? ""}|${bodyEl?.className ?? ""}|${bodyEl?.getAttribute("data-theme") ?? ""}`;
+        if (!force && lastThemeAttr && nextThemeSig === lastThemeSig) {
+            return;
+        }
+        lastThemeSig = nextThemeSig;
         resolvedTheme = resolveGlassTheme(effectiveOptions.theme, element);
-        element.setAttribute("data-lg-theme", resolvedTheme);
+        if (lastThemeAttr !== resolvedTheme) {
+            lastThemeAttr = resolvedTheme;
+            element.setAttribute("data-lg-theme", resolvedTheme);
+        }
     };
 
     const syncPillAttribute = () => {
         syncThemeAttribute();
         const direction = config.refractionDirection ?? "all";
-        element.setAttribute("data-lg-refraction-axis", direction);
-        if (direction === "all") {
-            element.style.removeProperty("--lg-refraction-fade");
-        } else {
-            element.style.setProperty("--lg-refraction-fade", `${(config.refractionEdgeFade ?? 0.35) * 50}%`);
+        if (lastRefractionAxisAttr !== direction) {
+            lastRefractionAxisAttr = direction;
+            element.setAttribute("data-lg-refraction-axis", direction);
         }
-        if (config.pill) {
-            element.setAttribute("data-lg-pill", "true");
-            element.style.removeProperty("--lg-radius");
-        } else {
-            element.removeAttribute("data-lg-pill");
-            if (effectiveOptions.radius !== undefined) {
-                element.style.setProperty("--lg-radius", `${Math.max(0, config.radius)}px`);
+        const nextRefractionFade =
+            direction === "all" ? null : `${(config.refractionEdgeFade ?? 0.35) * 50}%`;
+        if (lastRefractionFadeCss !== nextRefractionFade) {
+            lastRefractionFadeCss = nextRefractionFade;
+            if (nextRefractionFade === null) {
+                element.style.removeProperty("--lg-refraction-fade");
             } else {
-                element.style.removeProperty("--lg-radius");
+                element.style.setProperty("--lg-refraction-fade", nextRefractionFade);
             }
         }
-        if (config.cornerStyle === "squircle") {
-            element.setAttribute("data-lg-corner-style", "squircle");
-        } else {
-            element.removeAttribute("data-lg-corner-style");
+        let radiusShapeChanged = false;
+        if (lastPillAttr !== config.pill) {
+            lastPillAttr = config.pill;
+            radiusShapeChanged = true;
+            if (config.pill) {
+                element.setAttribute("data-lg-pill", "true");
+            } else {
+                element.removeAttribute("data-lg-pill");
+            }
         }
-        if (effectiveOptions.highlight !== undefined) {
-            element.style.setProperty("--lg-rim-opacity", String(Math.min(1, Math.max(0, effectiveOptions.highlight))));
-        } else {
-            element.style.removeProperty("--lg-rim-opacity");
+        const nextRadiusCss = config.pill
+            ? null
+            : effectiveOptions.radius !== undefined
+              ? `${Math.max(0, config.radius)}px`
+              : null;
+        if (lastRadiusCss !== nextRadiusCss) {
+            lastRadiusCss = nextRadiusCss;
+            radiusShapeChanged = true;
+            if (nextRadiusCss === null) {
+                element.style.removeProperty("--lg-radius");
+            } else {
+                element.style.setProperty("--lg-radius", nextRadiusCss);
+            }
         }
-        cachedRadiusStr = null;
-        const existingState = elementStateMap.get(element);
-        if (existingState) {
-            existingState.cachedRadiusStr = null;
+        const nextCornerStyle = config.cornerStyle === "squircle" ? "squircle" : "";
+        if (lastCornerStyleAttr !== nextCornerStyle) {
+            lastCornerStyleAttr = nextCornerStyle;
+            radiusShapeChanged = true;
+            if (nextCornerStyle) {
+                element.setAttribute("data-lg-corner-style", nextCornerStyle);
+            } else {
+                element.removeAttribute("data-lg-corner-style");
+            }
+        }
+        const nextRimOpacity =
+            effectiveOptions.highlight !== undefined
+                ? String(Math.min(1, Math.max(0, effectiveOptions.highlight)))
+                : null;
+        if (lastRimOpacityCss !== nextRimOpacity) {
+            lastRimOpacityCss = nextRimOpacity;
+            if (nextRimOpacity === null) {
+                element.style.removeProperty("--lg-rim-opacity");
+            } else {
+                element.style.setProperty("--lg-rim-opacity", nextRimOpacity);
+            }
+        }
+        if (radiusShapeChanged) {
+            cachedRadiusStr = null;
+            const existingState = elementStateMap.get(element);
+            if (existingState) {
+                existingState.cachedRadiusStr = null;
+            }
         }
     };
 
@@ -630,12 +663,12 @@ export function createLiquidGlassController(
         {
             width: 0, height: 0, radius: 0, bezel: 0, thickness: 0, scaleRatio: 0,
             ior: 1.5, blur: 0, surface: config.surface, tintColor: cachedTintColorRgb,
-            tintOpacity: 0.12, highlight: 0.44,
+            tintOpacity: 0.07, highlight: 0.62,
         },
         {
             width: 0, height: 0, radius: 0, bezel: 0, thickness: 0, scaleRatio: 0,
             ior: 1.5, blur: 0, surface: config.surface, tintColor: cachedTintColorRgb,
-            tintOpacity: 0.12, highlight: 0.44,
+            tintOpacity: 0.07, highlight: 0.62,
         },
     ];
     let nextFrameSlot = 0;
@@ -645,25 +678,20 @@ export function createLiquidGlassController(
         targetSlot: { relX: number; relY: number; relW: number; relH: number },
     ) => {
         const source = sceneEl ?? options.sceneElement;
-        if (!source?.isConnected) {
+        if (!source) {
             targetSlot.relX = 0;
             targetSlot.relY = 0;
             targetSlot.relW = 1;
             targetSlot.relH = 1;
             return targetSlot;
         }
+        if (!source.isConnected) return undefined;
         let sourceRect = viewportSourceRects.get(source);
         if (!sourceRect) {
             sourceRect = source.getBoundingClientRect();
             viewportSourceRects.set(source, sourceRect);
         }
-        if (sourceRect.width < 2 || sourceRect.height < 2) {
-            targetSlot.relX = 0;
-            targetSlot.relY = 0;
-            targetSlot.relW = 1;
-            targetSlot.relH = 1;
-            return targetSlot;
-        }
+        if (sourceRect.width < 2 || sourceRect.height < 2) return undefined;
         targetSlot.relX = (bounds.left - sourceRect.left) / sourceRect.width;
         targetSlot.relY = (bounds.top - sourceRect.top) / sourceRect.height;
         targetSlot.relW = bounds.width / sourceRect.width;
@@ -701,7 +729,10 @@ export function createLiquidGlassController(
     const syncCoalescenceState = (motionImpulse = 0, notifyPeers = true) => {
         if (effectiveOptions.coalesce === false) return;
         const bounds = readCoalescenceBounds();
-        if (!bounds) return;
+        if (!bounds) {
+            clearCoalescenceGeometry(element);
+            return;
+        }
         syncCoalescenceGeometry(
             element,
             bounds.left,
@@ -824,30 +855,58 @@ export function createLiquidGlassController(
             bezel: number;
         };
         activeSceneCanvas: HTMLCanvasElement | null;
-        hasSceneTex: boolean;
         sceneRect: { relX: number; relY: number; relW: number; relH: number } | undefined;
     }
     const preparedSnapshotSlot: PreparedWebglSnapshot = {
         bounds: { left: 0, top: 0, width: 0, height: 0, radius: 0, bezel: 0 },
         activeSceneCanvas: null,
-        hasSceneTex: false,
         sceneRect: undefined,
     };
     let hasPreparedViewportSnapshot = false;
 
-    const drawWebglFrame = ({ bounds, activeSceneCanvas, hasSceneTex, sceneRect }: PreparedWebglSnapshot) => {
-        if (destroyed || activeEngine !== "webgl" || !webglRenderer) return;
+    const syncWebglBackdrop = (hasScene: boolean) => {
+        const nextState = hasScene ? "1" : "0";
+        if (lastWebglSceneState !== nextState) {
+            lastWebglSceneState = nextState;
+            element.setAttribute("data-lg-webgl-scene", nextState);
+        }
+        const nextFilter = hasScene ? "" : webglCoreFilter;
+        if (lastWebglCoreFilter !== nextFilter) {
+            lastWebglCoreFilter = nextFilter;
+            if (nextFilter) element.style.setProperty("--lg-filter", nextFilter);
+            else element.style.removeProperty("--lg-filter");
+        }
+    };
+
+    const drawWebglFrame = ({ bounds, activeSceneCanvas, sceneRect }: PreparedWebglSnapshot) => {
+        if (destroyed || activeEngine !== "webgl" || !webglRenderer || webglContextLost) return;
         if (!isViewportVisible || (typeof document !== "undefined" && document.hidden)) {
             pendingVisibleRender = true;
             return;
         }
 
         const { width, height, radius, bezel } = bounds;
-        if (sceneUploadPending) {
+        const usableScene = sceneRect ? activeSceneCanvas : null;
+        const sceneWidth = usableScene?.width ?? 0;
+        const sceneHeight = usableScene?.height ?? 0;
+        const effectiveSharpness = resolveGlassSharpness(config.sharpness, config.blur);
+        if (
+            (usableScene && (sceneUploadPending || effectiveSharpness !== lastSceneSharpness)) ||
+            sceneWidth !== lastSceneWidth ||
+            sceneHeight !== lastSceneHeight
+        ) {
             lastRenderedFrame = null;
-            webglRenderer.setSceneCanvas(activeSceneCanvas);
-            sceneUploadPending = false;
+            if (effectiveSharpness > 0) {
+                webglRenderer.setSceneCanvas(usableScene, effectiveSharpness);
+            } else {
+                webglRenderer.setSceneCanvas(usableScene);
+            }
+            lastSceneWidth = webglRenderer.hasSceneTexture ? sceneWidth : 0;
+            lastSceneHeight = webglRenderer.hasSceneTexture ? sceneHeight : 0;
+            lastSceneSharpness = webglRenderer.hasSceneTexture ? effectiveSharpness : 0;
         }
+        sceneUploadPending = false;
+        const hasSceneTex = webglRenderer.hasSceneTexture && sceneRect !== undefined;
         const coalescenceSnapshot = applyCoalescenceVisuals();
 
         if (effectiveOptions.tintColor !== cachedTintColorRaw) {
@@ -855,37 +914,27 @@ export function createLiquidGlassController(
             cachedTintColorRgb = parseCssColorToRgb(effectiveOptions.tintColor);
         }
         const isDarkTheme = resolvedTheme === "dark";
+        const isSwitchGlider = element.classList.contains("lg-switch-glider");
         const tintColor: [number, number, number] =
-            effectiveOptions.tintColor !== undefined
-                ? cachedTintColorRgb
-                : isDarkTheme
-                    ? [0.06, 0.07, 0.09]
-                    : cachedTintColorRgb;
-        const tintOpacity = effectiveOptions.tintOpacity ?? (isDarkTheme ? 0.24 : 0.12);
-        const baseHighlight = effectiveOptions.highlight ?? 0.44;
-        const highlight = Math.min(1, (isDarkTheme ? baseHighlight * 0.58 : baseHighlight) + pressGlow);
+            effectiveOptions.tintColor === undefined && isDarkTheme
+                ? (isSwitchGlider ? DEFAULT_DARK_GLIDER_TINT_RGB : DEFAULT_DARK_TINT_RGB)
+                : cachedTintColorRgb;
+        const tintOpacity = effectiveOptions.tintOpacity ?? (isDarkTheme ? 0.36 : 0.07);
+        const baseHighlight = effectiveOptions.highlight ?? 0.62;
+        const highlight = Math.min(1, (isDarkTheme ? baseHighlight * 0.80 : baseHighlight) + pressGlow);
+        const rawDeviceDpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+        const sharpnessPixelRatio =
+            effectiveSharpness > 0 ? resolveSharpnessPixelRatio(effectiveSharpness, rawDeviceDpr) : undefined;
         const baseDpr =
             effectiveOptions.pixelRatio ??
-            (typeof window !== "undefined" ? Math.min(2, window.devicePixelRatio || 1) : 1);
+            sharpnessPixelRatio ??
+            Math.min(2, rawDeviceDpr);
         const effectivePixelRatio =
-            dragMotionSpeed > 0.3 && (radius > 0 || effectiveOptions.pixelRatio !== undefined)
+            useDragResolution && (radius > 0 || effectiveOptions.pixelRatio !== undefined || sharpnessPixelRatio !== undefined)
                 ? Math.min(baseDpr, Math.max(0.75, baseDpr * 0.7))
-                : effectiveOptions.pixelRatio;
+                : (effectiveOptions.pixelRatio ?? sharpnessPixelRatio);
 
-        const nextSceneState = hasSceneTex ? "1" : "0";
-        if (nextSceneState !== lastWebglSceneState) {
-            lastWebglSceneState = nextSceneState;
-            element.setAttribute("data-lg-webgl-scene", nextSceneState);
-        }
-        const nextCoreFilter = hasSceneTex ? "" : webglCoreFilter;
-        if (nextCoreFilter !== lastWebglCoreFilter) {
-            lastWebglCoreFilter = nextCoreFilter;
-            if (nextCoreFilter) {
-                element.style.setProperty("--lg-filter", nextCoreFilter);
-            } else {
-                element.style.removeProperty("--lg-filter");
-            }
-        }
+        syncWebglBackdrop(hasSceneTex);
 
         const frame = frameSlots[nextFrameSlot]!;
         frame.width = width;
@@ -902,12 +951,13 @@ export function createLiquidGlassController(
         frame.maxScaleMultiplier = config.maxScaleMultiplier;
         frame.ior = config.ior;
         frame.blur = config.blur;
-        frame.saturation = config.saturation;
+        frame.sharpness = config.sharpness;
+        frame.saturation = config.saturation ?? (isDarkTheme && config.blur >= 1 ? 1.32 : undefined);
         frame.surface = config.surface;
         frame.tintColor = tintColor;
         frame.tintOpacity = tintOpacity;
         frame.highlight = highlight;
-        frame.darkRimScale = element.classList.contains("lg-switch-glider") ? 0 : 1;
+        frame.darkRimScale = isSwitchGlider ? 0 : (isDarkTheme ? 0.60 : 1);
         frame.pixelRatio = effectivePixelRatio;
         frame.chromaticAberration = config.chromaticAberration;
         frame.abbeNumber = config.abbeNumber;
@@ -919,7 +969,7 @@ export function createLiquidGlassController(
         } else {
             frame.lightTilt = undefined;
         }
-        frame.sceneRect = sceneRect;
+        frame.sceneRect = hasSceneTex ? sceneRect : undefined;
         frame.coalescePeers = coalescenceSnapshot.peers;
         frame.bleedPx = coalescenceSnapshot.requiredBleedPx;
 
@@ -938,7 +988,7 @@ export function createLiquidGlassController(
     };
 
     const scheduleWebglRender = () => {
-        if (destroyed || activeEngine !== "webgl") return;
+        if (destroyed || activeEngine !== "webgl" || webglContextLost) return;
         if (!isViewportVisible || (typeof document !== "undefined" && document.hidden)) {
             pendingVisibleRender = true;
             return;
@@ -951,6 +1001,22 @@ export function createLiquidGlassController(
         scheduleViewportFrame();
     };
 
+    const observeExternalScene = (canvas: HTMLCanvasElement | null, source: HTMLElement | null) => {
+        if (canvas !== observedSceneCanvas) {
+            unsubscribeSceneCanvas?.();
+            observedSceneCanvas = canvas;
+            unsubscribeSceneCanvas = canvas && subscribeSceneCanvas(canvas, () => {
+                sceneUploadPending = true;
+                scheduleWebglRender();
+            });
+        }
+        if (source !== observedSceneSource) {
+            unobserveSceneSource?.();
+            observedSceneSource = source;
+            unobserveSceneSource = source && observeSharedElementResize(source, scheduleWebglRender);
+        }
+    };
+
     const handleVisibilityChange = (nextVisible: boolean) => {
         if (destroyed || isViewportVisible === nextVisible) return;
         isViewportVisible = nextVisible;
@@ -958,6 +1024,7 @@ export function createLiquidGlassController(
         if (activeEngine !== "webgl") return;
         const effectiveActive = nextVisible && !(typeof document !== "undefined" && document.hidden);
         localSceneCapture?.setActive?.(effectiveActive);
+        if (!nextVisible) clearCoalescenceGeometry(element);
         if (!effectiveActive) {
             if (queuedViewportSubscribers.delete(viewportSubscriber)) pendingVisibleRender = true;
             return;
@@ -967,10 +1034,9 @@ export function createLiquidGlassController(
             syncEffectiveLightTilt();
             pendingVisibleRender = true;
         }
-        if (pendingVisibleRender) {
-            pendingVisibleRender = false;
-            scheduleWebglRender();
-        }
+        pendingVisibleRender = false;
+        notifyPeersOnRender = true;
+        scheduleWebglRender();
     };
 
     const onDocumentVisibilityChange = () => {
@@ -1002,13 +1068,17 @@ export function createLiquidGlassController(
             destroyed ||
             activeEngine !== "webgl" ||
             !webglRenderer ||
+            webglContextLost ||
             !isViewportVisible ||
             (typeof document !== "undefined" && document.hidden)
         ) {
             return;
         }
         const bounds = readCoalescenceBounds();
-        if (!bounds) return;
+        if (!bounds) {
+            clearCoalescenceGeometry(element);
+            return;
+        }
         const { left, top, width, height, radius, bezel } = bounds;
         const notifyPeers = notifyPeersOnRender;
         notifyPeersOnRender = false;
@@ -1026,7 +1096,6 @@ export function createLiquidGlassController(
         preparedSnapshotSlot.bounds.radius = radius;
         preparedSnapshotSlot.bounds.bezel = bezel;
         preparedSnapshotSlot.activeSceneCanvas = activeSceneCanvas;
-        preparedSnapshotSlot.hasSceneTex = hasSceneTex;
         preparedSnapshotSlot.sceneRect = sceneRect;
         hasPreparedViewportSnapshot = true;
     };
@@ -1052,18 +1121,28 @@ export function createLiquidGlassController(
     };
 
     const onWebglContextLost = (event: Event) => {
+        if (event.target !== webglCanvas) return;
         event.preventDefault();
-        lastRenderedFrame = null;
-    };
-
-    const onWebglContextRestored = () => {
-        if (destroyed || activeEngine !== "webgl") return;
+        webglContextLost = true;
         webglRenderer?.dispose();
         webglRenderer = null;
+        lastRenderedFrame = null;
+        lastSceneWidth = 0;
+        lastSceneHeight = 0;
+        lastSceneSharpness = 0;
+        lastCaptureQualityKey = "";
+        syncWebglBackdrop(false);
+    };
+
+    const onWebglContextRestored = (event: Event) => {
+        if (destroyed || activeEngine !== "webgl" || event.target !== webglCanvas || !webglContextLost) return;
+        webglContextLost = false;
         mountWebgl();
     };
 
     const teardownWebgl = (preserveVisibilityObserver = false) => {
+        webglContextLost = false;
+        observeExternalScene(null, null);
         notifyPeersOnRender = false;
         hasPreparedViewportSnapshot = false;
         preparedSnapshotSlot.activeSceneCanvas = null;
@@ -1085,6 +1164,10 @@ export function createLiquidGlassController(
         localSceneCapture = null;
         capturedSceneCanvas = null;
         lastRenderedFrame = null;
+        lastSceneWidth = 0;
+        lastSceneHeight = 0;
+        lastSceneSharpness = 0;
+        lastCaptureQualityKey = "";
         webglRenderer?.dispose(true);
         webglRenderer = null;
         if (webglCanvas) {
@@ -1118,9 +1201,10 @@ export function createLiquidGlassController(
         } else {
             element.style.removeProperty("--lg-tint");
         }
-        setEngine("css");
+        const changed = setEngine("css");
         syncCoalescenceState(0, true);
         applyCoalescenceVisuals();
+        if (changed) options.onEngineChange?.("css");
     };
 
     const webglPoolEntry: WebglPoolEntry = {
@@ -1149,6 +1233,10 @@ export function createLiquidGlassController(
             mountCss(true);
             return;
         }
+        if (webglContextLost) {
+            syncWebglBackdrop(false);
+            return;
+        }
 
         if (!webglCanvas) {
             webglCanvas = document.createElement("canvas");
@@ -1169,33 +1257,35 @@ export function createLiquidGlassController(
             sceneUploadPending = true;
         }
 
+        observeExternalScene(externalSceneCanvas, externalSceneCanvas ? sceneEl : null);
         if (!externalSceneCanvas && sceneEl) {
             const targetSource = sceneEl;
+            const resolveCaptureQuality = () => {
+                const sharpness = resolveGlassSharpness(config.sharpness, config.blur);
+                const pixelRatio = effectiveOptions.pixelRatio;
+                const resolvedRadius = config.pill
+                    ? 1
+                    : (() => {
+                          cachedRadiusStr ??= window.getComputedStyle(element).borderTopLeftRadius.trim();
+                          return parseCssCornerRadiusPx(cachedRadiusStr, 2, 2) ?? config.radius;
+                      })();
+                return {
+                    ...(pixelRatio !== undefined && Number.isFinite(pixelRatio) && pixelRatio > 0 ? { pixelRatio } : {}),
+                    radius: resolvedRadius,
+                    ...(sharpness > 0 ? { sharpness } : {}),
+                };
+            };
+            const nextQuality = resolveCaptureQuality();
+            const nextQualityKey = `${nextQuality.pixelRatio ?? ""}|${nextQuality.radius}|${nextQuality.sharpness ?? 0}`;
             if (!localSceneCapture || localSceneCapture.source !== targetSource) {
                 unsubscribeCapture?.();
                 localSceneCapture?.destroy();
                 capturedSceneCanvas = null;
                 sceneUploadPending = true;
-                localSceneCapture = acquireSharedSceneCapture(
-                    targetSource,
-                    () => {
-                        const width =
-                            element.offsetWidth || Math.round(element.getBoundingClientRect().width);
-                        const height =
-                            element.offsetHeight || Math.round(element.getBoundingClientRect().height);
-                        let radius: number;
-                        if (width >= 2 && height >= 2) {
-                            const res = computeCornerRadiusPx(element, width, height, config, cachedRadiusStr);
-                            cachedRadiusStr = res.rawRadiusStr;
-                            radius = res.radius;
-                        } else {
-                            radius = config.pill ? 9999 : config.radius;
-                        }
-                        return {
-                            pixelRatio: effectiveOptions.pixelRatio,
-                            radius,
-                        };
-                    },
+                lastCaptureQualityKey = nextQualityKey;
+                localSceneCapture = acquireSharedSceneCapture(targetSource, resolveCaptureQuality);
+                localSceneCapture.setActive?.(
+                    isViewportVisible && !(typeof document !== "undefined" && document.hidden),
                 );
                 unsubscribeCapture = localSceneCapture.subscribe((canvas, source) => {
                     capturedSceneCanvas = canvas;
@@ -1204,7 +1294,9 @@ export function createLiquidGlassController(
                     sceneUploadPending = true;
                     scheduleWebglRender();
                 });
-                localSceneCapture.setActive?.(isViewportVisible);
+            } else if (nextQualityKey !== lastCaptureQualityKey) {
+                lastCaptureQualityKey = nextQualityKey;
+                localSceneCapture.scheduleCapture();
             }
         } else {
             unsubscribeCapture?.();
@@ -1228,25 +1320,39 @@ export function createLiquidGlassController(
         element.style.removeProperty("--lg-tint");
         element.style.removeProperty("--lg-bg");
         element.classList.add("lg-on");
-        setEngine("webgl");
+        const changed = setEngine("webgl");
         syncCoalescenceState(0, true);
         scheduleWebglRender();
+        if (changed) options.onEngineChange?.("webgl");
     };
 
     const mountSvg = () => {
-        teardownWebgl();
-        releaseWebglSlot(webglPoolEntry, true);
-        element.style.removeProperty("--lg-tint");
-        const svgTint = formatTintCssValue(effectiveOptions.tintColor, effectiveOptions.tintOpacity);
-        if (svgTint !== null) {
-            element.style.setProperty("--lg-bg", svgTint);
-        } else {
-            element.style.removeProperty("--lg-bg");
+        const wasSvg = activeEngine === "wasm-svg";
+        if (!wasSvg) {
+            teardownWebgl();
+            releaseWebglSlot(webglPoolEntry, true);
+            element.style.removeProperty("--lg-tint");
+            lastSvgBgCss = undefined;
+            lastSvgGeometrySig = "";
         }
-        setEngine("wasm-svg");
+        const svgTint = formatTintCssValue(effectiveOptions.tintColor, effectiveOptions.tintOpacity);
+        if (lastSvgBgCss !== svgTint) {
+            lastSvgBgCss = svgTint;
+            if (svgTint !== null) {
+                element.style.setProperty("--lg-bg", svgTint);
+            } else {
+                element.style.removeProperty("--lg-bg");
+            }
+        }
+        const changed = setEngine("wasm-svg");
         registerManagedElement(element, config);
-        syncCoalescenceState(0, true);
-        applyCoalescenceVisuals();
+        const nextSvgGeometrySig = `${config.pill ? 1 : 0}|${config.radius}|${config.bezel}|${config.adaptiveRefraction ? 1 : 0}|${effectiveOptions.coalesce === false ? 0 : 1}`;
+        if (!wasSvg || nextSvgGeometrySig !== lastSvgGeometrySig) {
+            lastSvgGeometrySig = nextSvgGeometrySig;
+            syncCoalescenceState(0, true);
+            applyCoalescenceVisuals();
+        }
+        if (changed) options.onEngineChange?.("wasm-svg");
     };
 
     const MAX_BUTTON_DRAG_PX = 4;
@@ -1368,8 +1474,7 @@ export function createLiquidGlassController(
         let containerRight = typeof window !== "undefined" ? window.innerWidth : baseRight;
         let containerBottom = typeof window !== "undefined" ? window.innerHeight : baseBottom;
         if (boundsOption === "parent") {
-            const parentEl =
-                (element.offsetParent as HTMLElement | null) ?? element.parentElement;
+            const parentEl = element.parentElement;
             if (parentEl) {
                 const parentRect = parentEl.getBoundingClientRect();
                 containerLeft = parentRect.left;
@@ -1421,11 +1526,19 @@ export function createLiquidGlassController(
     const clampToRange = (value: number, minVal: number, maxVal: number): number =>
         Math.min(maxVal, Math.max(minVal, value));
 
+    const dragWindow = element.ownerDocument.defaultView;
+    const stopDragWindowListeners = () => {
+        dragWindow?.removeEventListener("pointermove", onDragWindowMove);
+        dragWindow?.removeEventListener("pointerup", onInteractivePointerUp);
+        dragWindow?.removeEventListener("pointercancel", onInteractivePointerCancel);
+        dragWindow?.removeEventListener("blur", onInteractivePointerCancel);
+    };
+
     const onInteractivePointerDown = (event: PointerEvent) => {
         if (event.pointerType === "mouse" && event.button !== 0) return;
         if (isPointerDragging || activeDragPointerId !== null) return;
         hasDraggedBeyondThreshold = false;
-        springController?.press();
+        springController?.press(event.pointerType === "touch" || event.pointerType === "pen");
         const dragMode = resolveDragMode();
         if (dragMode !== null) {
             isPointerDragging = true;
@@ -1434,23 +1547,32 @@ export function createLiquidGlassController(
             activeFreeDragBounds = dragMode === "free" ? resolveFreeDragBounds() : null;
             dragStartClientX = event.clientX;
             dragStartClientY = event.clientY;
-            dragOriginOffsetX = freeDragRestX;
-            dragOriginOffsetY = freeDragRestY;
+            dragOriginOffsetX = lastSpringDragX;
+            dragOriginOffsetY = lastSpringDragY;
             lastDragClientX = event.clientX;
             lastDragClientY = event.clientY;
             lastDragTimestamp = event.timeStamp || (typeof performance !== "undefined" ? performance.now() : Date.now());
             dragVelocityX = 0;
             dragVelocityY = 0;
+            let hasCapture = false;
             try {
                 element.setPointerCapture?.(event.pointerId);
+                hasCapture = element.hasPointerCapture?.(event.pointerId) === true;
             } catch {
             }
+            if (!hasCapture) {
+                dragWindow?.addEventListener("pointermove", onDragWindowMove, { passive: true });
+            }
+            dragWindow?.addEventListener("pointerup", onInteractivePointerUp, { passive: true });
+            dragWindow?.addEventListener("pointercancel", onInteractivePointerCancel, { passive: true });
+            dragWindow?.addEventListener("blur", onInteractivePointerCancel, { passive: true });
         }
     };
 
     const onInteractivePointerMove = (event: PointerEvent) => {
         if (!springController) return;
-        if (isPointerDragging && activeDragMode !== null && event.pointerId === activeDragPointerId) {
+        if (isPointerDragging && event.pointerId !== activeDragPointerId) return;
+        if (isPointerDragging && activeDragMode !== null) {
             const dragMode = activeDragMode;
             const rawDeltaX = event.clientX - dragStartClientX;
             const rawDeltaY = event.clientY - dragStartClientY;
@@ -1504,18 +1626,13 @@ export function createLiquidGlassController(
         springController.setTilt(horizontal, vertical);
     };
 
-    const finishDragInteraction = (event: Event, isCancel: boolean) => {
+    const onDragWindowMove = (event: PointerEvent) => {
+        if (isPointerDragging && !event.composedPath().includes(element)) onInteractivePointerMove(event);
+    };
+
+    const finishDragInteraction = (event: Event | null, isCancel: boolean, resetOffset = false) => {
         if (!isPointerDragging) return;
-        const pointerEvent = event as PointerEvent;
-        if (
-            typeof pointerEvent.pointerId === "number" &&
-            activeDragPointerId !== null &&
-            pointerEvent.pointerId !== activeDragPointerId &&
-            event.type !== "blur" &&
-            event.type !== "lostpointercapture"
-        ) {
-            return;
-        }
+        stopDragWindowListeners();
         const finishedMode = activeDragMode;
         isPointerDragging = false;
         activeDragMode = null;
@@ -1529,16 +1646,10 @@ export function createLiquidGlassController(
             }
         }
 
-        const releaseTime =
-            (typeof pointerEvent.timeStamp === "number" && pointerEvent.timeStamp > 0
-                ? pointerEvent.timeStamp
-                : typeof performance !== "undefined"
-                  ? performance.now()
-                  : Date.now());
-        const idleSec = Math.max(0, (releaseTime - lastDragTimestamp) * 0.001);
-        const idleDecay = Math.exp(-idleSec / 0.055);
+        const releaseTime = event?.timeStamp || performance.now();
+        const idleDecay = isCancel ? 0 : Math.exp(-Math.max(0, releaseTime - lastDragTimestamp) / 55);
 
-        if (finishedMode === "free") {
+        if (finishedMode === "free" && !resetOffset) {
             const bounds = activeFreeDragBounds ?? resolveFreeDragBounds();
             activeFreeDragBounds = null;
             if (isCancel) {
@@ -1565,14 +1676,14 @@ export function createLiquidGlassController(
                 springController?.setDrag(freeDragRestX, freeDragRestY, false);
                 springController?.impulseDrag(vx * 0.1, vy * 0.1);
             }
-            effectiveOptions.onDragChange?.(freeDragRestX, freeDragRestY, false);
         } else {
             activeFreeDragBounds = null;
+            freeDragRestX = 0;
+            freeDragRestY = 0;
             springController?.setDrag(0, 0, false);
             if (!isCancel) {
                 springController?.impulseDrag(-dragVelocityX * 0.025 * idleDecay, -dragVelocityY * 0.025 * idleDecay);
             }
-            effectiveOptions.onDragChange?.(0, 0, false);
         }
 
         dragVelocityX = 0;
@@ -1580,6 +1691,7 @@ export function createLiquidGlassController(
         if (isCancel) {
             hasDraggedBeyondThreshold = false;
         }
+        effectiveOptions.onDragChange?.(freeDragRestX, freeDragRestY, false);
     };
 
     const onInteractivePointerUp = (event: PointerEvent) => {
@@ -1592,6 +1704,7 @@ export function createLiquidGlassController(
 
     const onInteractivePointerCancel = (event: Event) => {
         if (isPointerDragging && event.type === "pointerleave") return;
+        if (!isPointerDragging && event.type === "lostpointercapture") return;
         const pointerEvent = event as PointerEvent;
         if (
             typeof pointerEvent.pointerId === "number" &&
@@ -1641,6 +1754,7 @@ export function createLiquidGlassController(
             element.removeEventListener("keyup", onInteractiveKeyUp);
             element.removeEventListener("blur", onInteractivePointerCancel);
         }
+        if (isPointerDragging) stopDragWindowListeners();
         if (activeDragPointerId !== null) {
             try {
                 element.releasePointerCapture?.(activeDragPointerId);
@@ -1660,6 +1774,7 @@ export function createLiquidGlassController(
         lastSpringDragX = 0;
         lastSpringDragY = 0;
         dragMotionSpeed = 0;
+        useDragResolution = false;
         pressGlow = 0;
         springTiltHorizontal = 0;
         springTiltVertical = 0;
@@ -1742,12 +1857,16 @@ export function createLiquidGlassController(
 
     const syncInteractive = () => {
         const dragMode = resolveDragMode();
-        const enabled = isInteractiveElement() || dragMode !== null;
-        if (!enabled) {
+        if (isPointerDragging && activeDragMode !== dragMode) {
+            finishDragInteraction(null, true, true);
+            if (destroyed) return;
+            springController?.setTilt(0, 0);
+            springController?.release(false);
+        }
+        if (!isInteractiveElement() && dragMode === null) {
             detachInteractive();
             return;
         }
-
         if (lastConfiguredDragMode === "free" && dragMode !== "free") {
             freeDragRestX = 0;
             freeDragRestY = 0;
@@ -1758,9 +1877,6 @@ export function createLiquidGlassController(
         if (dragMode !== null) {
             element.setAttribute("data-lg-draggable", dragMode);
         } else {
-            if (isPointerDragging) {
-                finishDragInteraction(new Event("cancel"), true);
-            }
             element.removeAttribute("data-lg-draggable");
         }
         element.classList.add("lg-interactive");
@@ -1834,12 +1950,16 @@ export function createLiquidGlassController(
                     lastSpringDragX = frame.dragX;
                     lastSpringDragY = frame.dragY;
                     dragMotionSpeed = Math.hypot(frame.velocityX, frame.velocityY);
+                    // Keep the drawing buffer stable through spring reversals and settling.
+                    const enteredDragResolution = !useDragResolution && dragMotionSpeed > 0.3;
+                    useDragResolution ||= enteredDragResolution;
                     if (dragMoved) {
                         syncCoalescenceState(dragMotionSpeed, true);
                     }
                     if (
                         activeEngine === "webgl" &&
                         (dragMoved ||
+                            enteredDragResolution ||
                             Math.abs(frame.glow - prevGlow) > 0.004 ||
                             Math.abs(lightTiltHorizontal - prevTiltH) > 0.004 ||
                             Math.abs(lightTiltVertical - prevTiltV) > 0.004)
@@ -1851,7 +1971,7 @@ export function createLiquidGlassController(
                     const prevGlow = pressGlow;
                     const prevTiltH = lightTiltHorizontal;
                     const prevTiltV = lightTiltVertical;
-                    const prevMotionSpeed = dragMotionSpeed;
+                    const restoreResolution = useDragResolution;
                     const prevDrag =
                         Math.abs(lastSpringDragX - freeDragRestX) > 0.25 ||
                         Math.abs(lastSpringDragY - freeDragRestY) > 0.25;
@@ -1860,6 +1980,7 @@ export function createLiquidGlassController(
                     springTiltVertical = 0;
                     syncEffectiveLightTilt();
                     dragMotionSpeed = 0;
+                    useDragResolution = false;
                     lastSpringDragX = freeDragRestX;
                     lastSpringDragY = freeDragRestY;
                     clearSpringCssVars(true);
@@ -1867,10 +1988,10 @@ export function createLiquidGlassController(
                     if (
                         activeEngine === "webgl" &&
                         (prevDrag ||
-                            prevMotionSpeed > 0.3 ||
+                            restoreResolution ||
                             prevGlow > 0.004 ||
-                            Math.abs(prevTiltH) > 0.004 ||
-                            Math.abs(prevTiltV) > 0.004)
+                            Math.abs(lightTiltHorizontal - prevTiltH) > 0.004 ||
+                            Math.abs(lightTiltVertical - prevTiltV) > 0.004)
                     ) {
                         scheduleWebglRender();
                     }
@@ -1880,7 +2001,9 @@ export function createLiquidGlassController(
 
         springController.setFreeDragMode?.(dragMode === "free");
         const { reducedMotionQuery } = getMediaQueries();
-        springController.setReducedMotion(Boolean(reducedMotionQuery?.matches));
+        const prefersReducedMotion = Boolean(reducedMotionQuery?.matches);
+        if (prefersReducedMotion) useDragResolution = false;
+        springController.setReducedMotion(prefersReducedMotion);
 
         if (!interactiveListenersAttached) {
             interactiveListenersAttached = true;
@@ -1933,6 +2056,7 @@ export function createLiquidGlassController(
         webglCoreFilter = formatGlassCoreFilter(config.coreFilter, config.saturation);
         syncPillAttribute();
         syncInteractive();
+        if (destroyed) return;
         syncEffectiveLightTilt();
         syncAmbientLightTiltSubscription();
         const requestedEngine = effectiveOptions.engine ?? "auto";
@@ -1964,8 +2088,13 @@ export function createLiquidGlassController(
 
     const syncCoalescenceRegistration = () => {
         if (effectiveOptions.coalesce === false) {
+            unobserveCoalescenceResize?.();
+            unobserveCoalescenceResize = null;
             unregisterCoalescence?.();
             unregisterCoalescence = null;
+            lastCoalescingState = false;
+            lastBleedPx = -1;
+            lastInterferenceStr = "";
             element.removeAttribute("data-lg-coalescing");
             element.style.removeProperty("--lg-bleed");
             element.style.removeProperty("--lg-interference");
@@ -1983,6 +2112,12 @@ export function createLiquidGlassController(
                     applyCoalescenceVisuals();
                 }
             },
+        });
+        unobserveCoalescenceResize = observeSharedElementResize(element, () => {
+            if (activeEngine === "webgl" && !webglContextLost) return;
+            cachedRadiusStr = null;
+            syncCoalescenceState(0, true);
+            applyCoalescenceVisuals();
         });
     };
 
@@ -2010,7 +2145,7 @@ export function createLiquidGlassController(
             return activeEngine;
         },
         update(newOptions) {
-            if (destroyed) return;
+            if (destroyed || Object.keys(newOptions).length === 0) return;
             const prevPixelRatio = effectiveOptions.pixelRatio;
             const prevRadius = config.radius;
             const prevPill = config.pill;
@@ -2026,8 +2161,11 @@ export function createLiquidGlassController(
             }
             syncCoalescenceRegistration();
             if ("sceneCanvas" in newOptions) {
-                externalSceneCanvas = newOptions.sceneCanvas ?? null;
-                sceneUploadPending = true;
+                const nextCanvas = newOptions.sceneCanvas ?? null;
+                if (nextCanvas !== externalSceneCanvas || nextCanvas !== null) {
+                    externalSceneCanvas = nextCanvas;
+                    sceneUploadPending = true;
+                }
             }
             if ("sceneElement" in newOptions) {
                 const nextSource = newOptions.sceneElement ?? null;
@@ -2116,11 +2254,13 @@ export function createLiquidGlassController(
             if (destroyed) return;
             cachedRadiusStr = null;
             const existingState = elementStateMap.get(element);
-            syncThemeAttribute();
+            syncThemeAttribute(true);
             if (existingState) existingState.cachedRadiusStr = null;
             const targetEngine = resolveGlassEngine(effectiveOptions.engine ?? "auto", hasSceneInput());
             if (targetEngine !== activeEngine) {
                 if (targetEngine === "webgl" && activeEngine === "css" && isWebglSlotOnStandby(webglPoolEntry)) {
+                    syncCoalescenceState(0, true);
+                    applyCoalescenceVisuals();
                     return;
                 }
                 applyEngine();
@@ -2172,6 +2312,7 @@ export function createLiquidGlassController(
                 if (!canvas) {
                     mountWebgl();
                 } else {
+                    observeExternalScene(canvas, sceneEl);
                     scheduleWebglRender();
                 }
             } else {
@@ -2203,12 +2344,15 @@ export function createLiquidGlassController(
             }
             detachInteractive();
             clearLightTiltCssVars();
+            unobserveCoalescenceResize?.();
+            unobserveCoalescenceResize = null;
             unregisterCoalescence?.();
             unregisterCoalescence = null;
             teardownWebgl();
             releaseWebglSlot(webglPoolEntry, true);
             unregisterManagedElement(element);
             element.classList.remove("lg-on", "lg-hollow", "lg-interactive");
+            if (!hadSurfaceClass) element.classList.remove("lg-surface");
             element.removeAttribute("data-lg-surface");
             element.removeAttribute("data-lg-engine");
             element.removeAttribute("data-lg-theme");

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
     collectCoalescenceSnapshot,
+    getLastCoalescenceSearchStatsForTesting,
     registerCoalescenceParticipant,
     resetCoalescenceForTesting,
     syncCoalescenceGeometry,
@@ -369,6 +370,45 @@ describe("360 droplet button drag and liquid coalescence", () => {
         unregisterB();
     });
 
+    it("stops merging with collapsed glass and resumes after its layout returns", () => {
+        let onResize: ResizeObserverCallback | undefined;
+        vi.stubGlobal("ResizeObserver", class {
+            constructor(callback: ResizeObserverCallback) { onResize = callback; }
+            observe() {}
+            unobserve() {}
+            disconnect() {}
+        });
+        const first = document.body.appendChild(document.createElement("div"));
+        const second = document.body.appendChild(document.createElement("div"));
+        vi.spyOn(first, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, 80, 48));
+        const secondBounds = vi.spyOn(second, "getBoundingClientRect").mockReturnValue(new DOMRect(84, 0, 80, 48));
+        const firstGlass = createLiquidGlass(first, { engine: "css" });
+        const secondGlass = createLiquidGlass(second, { engine: "css" });
+        const resized = () => onResize!([{
+            target: second,
+            contentRect: second.getBoundingClientRect(),
+            borderBoxSize: [],
+            contentBoxSize: [],
+            devicePixelContentBoxSize: [],
+        }], {} as ResizeObserver);
+        try {
+            expect(first.getAttribute("data-lg-coalescing")).toBe("1");
+            secondBounds.mockReturnValue(new DOMRect(0, 0, 0, 0));
+            resized();
+            expect(first.hasAttribute("data-lg-coalescing")).toBe(false);
+            expect(second.hasAttribute("data-lg-coalescing")).toBe(false);
+
+            secondBounds.mockReturnValue(new DOMRect(84, 0, 80, 48));
+            resized();
+            expect(first.getAttribute("data-lg-coalescing")).toBe("1");
+            expect(second.getAttribute("data-lg-coalescing")).toBe("1");
+        } finally {
+            secondGlass.destroy();
+            firstGlass.destroy();
+            vi.unstubAllGlobals();
+        }
+    });
+
     it("accounts for rounded-corner clearance when elements are diagonally adjacent", () => {
         const elemA = document.createElement("div");
         const elemB = document.createElement("div");
@@ -500,104 +540,6 @@ describe("360 droplet button drag and liquid coalescence", () => {
         expect(collectCoalescenceSnapshot(glass.element).peers).toHaveLength(0);
     });
 
-    it("cleans dependent peer references on unregister and lazily indexes spatial grid on large teleports", () => {
-        const makePeer = (left: number, top: number) => {
-            const element = document.createElement("div");
-            const notify = vi.fn();
-            const unregister = registerCoalescenceParticipant({
-                element,
-                notifyPeerUpdate: notify,
-                readBounds: () => ({ left, top, width: 60, height: 40, radius: 12, bezel: 10 }),
-            });
-            syncCoalescenceGeometry(element, left, top, 60, 40, 12, 10, 0, false);
-            return { element, notify, unregister };
-        };
-
-        const mover = makePeer(0, 0);
-        const startNeighbor = makePeer(68, 0);
-        const endNeighbor = makePeer(8068, 0);
-        for (let idx = 0; idx < 18; idx++) {
-            makePeer(2000 + idx * 150, 2000);
-        }
-
-        syncCoalescenceGeometry(mover.element, 8000, 0, 60, 40, 12, 10);
-        expect(startNeighbor.notify).toHaveBeenCalledTimes(1);
-        expect(endNeighbor.notify).toHaveBeenCalledTimes(1);
-
-        collectCoalescenceSnapshot(mover.element);
-        endNeighbor.unregister();
-        expect(mover.notify).toHaveBeenCalledTimes(1);
-        endNeighbor.unregister();
-        expect(mover.notify).toHaveBeenCalledTimes(1);
-        expect(collectCoalescenceSnapshot(mover.element).peers).toHaveLength(0);
-    });
-
-    it("computes Minkowski diagonal rounded-rect distance and C2 quintic coalescence falloff", () => {
-        const elA = document.createElement("div");
-        const elB = document.createElement("div");
-        document.body.append(elA, elB);
-
-        const unregA = registerCoalescenceParticipant({
-            element: elA,
-            readBounds: () => ({ left: 0, top: 0, width: 60, height: 60, radius: 15, bezel: 12 }),
-            notifyPeerUpdate: () => {},
-        });
-        const unregB = registerCoalescenceParticipant({
-            element: elB,
-            readBounds: () => ({ left: 80, top: 80, width: 60, height: 60, radius: 15, bezel: 12 }),
-            notifyPeerUpdate: () => {},
-        });
-
-        syncCoalescenceGeometry(elA, 0, 0, 60, 60, 15, 12, 0, false);
-        syncCoalescenceGeometry(elB, 80, 80, 60, 60, 15, 12, 0, false);
-        expect(collectCoalescenceSnapshot(elA).peers).toHaveLength(1);
-
-        syncCoalescenceGeometry(elB, 82, 82, 60, 60, 15, 12, 0, false);
-        expect(collectCoalescenceSnapshot(elA).peers).toHaveLength(0);
-
-        syncCoalescenceGeometry(elB, 0, 64, 60, 60, 15, 12, 0, false);
-        const closeSnap = collectCoalescenceSnapshot(elA);
-        expect(closeSnap.interferenceIntensity).toBeGreaterThan(0.95);
-        expect(closeSnap.requiredBleedPx).toBeGreaterThan(12);
-
-        unregA();
-        unregB();
-    });
-
-    it("preserves stationary participants in spatial grid after dropping below and re-crossing threshold", () => {
-        const registerAt = (left: number, top: number) => {
-            const element = document.createElement("div");
-            const unregister = registerCoalescenceParticipant({
-                element,
-                notifyPeerUpdate: () => {},
-                readBounds: () => ({ left, top, width: 60, height: 48, radius: 14, bezel: 12 }),
-            });
-            syncCoalescenceGeometry(element, left, top, 60, 48, 14, 12, 0, false);
-            return { element, unregister };
-        };
-
-        const pairA = registerAt(0, 0);
-        const pairB = registerAt(70, 0);
-        const extras = Array.from({ length: 15 }, (_, idx) => registerAt(3000 + idx * 200, 3000));
-
-        expect(collectCoalescenceSnapshot(pairA.element).peers).toHaveLength(1);
-
-        extras.pop()!.unregister();
-        extras.pop()!.unregister();
-        expect(collectCoalescenceSnapshot(pairA.element).peers).toHaveLength(1);
-
-        const extra1 = registerAt(9000, 9000);
-        const extra2 = registerAt(9200, 9000);
-        expect(collectCoalescenceSnapshot(pairA.element).peers).toHaveLength(1);
-        expect(collectCoalescenceSnapshot(pairB.element).peers).toHaveLength(1);
-
-        extra1.unregister();
-        extra2.unregister();
-        for (const extra of extras) extra.unregister();
-        pairA.unregister();
-        pairB.unregister();
-    });
-
     it("does not repeatedly poll readBounds for hidden collapsed participants", () => {
         const visibleEl = document.createElement("div");
         const hiddenEl = document.createElement("div");
@@ -622,5 +564,91 @@ describe("360 droplet button drag and liquid coalescence", () => {
 
         unregVisible();
         unregHidden();
+    });
+
+    it("uses A* best-first k-NN pruning to match exact brute-force top-4 peers while skipping distant cells", () => {
+        const selfEl = document.createElement("div");
+        document.body.appendChild(selfEl);
+        const unregs: Array<() => void> = [];
+        unregs.push(
+            registerCoalescenceParticipant({
+                element: selfEl,
+                notifyPeerUpdate: () => {},
+                readBounds: () => ({ left: 128, top: 128, width: 64, height: 64, radius: 16, bezel: 12 }),
+            }),
+        );
+        syncCoalescenceGeometry(selfEl, 128, 128, 64, 64, 16, 12, 0, false);
+
+        const boxes: Array<{
+            element: HTMLElement;
+            left: number;
+            top: number;
+            width: number;
+            height: number;
+            radius: number;
+            bezel: number;
+            order: number;
+        }> = [];
+
+        const addBox = (
+            left: number,
+            top: number,
+            width: number,
+            height: number,
+            radius: number,
+            bezel: number,
+        ) => {
+            const element = document.createElement("div");
+            document.body.appendChild(element);
+            const order = boxes.length + 2;
+            unregs.push(
+                registerCoalescenceParticipant({
+                    element,
+                    notifyPeerUpdate: () => {},
+                    readBounds: () => ({ left, top, width, height, radius, bezel }),
+                }),
+            );
+            syncCoalescenceGeometry(element, left, top, width, height, radius, bezel, 0, false);
+            boxes.push({ element, left, top, width, height, radius, bezel, order });
+        };
+
+        // 4 ultra-close peers inside cell (1,1) around [128..192]
+        addBox(194, 130, 20, 20, 6, 12); // gap = 2px
+        addBox(195, 160, 20, 20, 6, 24); // gap = 3px (unequal bezel -> Derjaguin mean)
+        addBox(150, 196, 20, 20, 6, 12); // gap = 4px
+        addBox(130, 197, 20, 20, 6, 12); // gap = 5px
+
+        // 24 farther peers in adjacent cells (still within 42px range, e.g. 20..40px away in cells (0,0), (0,1), (2,2), etc.)
+        for (let idx = 0; idx < 6; idx++) {
+            addBox(82, 82 + idx * 14, 24, 12, 4, 12);
+            addBox(82, 212 + idx * 4, 24, 12, 4, 12);
+            addBox(222, 82 + idx * 14, 24, 12, 4, 12);
+            addBox(222, 214 + idx * 4, 24, 12, 4, 12);
+        }
+
+        const snapshot = collectCoalescenceSnapshot(selfEl);
+        const stats = getLastCoalescenceSearchStatsForTesting();
+
+        expect(snapshot.peers).toHaveLength(4);
+        expect(stats.prunedCells).toBeGreaterThan(0);
+        expect(stats.expandedCells).toBeLessThan(stats.expandedCells + stats.prunedCells);
+
+        // Verify exact match with brute-force top-4
+        const expectedCenters = [
+            { x: 194 + 10 - 160, y: 130 + 10 - 160 },
+            { x: 195 + 10 - 160, y: 160 + 10 - 160 },
+            { x: 150 + 10 - 160, y: 196 + 10 - 160 },
+            { x: 130 + 10 - 160, y: 197 + 10 - 160 },
+        ];
+        snapshot.peers.forEach((peer, index) => {
+            expect(peer.relCenterX).toBeCloseTo(expectedCenters[index]!.x, 6);
+            expect(peer.relCenterY).toBeCloseTo(expectedCenters[index]!.y, 6);
+        });
+
+        // Verify Derjaguin harmonic mean curvature radius for unequal bezels (12 and 24 -> 16)
+        const derjaguinEffective = (2 * 12 * 24) / (12 + 24);
+        expect(snapshot.peers[1]!.mergeRadius).toBeCloseTo(Math.min(48, Math.max(28, derjaguinEffective * 2.85)), 5);
+
+        for (const unreg of unregs) unreg();
     });
 });

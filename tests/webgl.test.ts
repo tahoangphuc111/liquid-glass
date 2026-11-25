@@ -5,14 +5,9 @@ import {
     createSceneCaptureController,
     resolveCaptureDimensions,
 } from "../src/core/sceneCapture.js";
-import {
-    buildOpticalLut,
-    evaluateOpticalProfile,
-    OPTICAL_LUT_SIZE,
-    resetOpticalLutCacheForTesting,
-} from "../src/core/optics.js";
+import { evaluateOpticalProfile } from "../src/core/optics.js";
 import { getOpticalLutPeak } from "../src/core/refractionBounds.js";
-import { resetOpticalTransferForTesting } from "../src/core/opticalTransfer.js";
+import { DEFAULT_CLEAR_SHARPNESS, resolveEffectiveChromaticAberration } from "../src/core/config.js";
 import { GlassWebglRenderer, resolveWebglPixelRatio } from "../src/core/webglRenderer.js";
 
 function createMockWebglContext(options?: {
@@ -201,11 +196,77 @@ describe("optical transfer caching", () => {
         expect(saturation).toEqual([-1, 0, 2, 1, -1]);
         expect(chroma).toHaveLength(4);
         expect(chroma[0]).toBe(0);
-        expect(chroma[1]).toBeCloseTo(0.6);
-        expect(chroma[2]).toBeCloseTo(1);
+        expect(chroma[1]).toBeCloseTo(resolveEffectiveChromaticAberration(0.6, undefined, 2.15), 6);
+        expect(chroma[2]).toBeCloseTo(resolveEffectiveChromaticAberration(1, undefined, 2.15), 6);
+        expect(chroma[2]!).toBeGreaterThan(chroma[1]!);
         expect(chroma[3]).toBe(0);
         expect(gl.framebufferTexture2D).toHaveBeenCalledTimes(2);
         renderer.dispose();
+    });
+
+    it("updates the medium in both shaders only when the material changes", () => {
+        const { gl, renderer } = setup();
+        renderer.setSceneCanvas(document.createElement("canvas"));
+        const params = { ...frame, tintColor: [0.12, 0.67, 0.91] as [number, number, number],
+            sceneRect: { relX: 0.2, relY: 0.2, relW: 0.4, relH: 0.4 } };
+        const uploads = () => vi.mocked(gl.uniform4f).mock.calls
+            .filter(([location]) => (location as { name?: string } | null)?.name === "uMedium");
+        try {
+            for (let index = 0; index < 3; index++) renderer.render(params);
+            expect(uploads()).toHaveLength(2);
+            expect(uploads()[0]!.slice(1)).toEqual(uploads()[1]!.slice(1));
+
+            renderer.render({ ...params, highlight: 0.2, saturation: 0.7 });
+            expect(uploads()).toHaveLength(2);
+            renderer.render({ ...params, thickness: 100 });
+            expect(uploads()).toHaveLength(3);
+            expect(uploads()[2]![1]).toBeLessThan(uploads()[1]![1]);
+
+            renderer.render({ ...params, thickness: 100, tintOpacity: 0 });
+            expect(uploads()).toHaveLength(4);
+            expect(uploads()[3]!.slice(1)).toEqual([1, 1, 1, 0]);
+        } finally {
+            renderer.dispose();
+        }
+    });
+
+    it("defers compiling cache shaders until storage fits the shared device budget", () => {
+        vi.stubGlobal("navigator", { deviceMemory: 4 });
+        const first = setup();
+        const second = setup();
+        const params = { ...frame, width: 600, height: 500, pixelRatio: 1 };
+        try {
+            for (let index = 0; index < 3; index++) first.renderer.render(params);
+            expect(first.gl.createFramebuffer).toHaveBeenCalledOnce();
+            for (let index = 0; index < 3; index++) second.renderer.render(params);
+            expect(second.gl.createProgram).toHaveBeenCalledOnce();
+            expect(second.gl.createFramebuffer).not.toHaveBeenCalled();
+
+            first.renderer.dispose();
+            second.renderer.render(params);
+            expect(second.gl.createProgram).toHaveBeenCalledTimes(3);
+            expect(second.gl.createFramebuffer).toHaveBeenCalledOnce();
+        } finally {
+            first.renderer.dispose();
+            second.renderer.dispose();
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it.each([0, 4])("reuses a compact panel shader when moving across the scene edge with blur %d", (blur) => {
+        const { gl, renderer } = setup();
+        renderer.setSceneCanvas(document.createElement("canvas"));
+        const params = { ...frame, height: 24, radius: 12, blur,
+            sceneRect: { relX: 0.2, relY: 0.2, relW: 0.4, relH: 0.2 } };
+        try {
+            for (let index = 0; index < 3; index++) renderer.render(params);
+            expect(gl.createProgram).toHaveBeenCalledTimes(3);
+            renderer.render({ ...params, sceneRect: { ...params.sceneRect, relX: -0.02 } });
+            expect(gl.createProgram).toHaveBeenCalledTimes(3);
+            expect(gl.drawArrays).toHaveBeenCalledTimes(5);
+        } finally {
+            renderer.dispose();
+        }
     });
 
     it("rebuilds the optical transfer when the direction or feather changes", () => {
@@ -229,6 +290,17 @@ describe("optical transfer caching", () => {
     it("finds a peak between interpolated optical samples", () => {
         const lut = new Uint8Array([255, 254, 127, 255, 127, 255, 255, 254]);
         expect(getOpticalLutPeak(lut)).toBe(0.25);
+    });
+
+    it("rebuilds transfer geometry without reallocating textures for a fractional resize", () => {
+        const { gl, renderer } = setup();
+        for (let index = 0; index < 3; index++) renderer.render(frame);
+        expect(gl.framebufferTexture2D).toHaveBeenCalledTimes(2);
+        for (let index = 0; index < 3; index++) renderer.render({ ...frame, width: frame.width + 0.1 });
+        expect(gl.drawArrays).toHaveBeenCalledTimes(8);
+        expect(gl.framebufferTexture2D).toHaveBeenCalledTimes(2);
+        expect(gl.deleteTexture).not.toHaveBeenCalled();
+        renderer.dispose();
     });
 
     it("builds once after geometry stabilizes and reuses optics across scene and lighting updates", () => {
@@ -300,16 +372,16 @@ describe("WebGL high-DPI pixel resolution and scene capture scaling", () => {
 
     it("bounds automatic WebGL resolution across 1x, 2x, and 3x displays", () => {
         Object.defineProperty(window, "devicePixelRatio", { value: 1, configurable: true });
-        expect(resolveWebglPixelRatio(undefined, 18)).toBe(1.5);
+        expect(resolveWebglPixelRatio(undefined, 18)).toBe(2);
 
         Object.defineProperty(window, "devicePixelRatio", { value: 2, configurable: true });
         expect(resolveWebglPixelRatio(undefined, 18)).toBe(2);
 
         Object.defineProperty(window, "devicePixelRatio", { value: 3, configurable: true });
-        expect(resolveWebglPixelRatio(undefined, 18)).toBe(2.5);
+        expect(resolveWebglPixelRatio(undefined, 18)).toBe(3);
 
-        expect(resolveWebglPixelRatio(undefined, 0)).toBe(0.25);
-        expect(resolveWebglPixelRatio(undefined, 2)).toBe(2.5);
+        expect(resolveWebglPixelRatio(undefined, 0)).toBe(0.125);
+        expect(resolveWebglPixelRatio(undefined, 2)).toBe(3);
         expect(resolveWebglPixelRatio(3, 0)).toBe(3);
         expect(resolveWebglPixelRatio(12)).toBe(4);
         expect(resolveWebglPixelRatio(0.5)).toBe(0.5);
@@ -413,8 +485,8 @@ describe("WebGL high-DPI pixel resolution and scene capture scaling", () => {
             highlight: 0.72,
         });
 
-        expect(canvas.width).toBe(75);
-        expect(canvas.height).toBe(25);
+        expect(canvas.width).toBe(37);
+        expect(canvas.height).toBe(12);
         const highlightCalls = uniform4fCalls.filter(
             (c) => (c.loc as { name?: string })?.name === "uHighlight",
         );
@@ -439,7 +511,7 @@ describe("WebGL high-DPI pixel resolution and scene capture scaling", () => {
             uniform4fCalls
                 .filter((c) => (c.loc as { name?: string })?.name === "uHighlight")
                 .at(-1)?.values[1],
-        ).toBe(0.085);
+        ).toBeCloseTo(resolveEffectiveChromaticAberration(true, undefined, 2.15), 6);
 
         renderer!.render({
             width: 300,
@@ -460,7 +532,7 @@ describe("WebGL high-DPI pixel resolution and scene capture scaling", () => {
             uniform4fCalls
                 .filter((c) => (c.loc as { name?: string })?.name === "uHighlight")
                 .at(-1)?.values[1],
-        ).toBe(0.14);
+        ).toBeCloseTo(resolveEffectiveChromaticAberration(0.14, undefined, 2.15), 6);
 
         renderer!.dispose();
     });
@@ -472,10 +544,10 @@ describe("WebGL high-DPI pixel resolution and scene capture scaling", () => {
         expect(medium).toEqual({ texWidth: 1024, texHeight: 819 });
 
         const unrounded = resolveCaptureDimensions(1000, 800, undefined, 0);
-        expect(unrounded).toEqual({ texWidth: 125, texHeight: 100 });
+        expect(unrounded).toEqual({ texWidth: 63, texHeight: 50 });
 
         const largeUnrounded = resolveCaptureDimensions(2400, 1600, undefined, 0);
-        expect(Math.max(largeUnrounded.texWidth, largeUnrounded.texHeight)).toBeLessThanOrEqual(320);
+        expect(Math.max(largeUnrounded.texWidth, largeUnrounded.texHeight)).toBeLessThanOrEqual(256);
 
         const tall = resolveCaptureDimensions(1280, 1600);
         expect(Math.max(tall.texWidth, tall.texHeight)).toBeLessThanOrEqual(3072);
@@ -746,21 +818,6 @@ describe("WebGL high-DPI pixel resolution and scene capture scaling", () => {
         renderer.dispose();
     });
 
-    it("builds and caches optical lookup tables and guards parameters", () => {
-        const lut = buildOpticalLut("convex_squircle", 1.5);
-        expect(lut.length).toBe(OPTICAL_LUT_SIZE * 4);
-        expect(buildOpticalLut("convex_squircle", 1.5)).toBe(lut);
-        expect(buildOpticalLut("convex_squircle", NaN).length).toBe(OPTICAL_LUT_SIZE * 4);
-        expect(() => buildOpticalLut("linear", 1.5, -1)).toThrow(RangeError);
-
-        const profile = evaluateOpticalProfile(0.5, "convex_circle", 1.5);
-        expect(Number.isFinite(profile[0])).toBe(true);
-        expect(Number.isFinite(profile[1])).toBe(true);
-
-        expect(() => resetOpticalLutCacheForTesting()).not.toThrow();
-        expect(() => resetOpticalTransferForTesting()).not.toThrow();
-    });
-
     it("uses device-pixel-bounded anti-aliased stroke widths and unit diagonal normals in fragment shader", () => {
         const { gl } = createMockWebglContext({ transferCache: true });
         const canvas = document.createElement("canvas");
@@ -772,9 +829,11 @@ describe("WebGL high-DPI pixel resolution and scene capture scaling", () => {
         expect(fragmentCall).toBeDefined();
         const fragSrc = fragmentCall![1];
         expect(fragSrc).toContain("float invDpr = 1.0 / max(uDpr, 0.0001);");
-        expect(fragSrc).toContain("float darkRimWidth = max(0.58 / dprScale, 1.30 * invDpr);");
-        expect(fragSrc).toContain("float hairlineWidth = max(0.85 / dprScale, 1.55 * invDpr);");
-        expect(fragSrc).toContain("float satMix = step(2.199, uHighlight.w);");
+        expect(fragSrc).toContain("float darkRimWidth = max(0.68 / dprScale, 1.42 * invDpr);");
+        expect(fragSrc).toContain("float hairlineWidth = max(0.95 / dprScale, 1.68 * invDpr);");
+        expect(fragSrc).toContain("float rimT = clamp((rimY - 0.68) / 0.32, 0.0, 1.0);");
+        expect(fragSrc).toContain("float rimHighlight = clamp(rawRim / (1.0 + 0.18 * rawRim), 0.0, 1.0);");
+        expect(fragSrc).toContain("vibrantScene = uHighlight.w >= 2.199");
         expect(fragSrc).not.toContain("step(q.yx, q.xy)");
 
         const sceneCanvas = document.createElement("canvas");
@@ -910,5 +969,134 @@ describe("WebGL high-DPI pixel resolution and scene capture scaling", () => {
 
         controller.destroy();
         hiddenSpy.mockRestore();
+    });
+
+    it("uses unified IOR/Abbe dispersion, consistent travel bounds across blur, and 5-tap spectral blur in WebGL shaders", () => {
+        const shaderSources: string[] = [];
+        const { gl, uniform4fCalls } = createMockWebglContext({ transferCache: true });
+        const origShaderSource = gl.shaderSource.bind(gl);
+        gl.shaderSource = vi.fn((shader: WebGLShader, source: string) => {
+            shaderSources.push(source);
+            return origShaderSource(shader, source);
+        });
+
+        const canvas = document.createElement("canvas");
+        vi.spyOn(canvas, "getContext").mockReturnValue(gl);
+        const renderer = GlassWebglRenderer.create(canvas)!;
+        renderer.setSceneCanvas(document.createElement("canvas"));
+
+        const baseFrame = {
+            width: 240,
+            height: 24,
+            radius: 12,
+            bezel: 14,
+            thickness: 60,
+            scaleRatio: 20,
+            surface: "convex_squircle" as const,
+            tintColor: [1, 1, 1] as [number, number, number],
+            tintOpacity: 0.12,
+            highlight: 0.7,
+            pixelRatio: 2,
+            adaptiveRefraction: true,
+            sceneRect: { relX: 0.2, relY: 0.2, relW: 0.4, relH: 0.4 },
+        };
+
+        for (const material of [
+            { ior: 1.333, abbeNumber: 55.7, chromaticAberration: 0.04 },
+            { ior: 1.75, abbeNumber: 28, chromaticAberration: true },
+            { ior: 2.417, abbeNumber: 55.3, chromaticAberration: true },
+        ]) {
+            renderer.render({ ...baseFrame, ...material, blur: 0 });
+            const highlightClear = uniform4fCalls
+                .filter(({ loc }) => (loc as { name: string }).name === "uHighlight")
+                .at(-1)!;
+            const opticalClear = uniform4fCalls
+                .filter(({ loc }) => (loc as { name: string }).name === "uOptical")
+                .at(-1)!;
+            const expectedChroma = resolveEffectiveChromaticAberration(
+                material.chromaticAberration,
+                material.abbeNumber,
+                material.ior,
+            );
+            expect(highlightClear.values[1]).toBeCloseTo(expectedChroma, 6);
+
+            renderer.render({ ...baseFrame, ...material, blur: 3 });
+            const opticalBlurred = uniform4fCalls
+                .filter(({ loc }) => (loc as { name: string }).name === "uOptical")
+                .at(-1)!;
+            expect(opticalBlurred.values[2]).toBeCloseTo(opticalClear.values[2]!, 6);
+        }
+
+        expect(shaderSources.some((src) => src.includes("sampleSpectralBlur5Tap"))).toBe(true);
+        expect(shaderSources.some((src) => src.includes("smoothstep(0.08, 0.82, meniscusTilt)"))).toBe(true);
+        expect(shaderSources.some((src) => src.includes("sampleY") && src.includes("sampleC"))).toBe(true);
+        expect(shaderSources.every((src) => !src.includes("float coreGain"))).toBe(true);
+        renderer.dispose();
+    });
+
+    it("unlocks high-resolution capture, scene textures, and 4x WebGL rendering for sharpness and blur: 0", () => {
+        Object.defineProperty(window, "devicePixelRatio", { value: 1, configurable: true });
+        expect(resolveCaptureDimensions(1600, 900, undefined, 18)).toEqual({ texWidth: 1024, texHeight: 576 });
+        expect(resolveCaptureDimensions(1600, 900, undefined, 18, DEFAULT_CLEAR_SHARPNESS).texWidth).toBeGreaterThan(2500);
+        expect(resolveCaptureDimensions(1600, 900, undefined, 18, 1)).toEqual({ texWidth: 4096, texHeight: 2304 });
+
+        const shaderSources: string[] = [];
+        const { gl, uniform1fCalls } = createMockWebglContext({ transferCache: true, maxTextureSize: 4096, maxViewportDims: [4096, 4096] });
+        const origShaderSource = gl.shaderSource.bind(gl);
+        gl.shaderSource = vi.fn((shader: WebGLShader, source: string) => {
+            shaderSources.push(source);
+            return origShaderSource(shader, source);
+        });
+
+        const canvas = document.createElement("canvas");
+        vi.spyOn(canvas, "getContext").mockReturnValue(gl);
+        const renderer = GlassWebglRenderer.create(canvas)!;
+        const hiResScene = document.createElement("canvas");
+        hiResScene.width = 2400;
+        hiResScene.height = 1200;
+        renderer.setSceneCanvas(hiResScene, 1);
+        const uploadedScene = (gl.texImage2D as ReturnType<typeof vi.fn>).mock.calls[0]?.[5] as HTMLCanvasElement;
+        expect(uploadedScene.width).toBe(2400);
+        expect(uploadedScene.height).toBe(1200);
+
+        const baseFrame = {
+            width: 300,
+            height: 200,
+            radius: 20,
+            bezel: 14,
+            thickness: 40,
+            scaleRatio: 2,
+            ior: 1.5,
+            surface: "convex_squircle" as const,
+            tintColor: [1, 1, 1] as [number, number, number],
+            tintOpacity: 0.12,
+            highlight: 0.7,
+            sceneRect: { relX: 0.2, relY: 0.2, relW: 0.4, relH: 0.4 },
+        };
+
+        const lastSharpness = () =>
+            uniform1fCalls.filter(({ loc }) => (loc as { name: string }).name === "uSharpness").at(-1)?.val;
+
+        renderer.render({ ...baseFrame, blur: 4 });
+        expect(lastSharpness()).toBe(0);
+        expect(canvas.width).toBe(600);
+
+        renderer.render({ ...baseFrame, blur: 0 });
+        expect(lastSharpness()).toBe(DEFAULT_CLEAR_SHARPNESS);
+        expect(canvas.width).toBe(990);
+
+        // Explicit sharpness: 0 disables both auto-sharpness and supersampling boost.
+        renderer.render({ ...baseFrame, blur: 0, sharpness: 0 });
+        expect(lastSharpness()).toBe(0);
+        expect(canvas.width).toBe(600);
+
+        // Explicit sharpness: 1 renders at 4x supersampling even when blur > 0.
+        renderer.render({ ...baseFrame, blur: 4, sharpness: 1 });
+        expect(lastSharpness()).toBe(1);
+        expect(canvas.width).toBe(1200);
+
+        expect(shaderSources.some((src) => src.includes("applySceneSharpening"))).toBe(true);
+        expect(shaderSources.some((src) => src.includes("sampleSharpInterior"))).toBe(true);
+        renderer.dispose();
     });
 });

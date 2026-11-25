@@ -27,6 +27,7 @@ export function resolveRefractionTravel(span: number, bezel: number): number {
 }
 
 export function getOpticalLutPeak(lut: Uint8Array): number {
+    if (lut.length < 4) return 0;
     let peak = 0;
     let normal = (lut[0]! * 256 + lut[1]!) - 32767;
     let refraction = (lut[2]! * 256 + lut[3]!) - 32767;

@@ -1,10 +1,20 @@
 import { automaticRoundedPixelRatio, resizeCanvas, SMALL_FRAME_PIXELS, SMALL_SCENE_DIMENSION, useSmallMemoryBudget } from "./renderBudget.js";
 import type { CoalescencePeer } from "./coalescence.js";
 import type { GlassCornerStyle, GlassRefractionDirection, GlassSurface } from "./types.js";
-import { resolveChromaticAberration, resolveCornerStyle, resolveGlassSaturation, resolveSurfaceId } from "./config.js";
-import { buildOpticalLut, OPTICAL_LUT_SIZE } from "./optics.js";
+import {
+    CHROMATIC_BLUE_SHIFT_RATIO,
+    CHROMATIC_RED_SHIFT_RATIO,
+    resolveChromaticChannelScales,
+    resolveCornerStyle,
+    resolveEffectiveChromaticAberration,
+    resolveGlassSaturation,
+    resolveGlassSharpness,
+    resolveSharpnessPixelRatio,
+    resolveSurfaceId,
+} from "./config.js";
+import { buildOpticalLut, OPTICAL_LUT_SIZE, resolveGlassMedium, type GlassMediumCoefficients } from "./optics.js";
 import { getOpticalLutPeak, getRefractionDirectionId, getRefractionSpan, resolveRefractionBezel, resolveRefractionEdgeFade, resolveRefractionTravel } from "./refractionBounds.js";
-import { OpticalTransferCache } from "./opticalTransfer.js";
+import { buildWebgl2Sources, canAllocateOpticalTransfer, OpticalTransferCache } from "./opticalTransfer.js";
 import { parseCssColorToRgb } from "./cssColor.js";
 
 export { parseCssColorToRgb };
@@ -24,6 +34,7 @@ export interface GlassFrameParams {
     scaleRatio: number;
     ior: number;
     blur: number;
+    sharpness?: number;
     saturation?: number;
     surface: GlassSurface;
     tintColor: [number, number, number];
@@ -94,12 +105,15 @@ uniform vec4 uGeom;
 uniform vec4 uOptical;
 uniform vec2 uRefraction;
 uniform vec4 uTint;
+uniform vec4 uMedium;
 uniform float uSaturation;
+uniform float uSharpness;
 uniform vec4 uHighlight;
 uniform vec4 uSceneRect;
 uniform sampler2D uSceneTex;
 uniform float uHasSceneTex;
 uniform float uDpr;
+uniform vec2 uPixelSize;
 uniform sampler2D uOpticalLut;
 uniform vec2 uLutScale;
 uniform float uInteriorMargin;
@@ -122,6 +136,7 @@ uniform highp sampler2D uTransferLighting;
 #endif
 
 const vec3 HALF_PRIMARY = vec3(-0.199003, 0.479950, 0.854427);
+const vec3 HALF_SECONDARY = vec3(0.214176, -0.464049, 0.859528);
 
 const vec2 DECODE_LUT16 = vec2(65280.0 / 32767.0, 255.0 / 32767.0);
 
@@ -154,6 +169,33 @@ float evalSquircleSd(vec2 qPlus, float radius) {
     return (major * m4 - radius) * (m2 * m4 * inversesqrt(1.0 + r3 * r3));
 }
 
+float edgeCoverage(float sd, vec2 gradient) {
+    // Project the pixel box onto the local gradient of the signed distance.
+    vec2 projected = abs(gradient) * uPixelSize;
+    float rawMajor = max(max(projected.x, projected.y), 1e-5);
+    float rawMinor = min(projected.x, projected.y);
+    // Widen the AA filter footprint on curved arcs (circles, pills, rounded corners)
+    // so shallow curves do not show 1px box-filter stair-stepping.
+    float curveBlend = smoothstep(0.0, 0.35, rawMinor / rawMajor);
+    float filterScale = mix(1.0, 1.48, curveBlend);
+    float major = rawMajor * filterScale;
+    float minor = rawMinor * filterScale;
+    float absSd = abs(sd);
+    float plateau = (major - minor) * 0.5;
+    float coverage;
+    if (absSd <= plateau) {
+        coverage = 0.5 - sd / major;
+    } else {
+        // Beyond the central strip, the area on the smaller side is a triangle.
+        float tail = max(0.0, (major + minor) * 0.5 - absSd);
+        float triangleArea = tail * tail / (2.0 * major * max(minor, 1e-5));
+        coverage = sd > 0.0 ? triangleArea : 1.0 - triangleArea;
+    }
+    float clampedCov = clamp(coverage, 0.0, 1.0);
+    float softCov = clampedCov * clampedCov * (3.0 - 2.0 * clampedCov);
+    return mix(clampedCov, softCov, 0.35 * curveBlend);
+}
+
 vec2 sampleOpticalLut16(float depthT) {
     float fIdx = clamp(depthT, 0.0, 1.0) * uLutScale.x;
     float i0 = floor(fIdx);
@@ -178,34 +220,46 @@ float evalAmbientSheen(vec2 uv) {
     float smoothDeltaX = sqrt((uv.x - shiftedCenter.x) * (uv.x - shiftedCenter.x) + 0.015);
     float archTerm = clamp(uv.y * 0.90 + 0.08 + shiftedCenter.y - smoothDeltaX * 0.36, 0.0, 1.0);
     float archTermSq = archTerm * archTerm;
-    float topArchSheen = archTermSq * archTerm * (0.82 + 0.18 * archTerm) * 0.032;
+    float topArchSheen = archTermSq * archTerm * (0.82 + 0.18 * archTerm) * 0.068;
     float bounceTerm = clamp((0.45 - uv.y - shiftedCenter.y * 0.5) * 2.222222, 0.0, 1.0);
-    float bottomBounce = bounceTerm * bounceTerm * (0.83 + 0.17 * bounceTerm) * 0.016;
+    float bottomBounce = bounceTerm * bounceTerm * (0.83 + 0.17 * bounceTerm) * 0.030;
     return topArchSheen + bottomBounce;
 }
 
 float compressHighlight(float rawHighlight) {
     float clamped = max(0.0, rawHighlight);
-    return clamp(clamped / (1.0 + 0.55 * clamped), 0.0, 0.52);
+    return clamp(clamped / (1.0 + 0.50 * clamped), 0.0, 0.60);
 }
+
+#ifndef LG_TRANSFER_BUILD
+vec4 sampleSceneTex(vec2 uv) {
+#ifdef LG_WEBGL2
+    vec2 gradX = vec2((uSceneRect.z / max(1.0, uSize.x)) * uPixelSize.x, 0.0);
+    vec2 gradY = vec2(0.0, (uSceneRect.w / max(1.0, uSize.y)) * uPixelSize.y);
+    return textureGrad(uSceneTex, uv, gradX, gradY);
+#else
+    return texture2D(uSceneTex, uv);
+#endif
+}
+#endif
 
 #if defined(LG_SAMPLE_BLUR) || defined(LG_INTERIOR_PASS) || (!defined(LG_TRANSFER_BUILD) && !defined(LG_TRANSFER_SAMPLE))
 vec3 sampleInteriorBlur5Tap(bool clampUv) {
     if (clampUv) {
-        vec3 centerG = texture2D(uSceneTex, clamp(vSceneUv, 0.002, 0.998)).rgb;
+        vec3 centerG = sampleSceneTex(clamp(vSceneUv, 0.002, 0.998)).rgb;
         vec3 outerSum =
-            texture2D(uSceneTex, clamp(vUv1P, 0.002, 0.998)).rgb +
-            texture2D(uSceneTex, clamp(vUv1M, 0.002, 0.998)).rgb +
-            texture2D(uSceneTex, clamp(vUv2P, 0.002, 0.998)).rgb +
-            texture2D(uSceneTex, clamp(vUv2M, 0.002, 0.998)).rgb;
+            sampleSceneTex(clamp(vUv1P, 0.002, 0.998)).rgb +
+            sampleSceneTex(clamp(vUv1M, 0.002, 0.998)).rgb +
+            sampleSceneTex(clamp(vUv2P, 0.002, 0.998)).rgb +
+            sampleSceneTex(clamp(vUv2M, 0.002, 0.998)).rgb;
         return centerG * 0.24 + outerSum * 0.19;
     }
-    vec3 centerG = texture2D(uSceneTex, vSceneUv).rgb;
+    vec3 centerG = sampleSceneTex(vSceneUv).rgb;
     vec3 outerSum =
-        texture2D(uSceneTex, vUv1P).rgb +
-        texture2D(uSceneTex, vUv1M).rgb +
-        texture2D(uSceneTex, vUv2P).rgb +
-        texture2D(uSceneTex, vUv2M).rgb;
+        sampleSceneTex(vUv1P).rgb +
+        sampleSceneTex(vUv1M).rgb +
+        sampleSceneTex(vUv2P).rgb +
+        sampleSceneTex(vUv2M).rgb;
     return centerG * 0.24 + outerSum * 0.19;
 }
 #endif
@@ -221,31 +275,153 @@ vec3 sampleInteriorBlur() {
 #endif
 
 #if !defined(LG_TRANSFER_BUILD) && (!defined(LG_TRANSFER_SAMPLE) || defined(LG_SAMPLE_CHROMA))
-vec3 sampleSpectralCenter(vec2 rayUv, vec2 chromaR, vec2 chromaB, vec3 centerG, float chromaMix) {
+vec3 sampleSpectralCenter(
+    vec2 rayUv,
+    vec2 chromaR,
+    vec2 chromaB,
+    vec3 centerG,
+    float chromaMix,
+    float dispersionPxSq
+) {
     if (chromaMix <= 0.0) return centerG;
-    vec3 dispersed = vec3(
-        texture2D(uSceneTex, clamp(rayUv - chromaR, 0.002, 0.998)).r,
-        centerG.g,
-        texture2D(uSceneTex, clamp(rayUv + chromaB, 0.002, 0.998)).b
+    vec2 uvR = clamp(rayUv - chromaR, 0.002, 0.998);
+    vec2 uvB = clamp(rayUv + chromaB, 0.002, 0.998);
+    float redSample = sampleSceneTex(uvR).r;
+    float blueSample = sampleSceneTex(uvB).b;
+    vec3 dualDispersed = vec3(redSample, centerG.g, blueSample);
+    if (dispersionPxSq <= 2.25) {
+        return mix(centerG, dualDispersed, chromaMix);
+    }
+    vec2 uvY = clamp(rayUv - chromaR * 0.35, 0.002, 0.998);
+    vec2 uvC = clamp(rayUv + chromaB * 0.44, 0.002, 0.998);
+    vec2 sampleY = sampleSceneTex(uvY).rg;
+    vec2 sampleC = sampleSceneTex(uvC).gb;
+    vec3 quadDispersed = vec3(
+        redSample * 0.62 + sampleY.x * 0.38,
+        sampleY.y * 0.22 + centerG.g * 0.56 + sampleC.x * 0.22,
+        sampleC.y * 0.38 + blueSample * 0.62
     );
-    return mix(centerG, dispersed, chromaMix);
+    float quadBlend = smoothstep(2.25, 6.25, dispersionPxSq);
+    return mix(centerG, mix(dualDispersed, quadDispersed, quadBlend), chromaMix);
+}
+
+vec2 sampleSpectralBlur5Tap(
+    vec2 rayUv,
+    vec2 chromaR,
+    vec2 chromaB,
+    vec2 tap1,
+    vec2 tap2,
+    float centerWeight,
+    float crossWeight
+) {
+    vec2 uvR = rayUv - chromaR;
+    vec2 uvB = rayUv + chromaB;
+#ifdef LG_WEBGL2
+    vec2 baseGradX = vec2((uSceneRect.z / max(1.0, uSize.x)) * uPixelSize.x, 0.0);
+    vec2 baseGradY = vec2(0.0, (uSceneRect.w / max(1.0, uSize.y)) * uPixelSize.y);
+    float spanX = max(abs(tap1.x), abs(tap2.x));
+    float spanY = max(abs(tap1.y), abs(tap2.y));
+    if (centerWeight >= 0.26) {
+        vec2 blurGradX = vec2(max(spanX * 1.45, baseGradX.x), 0.0);
+        vec2 blurGradY = vec2(0.0, max(spanY * 1.45, baseGradY.y));
+        float redBlur = textureGrad(uSceneTex, clamp(uvR, 0.002, 0.998), blurGradX, blurGradY).r;
+        float blueBlur = textureGrad(uSceneTex, clamp(uvB, 0.002, 0.998), blurGradX, blurGradY).b;
+        return vec2(redBlur, blueBlur);
+    }
+    vec2 dipoleStep = (tap1 + tap2) * 0.36;
+    vec2 dipoleGradX = vec2(max(spanX * 1.05, baseGradX.x), 0.0);
+    vec2 dipoleGradY = vec2(0.0, max(spanY * 1.05, baseGradY.y));
+    float redBlur = 0.5 * (
+        textureGrad(uSceneTex, clamp(uvR + dipoleStep, 0.002, 0.998), dipoleGradX, dipoleGradY).r +
+        textureGrad(uSceneTex, clamp(uvR - dipoleStep, 0.002, 0.998), dipoleGradX, dipoleGradY).r
+    );
+    float blueBlur = 0.5 * (
+        textureGrad(uSceneTex, clamp(uvB + dipoleStep, 0.002, 0.998), dipoleGradX, dipoleGradY).b +
+        textureGrad(uSceneTex, clamp(uvB - dipoleStep, 0.002, 0.998), dipoleGradX, dipoleGradY).b
+    );
+    return vec2(redBlur, blueBlur);
+#else
+    float redBlur =
+        sampleSceneTex(clamp(uvR, 0.002, 0.998)).r * centerWeight +
+        (sampleSceneTex(clamp(uvR + tap1, 0.002, 0.998)).r +
+         sampleSceneTex(clamp(uvR - tap1, 0.002, 0.998)).r +
+         sampleSceneTex(clamp(uvR + tap2, 0.002, 0.998)).r +
+         sampleSceneTex(clamp(uvR - tap2, 0.002, 0.998)).r) * crossWeight;
+    float blueBlur =
+        sampleSceneTex(clamp(uvB, 0.002, 0.998)).b * centerWeight +
+        (sampleSceneTex(clamp(uvB + tap1, 0.002, 0.998)).b +
+         sampleSceneTex(clamp(uvB - tap1, 0.002, 0.998)).b +
+         sampleSceneTex(clamp(uvB + tap2, 0.002, 0.998)).b +
+         sampleSceneTex(clamp(uvB - tap2, 0.002, 0.998)).b) * crossWeight;
+    return vec2(redBlur, blueBlur);
+#endif
 }
 #endif
 
 #if !defined(LG_TRANSFER_BUILD) && (!defined(LG_TRANSFER_SAMPLE) || defined(LG_SAMPLE_BLUR) || defined(LG_SAMPLE_CLEAR))
-vec3 sampleBorderScene(vec2 rayUv, vec2 dispUv, float chromaSpread, vec2 blurUv, float chromaMix) {
+vec3 applySceneSharpening(vec2 rayUv, vec3 centerColor, vec2 sharpStep, float sharpness) {
+    if (sharpness <= 0.0001) return centerColor;
+    vec3 tapN = sampleSceneTex(clamp(rayUv + vec2(0.0, sharpStep.y), 0.002, 0.998)).rgb;
+    vec3 tapS = sampleSceneTex(clamp(rayUv - vec2(0.0, sharpStep.y), 0.002, 0.998)).rgb;
+    vec3 tapE = sampleSceneTex(clamp(rayUv + vec2(sharpStep.x, 0.0), 0.002, 0.998)).rgb;
+    vec3 tapW = sampleSceneTex(clamp(rayUv - vec2(sharpStep.x, 0.0), 0.002, 0.998)).rgb;
+    vec3 neighborAvg = (tapN + tapS + tapE + tapW) * 0.25;
+    vec3 neighborMin = min(centerColor, min(min(tapN, tapS), min(tapE, tapW)));
+    vec3 neighborMax = max(centerColor, max(max(tapN, tapS), max(tapE, tapW)));
+    vec3 detail = centerColor - neighborAvg;
+    float haloMargin = 0.04 * sharpness;
+    return clamp(
+        centerColor + detail * (sharpness * 0.45),
+        max(vec3(0.0), neighborMin - haloMargin),
+        min(vec3(1.0), neighborMax + haloMargin)
+    );
+}
+
+vec3 sampleBorderScene(
+    vec2 rayUv,
+    vec2 dispUv,
+    float chromaSpread,
+    vec2 blurUv,
+    vec2 sharpStep,
+    float chromaMix,
+    float dispersionPxSq,
+    float sharpness
+) {
     vec2 uvG = clamp(rayUv, 0.002, 0.998);
-    vec3 centerG = texture2D(uSceneTex, uvG).rgb;
+    vec3 centerG = sampleSceneTex(uvG).rgb;
 #if !defined(LG_TRANSFER_SAMPLE) || defined(LG_SAMPLE_CHROMA)
-    vec2 chromaR = dispUv * min(chromaSpread * 0.72, 1.0);
-    vec2 chromaB = dispUv * (chromaSpread * 1.28);
+    vec2 chromaR = vec2(0.0);
+    vec2 chromaB = vec2(0.0);
+    if (chromaMix > 0.0) {
+        chromaR = dispUv * min(chromaSpread * ${CHROMATIC_RED_SHIFT_RATIO.toFixed(2)}, 1.0);
+        chromaB = dispUv * (chromaSpread * ${CHROMATIC_BLUE_SHIFT_RATIO.toFixed(2)});
+    }
 #endif
     float blurExtent = max(blurUv.x, blurUv.y);
     if (blurExtent <= 0.00001) {
+        vec2 invSharpStep = vec2(1.0) / max(sharpStep, vec2(1e-6));
+        float dispStrength = length(dispUv * invSharpStep) * 0.65;
+        float rgssWeight = smoothstep(0.25, 3.8, dispStrength);
+        vec3 filteredG = centerG;
+        if (rgssWeight > 0.01) {
+            vec2 rgssRadius = sharpStep * (0.55 * rgssWeight);
+            vec2 rgssA = vec2(0.35, 0.85) * rgssRadius;
+            vec2 rgssB = vec2(-0.85, 0.35) * rgssRadius;
+            vec3 rgssSample = (
+                sampleSceneTex(clamp(uvG + rgssA, 0.002, 0.998)).rgb +
+                sampleSceneTex(clamp(uvG - rgssA, 0.002, 0.998)).rgb +
+                sampleSceneTex(clamp(uvG + rgssB, 0.002, 0.998)).rgb +
+                sampleSceneTex(clamp(uvG - rgssB, 0.002, 0.998)).rgb
+            ) * 0.25;
+            filteredG = mix(centerG, rgssSample, rgssWeight * 0.85);
+        }
+        vec3 crispG = applySceneSharpening(uvG, filteredG, sharpStep, sharpness);
 #if !defined(LG_TRANSFER_SAMPLE) || defined(LG_SAMPLE_CHROMA)
-        return sampleSpectralCenter(rayUv, chromaR, chromaB, centerG, chromaMix);
+        if (chromaMix <= 0.0) return crispG;
+        vec3 spectral = sampleSpectralCenter(rayUv, chromaR, chromaB, filteredG, chromaMix, dispersionPxSq);
+        return clamp(crispG + (spectral - filteredG), 0.0, 1.0);
 #else
-        return centerG;
+        return crispG;
 #endif
     }
 
@@ -255,111 +431,159 @@ vec3 sampleBorderScene(vec2 rayUv, vec2 dispUv, float chromaSpread, vec2 blurUv,
         vec2 tap1 = offset1 * 0.64;
         vec2 tap2 = offset2 * 0.64;
         vec3 crossSum =
-            texture2D(uSceneTex, clamp(uvG + tap1, 0.002, 0.998)).rgb +
-            texture2D(uSceneTex, clamp(uvG - tap1, 0.002, 0.998)).rgb +
-            texture2D(uSceneTex, clamp(uvG + tap2, 0.002, 0.998)).rgb +
-            texture2D(uSceneTex, clamp(uvG - tap2, 0.002, 0.998)).rgb;
+            sampleSceneTex(clamp(uvG + tap1, 0.002, 0.998)).rgb +
+            sampleSceneTex(clamp(uvG - tap1, 0.002, 0.998)).rgb +
+            sampleSceneTex(clamp(uvG + tap2, 0.002, 0.998)).rgb +
+            sampleSceneTex(clamp(uvG - tap2, 0.002, 0.998)).rgb;
+        vec3 baseSmall = centerG * 0.28 + crossSum * 0.18;
+        vec3 smallSample = baseSmall;
 #if !defined(LG_TRANSFER_SAMPLE) || defined(LG_SAMPLE_CHROMA)
-        centerG = sampleSpectralCenter(rayUv, chromaR, chromaB, centerG, chromaMix);
+        if (chromaMix > 0.0) {
+            vec2 dispersedRb = sampleSpectralBlur5Tap(rayUv, chromaR, chromaB, tap1, tap2, 0.28, 0.18);
+            smallSample = mix(baseSmall, vec3(dispersedRb.x, baseSmall.g, dispersedRb.y), chromaMix);
+        }
 #endif
-        return centerG * 0.28 + crossSum * 0.18;
+        if (sharpness > 0.0001) {
+            vec3 crispSmall = applySceneSharpening(uvG, centerG, sharpStep, sharpness);
+            return clamp(mix(smallSample, crispSmall + (smallSample - baseSmall), sharpness * 0.35), 0.0, 1.0);
+        }
+        return smallSample;
     }
 
     vec2 inner1 = (offset1 + offset2) * 0.36;
     vec2 inner2 = (offset1 - offset2) * 0.36;
     vec3 innerSum =
-        texture2D(uSceneTex, clamp(uvG + inner1, 0.002, 0.998)).rgb +
-        texture2D(uSceneTex, clamp(uvG - inner1, 0.002, 0.998)).rgb +
-        texture2D(uSceneTex, clamp(uvG + inner2, 0.002, 0.998)).rgb +
-        texture2D(uSceneTex, clamp(uvG - inner2, 0.002, 0.998)).rgb;
+        sampleSceneTex(clamp(uvG + inner1, 0.002, 0.998)).rgb +
+        sampleSceneTex(clamp(uvG - inner1, 0.002, 0.998)).rgb +
+        sampleSceneTex(clamp(uvG + inner2, 0.002, 0.998)).rgb +
+        sampleSceneTex(clamp(uvG - inner2, 0.002, 0.998)).rgb;
     vec3 outerSum =
-        texture2D(uSceneTex, clamp(uvG + offset1, 0.002, 0.998)).rgb +
-        texture2D(uSceneTex, clamp(uvG - offset1, 0.002, 0.998)).rgb +
-        texture2D(uSceneTex, clamp(uvG + offset2, 0.002, 0.998)).rgb +
-        texture2D(uSceneTex, clamp(uvG - offset2, 0.002, 0.998)).rgb;
+        sampleSceneTex(clamp(uvG + offset1, 0.002, 0.998)).rgb +
+        sampleSceneTex(clamp(uvG - offset1, 0.002, 0.998)).rgb +
+        sampleSceneTex(clamp(uvG + offset2, 0.002, 0.998)).rgb +
+        sampleSceneTex(clamp(uvG - offset2, 0.002, 0.998)).rgb;
     vec3 base = centerG * 0.20 + innerSum * 0.12 + outerSum * 0.08;
+    vec3 blurredSample = base;
 #if !defined(LG_TRANSFER_SAMPLE) || defined(LG_SAMPLE_CHROMA)
-    if (chromaMix <= 0.0) return base;
-
-    float coreGain = uHighlight.w > 0.0 ? 1.15 : 1.0;
-    vec2 chromaRBlur = dispUv * min(chromaSpread * 0.72, 1.0 / coreGain);
-    vec2 uvR = clamp(rayUv - chromaRBlur * coreGain, 0.002, 0.998);
-    vec2 uvB = clamp(rayUv + chromaB * coreGain, 0.002, 0.998);
-    float rCore = texture2D(uSceneTex, uvR).r * 0.24 +
-        (texture2D(uSceneTex, clamp(rayUv + inner1 - chromaRBlur, 0.002, 0.998)).r +
-         texture2D(uSceneTex, clamp(rayUv - inner1 - chromaRBlur, 0.002, 0.998)).r) * 0.22;
-    float bCore = texture2D(uSceneTex, uvB).b * 0.24 +
-        (texture2D(uSceneTex, clamp(rayUv + inner2 + chromaB, 0.002, 0.998)).b +
-         texture2D(uSceneTex, clamp(rayUv - inner2 + chromaB, 0.002, 0.998)).b) * 0.22;
-    vec3 dispersed = vec3(rCore + outerSum.r * 0.08, base.g, bCore + outerSum.b * 0.08);
-    return mix(base, dispersed, chromaMix);
-#else
-    return base;
+    if (chromaMix > 0.0) {
+        vec2 dispersedRb = sampleSpectralBlur5Tap(rayUv, chromaR, chromaB, offset1 * 0.76, offset2 * 0.76, 0.24, 0.19);
+        blurredSample = mix(base, vec3(dispersedRb.x, base.g, dispersedRb.y), chromaMix);
+    }
 #endif
+    if (sharpness > 0.0001) {
+        vec3 crispLarge = applySceneSharpening(uvG, centerG, sharpStep, sharpness);
+        return clamp(mix(blurredSample, crispLarge + (blurredSample - base), sharpness * 0.35), 0.0, 1.0);
+    }
+    return blurredSample;
+}
+#endif
+
+#if !defined(LG_TRANSFER_BUILD) && (defined(LG_INTERIOR_PASS) || !defined(LG_TRANSFER_SAMPLE) || defined(LG_SAMPLE_BLUR) || defined(LG_SAMPLE_CLEAR))
+vec3 sampleSharpInterior(vec2 sceneUv, vec3 centerColor, float sharpness, bool isBlurred) {
+    if (sharpness <= 0.0001) return centerColor;
+    vec2 uvPerCssPx = vec2(
+        uSceneRect.z / max(1.0, uSize.x),
+        uSceneRect.w / max(1.0, uSize.y)
+    );
+    vec2 sharpStep = uvPerCssPx * 0.65;
+    vec2 clampedUv = clamp(sceneUv, 0.002, 0.998);
+    if (!isBlurred) {
+        vec3 tapN = sampleSceneTex(clamp(clampedUv + vec2(0.0, sharpStep.y), 0.002, 0.998)).rgb;
+        vec3 tapS = sampleSceneTex(clamp(clampedUv - vec2(0.0, sharpStep.y), 0.002, 0.998)).rgb;
+        vec3 tapE = sampleSceneTex(clamp(clampedUv + vec2(sharpStep.x, 0.0), 0.002, 0.998)).rgb;
+        vec3 tapW = sampleSceneTex(clamp(clampedUv - vec2(sharpStep.x, 0.0), 0.002, 0.998)).rgb;
+        vec3 neighborAvg = (tapN + tapS + tapE + tapW) * 0.25;
+        vec3 neighborMin = min(centerColor, min(min(tapN, tapS), min(tapE, tapW)));
+        vec3 neighborMax = max(centerColor, max(max(tapN, tapS), max(tapE, tapW)));
+        float haloMargin = 0.04 * sharpness;
+        return clamp(
+            centerColor + (centerColor - neighborAvg) * (sharpness * 0.45),
+            max(vec3(0.0), neighborMin - haloMargin),
+            min(vec3(1.0), neighborMax + haloMargin)
+        );
+    }
+    vec3 rawCenter = sampleSceneTex(clampedUv).rgb;
+    vec3 tapN = sampleSceneTex(clamp(clampedUv + vec2(0.0, sharpStep.y), 0.002, 0.998)).rgb;
+    vec3 tapS = sampleSceneTex(clamp(clampedUv - vec2(0.0, sharpStep.y), 0.002, 0.998)).rgb;
+    vec3 tapE = sampleSceneTex(clamp(clampedUv + vec2(sharpStep.x, 0.0), 0.002, 0.998)).rgb;
+    vec3 tapW = sampleSceneTex(clamp(clampedUv - vec2(sharpStep.x, 0.0), 0.002, 0.998)).rgb;
+    vec3 neighborAvg = (tapN + tapS + tapE + tapW) * 0.25;
+    vec3 neighborMin = min(rawCenter, min(min(tapN, tapS), min(tapE, tapW)));
+    vec3 neighborMax = max(rawCenter, max(max(tapN, tapS), max(tapE, tapW)));
+    float haloMargin = 0.04 * sharpness;
+    vec3 crispCenter = clamp(
+        rawCenter + (rawCenter - neighborAvg) * (sharpness * 0.45),
+        max(vec3(0.0), neighborMin - haloMargin),
+        min(vec3(1.0), neighborMax + haloMargin)
+    );
+    return mix(centerColor, crispCenter, sharpness * 0.35);
 }
 #endif
 
 float spectralMix(vec2 shiftPx) {
-    return smoothstep(0.0001, 0.25, dot(shiftPx, shiftPx));
+    return smoothstep(0.0625, 0.5625, dot(shiftPx, shiftPx));
 }
 
-vec4 applyGlassMedium(vec3 sceneColor, vec3 baseGlass) {
+vec4 applyGlassMedium(vec3 sceneColor) {
     float luma = dot(sceneColor, vec3(0.299, 0.587, 0.114));
-    float satMix = step(2.199, uHighlight.w);
     vec3 vibrantScene;
     if (uSaturation < 0.0) {
-        vibrantScene = clamp(mix(vec3(luma), sceneColor, 1.0 + 1.05 * satMix) * (1.0 + 0.03 * satMix), 0.0, 1.0);
+        vibrantScene = uHighlight.w >= 2.199
+            ? clamp(mix(vec3(luma), sceneColor, 2.05) * 1.03, 0.0, 1.0)
+            : sceneColor;
     } else if (uSaturation == 1.0) {
         vibrantScene = sceneColor;
     } else {
         float filterLuma = dot(sceneColor, vec3(0.213, 0.715, 0.072));
         vibrantScene = clamp(mix(vec3(filterLuma), sceneColor, uSaturation), 0.0, 1.0);
     }
-    float tintAlpha = clamp(uTint.a, 0.0, 0.85);
-    float tintChroma = max(max(baseGlass.r, baseGlass.g), baseGlass.b) - min(min(baseGlass.r, baseGlass.g), baseGlass.b);
-    vec3 frostedTint = mix(vibrantScene, baseGlass, tintAlpha);
-    float pathScale = 0.75 + clamp(uOptical.y, 0.0, 160.0) * 0.014;
-    vec3 opticalTransmittance = exp(-tintAlpha * pathScale * (vec3(1.0) - baseGlass));
-    vec3 opticalAbsorption = vibrantScene * opticalTransmittance;
-    vec3 tintedScene = mix(frostedTint, opticalAbsorption, clamp(tintChroma * 1.1, 0.0, 0.85));
-    return vec4(tintedScene, luma);
+    return vec4(vibrantScene * uMedium.rgb + uTint.rgb * uMedium.a, luma);
 }
 
 vec3 compositeInteriorScene(vec3 sceneColor, float ambientSheen) {
-    vec4 medium = applyGlassMedium(sceneColor, uTint.rgb);
-    float ambientSheenScale = mix(0.35, 1.0, smoothstep(0.08, 0.45, medium.a));
+    vec4 medium = applyGlassMedium(sceneColor);
+    float ambientSheenScale = mix(0.42, 1.0, smoothstep(0.08, 0.45, medium.a));
     float effectiveHighlight = compressHighlight((ambientSheen * ambientSheenScale) * uHighlight.x);
-    return clamp(mix(medium.rgb, vec3(1.0), effectiveHighlight * 0.44), 0.0, 1.0);
+    return clamp(mix(medium.rgb, vec3(1.0), effectiveHighlight * 0.34), 0.0, 1.0);
 }
 
 float computeWhiteRimFactor(float baseRimTerms, float ambientSheen, float ambientSheenScale) {
-    float rimHighlight = clamp(baseRimTerms * min(1.0, uHighlight.x * 2.5) * 1.15, 0.0, 1.0);
-    float sheenHighlight = compressHighlight(ambientSheen * ambientSheenScale * uHighlight.x) * 0.28;
+    float rawRim = max(0.0, baseRimTerms * min(1.0, uHighlight.x * 2.5) * 1.15);
+    float rimHighlight = clamp(rawRim / (1.0 + 0.18 * rawRim), 0.0, 1.0);
+    float sheenHighlight = compressHighlight(ambientSheen * ambientSheenScale * uHighlight.x) * 0.34;
     return clamp(max(rimHighlight, sheenHighlight), 0.0, 1.0);
 }
 
 vec3 compositeBorderScene(
     vec3 sceneColor,
-    vec3 baseGlass,
     float ambientSheen,
     float baseRimTerms,
     float outerStroke,
     float additiveGlow,
     vec3 interferenceTint
 ) {
-    vec4 medium = applyGlassMedium(sceneColor, baseGlass);
-    float ambientSheenScale = mix(0.35, 1.0, smoothstep(0.08, 0.45, medium.a));
+    vec4 medium = applyGlassMedium(sceneColor);
+    float ambientSheenScale = mix(0.42, 1.0, smoothstep(0.08, 0.45, medium.a));
     float whiteRimFactor = computeWhiteRimFactor(baseRimTerms, ambientSheen, ambientSheenScale);
     vec3 framedScene = mix(medium.rgb, vec3(0.0), outerStroke * (1.0 - whiteRimFactor) * 0.40 * uHighlight.z);
     vec3 litColor = mix(framedScene, vec3(1.0), whiteRimFactor);
-    return clamp(litColor + vec3(1.0) * additiveGlow * uHighlight.x + interferenceTint, 0.0, 1.0);
+    vec3 specularBoost = (vec3(1.0) - litColor * 0.35) * (additiveGlow * uHighlight.x);
+    return clamp(litColor + specularBoost + interferenceTint, 0.0, 1.0);
 }
 
 void main() {
 #ifdef LG_INTERIOR_PASS
-    vec3 interiorScene = sampleInteriorBlur5Tap(uDirectBlurClamp > 0.5);
+    vec3 interiorScene = sampleSharpInterior(
+        vSceneUv,
+        sampleInteriorBlur5Tap(uDirectBlurClamp > 0.5),
+        uSharpness,
+        uHighlight.w > 0.00001
+    );
     gl_FragColor = vec4(compositeInteriorScene(interiorScene, evalAmbientSheen(vUv)), 1.0);
     return;
+#endif
+#ifndef LG_TRANSFER_SAMPLE
+    float edgeAaLimit = 0.78 * length(uPixelSize);
 #endif
 #if defined(LG_SPECIALIZED) && !defined(LG_NO_INTERIOR_FASTPATH)
     vec2 halfExtents = uSize * 0.5;
@@ -380,8 +604,7 @@ void main() {
         outLen = length(qPlus);
         sd = outLen + min(max(q.x, q.y), 0.0) - radius;
     }
-    float aa = 0.85 / max(uDpr, 0.0001);
-    if (sd > aa) {
+    if (sd >= edgeAaLimit) {
         transferGeometry = vec4(0.0);
         transferLighting = vec4(0.0);
         return;
@@ -393,18 +616,9 @@ void main() {
     float cachedSqDist = 0.0;
     if (isSquircleCorner) {
         cachedSqSd = evalSquircleSd(qPlus, radius);
-        if (cachedSqSd > 0.85 / max(uDpr, 0.0001)) {
-            gl_FragColor = vec4(0.0);
-            return;
-        }
         interior = cachedSqSd <= -uInteriorMargin;
     } else {
         cachedSqDist = dot(qPlus, qPlus);
-        float outerRadius = radius + 0.85 / max(uDpr, 0.0001);
-        if (cachedSqDist > outerRadius * outerRadius) {
-            gl_FragColor = vec4(0.0);
-            return;
-        }
         float inset = radius - uInteriorMargin - min(max(q.x, q.y), 0.0);
         interior = inset >= 0.0 && cachedSqDist <= inset * inset;
     }
@@ -428,17 +642,18 @@ void main() {
             gl_FragColor = vec4(texture2D(uInteriorTex, vUv).rgb, 1.0);
             return;
         }
-        vec3 sceneColor = sampleInteriorBlur();
+        vec3 sceneColor = sampleSharpInterior(vSceneUv, sampleInteriorBlur(), uSharpness, true);
 #else
         vec2 sceneUv = vec2(
             uSceneRect.x + vUv.x * uSceneRect.z,
             1.0 - (uSceneRect.y + (1.0 - vUv.y) * uSceneRect.w)
         );
 #ifdef LG_SAMPLE_CLAMP
-        vec3 sceneColor = texture2D(uSceneTex, clamp(sceneUv, 0.002, 0.998)).rgb;
+        vec3 sceneColor = sampleSceneTex(clamp(sceneUv, 0.002, 0.998)).rgb;
 #else
-        vec3 sceneColor = texture2D(uSceneTex, sceneUv).rgb;
+        vec3 sceneColor = sampleSceneTex(sceneUv).rgb;
 #endif
+        sceneColor = sampleSharpInterior(sceneUv, sceneColor, uSharpness, false);
 #endif
         gl_FragColor = vec4(compositeInteriorScene(sceneColor, ambientSheen), 1.0);
         return;
@@ -482,8 +697,8 @@ void main() {
             float dynamicSq = dynamicNdh * dynamicNdh;
             float dynamicQuad = dynamicSq * dynamicSq;
             float dynamicLobe = (dynamicQuad * dynamicQuad) / (12.0 - 11.0 * dynamicSq);
-            float specularRatio = dynamicLobe / max(staticLobe, 1e-4);
-            additiveGlow = clamp(additiveGlow * mix(1.0, specularRatio, clamp(length(uLightTilt), 0.0, 1.0)), 0.0, 0.25);
+            float specularRatio = clamp(dynamicLobe / max(staticLobe, 0.015), 0.25, 2.2);
+            additiveGlow = clamp(additiveGlow * mix(1.0, specularRatio, clamp(length(uLightTilt), 0.0, 1.0)), 0.0, 0.60);
         }
         ambientSheen = evalAmbientSheen(vUv);
     }
@@ -509,6 +724,7 @@ void main() {
         selfSd = outLen + min(max(q.x, q.y), 0.0) - radius;
         edgeNormal = quadrantSign * (outLen > 1e-8 ? qPlus / outLen : vec2(axisSelector, 1.0 - axisSelector));
     }
+    vec2 coverageGradient = edgeNormal;
     float sd = selfSd;
     float proximityFactor = 0.0;
     float saddleBlend = 0.0;
@@ -556,6 +772,7 @@ void main() {
             float hBlend = 4.0 * merged.y * (1.0 - merged.y);
             float smoothH = hBlend * hBlend * (3.0 - 2.0 * hBlend);
             sd = merged.x;
+            coverageGradient = mix(peerNormal, coverageGradient, merged.y);
             if (hBlend > 0.0) {
                 saddleBlend = max(saddleBlend, smoothH * pairProximity);
                 vec2 rawMixedNormal = mix(peerNormal, edgeNormal, merged.y);
@@ -585,8 +802,7 @@ void main() {
         }
     }
 
-    float aa = 0.85 / max(uDpr, 0.0001);
-    if (sd > aa) {
+    if (sd >= edgeAaLimit) {
 #ifdef LG_TRANSFER_BUILD
         transferGeometry = vec4(0.0);
         transferLighting = vec4(0.0);
@@ -605,9 +821,19 @@ void main() {
             float ambientSheen = evalAmbientSheen(vUv);
             vec3 sceneColor;
             if (uHighlight.w <= 0.00001) {
-                sceneColor = texture2D(uSceneTex, clamp(vSceneUv, 0.002, 0.998)).rgb;
+                sceneColor = sampleSharpInterior(
+                    vSceneUv,
+                    sampleSceneTex(clamp(vSceneUv, 0.002, 0.998)).rgb,
+                    uSharpness,
+                    false
+                );
             } else {
-                sceneColor = sampleInteriorBlur5Tap(uDirectBlurClamp > 0.5);
+                sceneColor = sampleSharpInterior(
+                    vSceneUv,
+                    sampleInteriorBlur5Tap(uDirectBlurClamp > 0.5),
+                    uSharpness,
+                    true
+                );
             }
             gl_FragColor = vec4(compositeInteriorScene(sceneColor, ambientSheen), 1.0);
             return;
@@ -633,22 +859,16 @@ void main() {
     vec2 edgeNormal = isSquircleCorner
         ? quadrantSign * squircleNormal
         : quadrantSign * (outLen > 1e-8 ? qPlus / outLen : vec2(axisSelector, 1.0 - axisSelector));
+    vec2 coverageGradient = edgeNormal;
 #endif
-    float edgeAA = 1.0;
-    if (sd > -aa) {
-        vec2 pixelNormal = abs(edgeNormal);
-        float majorAxis = max(pixelNormal.x, pixelNormal.y);
-        float minorAxis = min(pixelNormal.x, pixelNormal.y);
-        float aaSpan = max(0.85, majorAxis + minorAxis * 0.414214);
-        float linearCov = clamp(0.5 - (sd * uDpr) / aaSpan, 0.0, 1.0);
-        edgeAA = linearCov * linearCov * (3.0 - 2.0 * linearCov);
-    }
+    float edgeAA = sd <= -edgeAaLimit ? 1.0 : edgeCoverage(sd, coverageGradient);
     float invDpr = 1.0 / max(uDpr, 0.0001);
-    float insideEdgeMask = smoothstep(0.0, aa * 1.2, -sd);
+    float pixelSpan = max(invDpr, max(uPixelSize.x, uPixelSize.y));
+    float insideEdgeMask = smoothstep(-0.08 * pixelSpan, 1.48 * pixelSpan, -sd);
     float dprScale = max(1.0, uDpr * 0.75);
-    float rimInset = max(0.24 / dprScale, 0.44 * invDpr);
+    float rimInset = max(0.32 / dprScale, 0.58 * pixelSpan);
     float absSdRim = abs(sd + rimInset);
-    float hairlineWidth = max(0.85 / dprScale, 1.55 * invDpr);
+    float hairlineWidth = max(0.95 / dprScale, 1.68 * invDpr);
     float hairlineRatio = absSdRim / (hairlineWidth * 0.34);
     float hairlineInv = 1.0 / (1.0 + hairlineRatio * hairlineRatio);
     float hairline = hairlineInv * hairlineInv * insideEdgeMask;
@@ -660,11 +880,12 @@ void main() {
     float meniscusTilt = 0.0;
     vec3 domeNormal = vec3(0.0, 0.0, 1.0);
     vec2 dispDir = vec2(0.0);
-    float specSharp1 = 0.071558949;
+    float specSharp1 = 0.0;
+    float specSharp2 = 0.0;
     if (depthInBezel < 1.0) {
         float interiorShift = bezel * (0.08 + 0.38 * depthInBezel * depthInBezel);
         vec2 rawShift = q + interiorShift;
-        float smoothCornerEps = max(bezel * 0.08, 0.25);
+        float smoothCornerEps = radius > 0.5 ? max(bezel * 0.035, 0.12) : max(bezel * 0.16, 0.5);
         vec2 bezelVec = rawShift + sqrt(rawShift * rawShift + vec2(smoothCornerEps));
         vec2 rawBezelNormal = quadrantSign * (bezelVec * inversesqrt(dot(bezelVec, bezelVec)));
         vec2 bezelNormal = rawBezelNormal;
@@ -679,10 +900,8 @@ void main() {
         meniscusTilt = inBezelMask / (tiltDenom * tiltDenom);
         domeNormal = vec3(bezelNormal * xyMag, sqrt(max(0.0, 1.0 - xyMag * xyMag)));
         dispDir = (uRefraction.x > 0.5 ? edgeNormal : bezelNormal) * abs(xyMag);
-#ifdef LG_TRANSFER_BUILD
-        if (hairline > 1e-4) {
-#else
-        if (hairline > 1e-4 && uHighlight.x > 1e-4) {
+#ifndef LG_TRANSFER_BUILD
+        if (uHighlight.x > 1e-4) {
 #endif
             vec3 primaryHalf = dot(uLightTilt, uLightTilt) > 1e-6
                 ? normalize(HALF_PRIMARY + vec3(uLightTilt * 0.30, 0.0))
@@ -691,25 +910,39 @@ void main() {
             float ndoth1Sq = ndoth1 * ndoth1;
             float ndoth1Quad = ndoth1Sq * ndoth1Sq;
             specSharp1 = (ndoth1Quad * ndoth1Quad) / (12.0 - 11.0 * ndoth1Sq);
+
+            vec3 secondaryHalf = dot(uLightTilt, uLightTilt) > 1e-6
+                ? normalize(HALF_SECONDARY - vec3(uLightTilt * 0.24, 0.0))
+                : HALF_SECONDARY;
+            float ndoth2 = clamp(dot(domeNormal, secondaryHalf), 0.0, 1.0);
+            float ndoth2Sq = ndoth2 * ndoth2;
+            float ndoth2Quad = ndoth2Sq * ndoth2Sq;
+            specSharp2 = (ndoth2Quad * ndoth2Quad) / (12.0 - 11.0 * ndoth2Sq);
+#ifndef LG_TRANSFER_BUILD
         }
+#endif
     }
 
     float nxSq = edgeNormal.x * edgeNormal.x;
     float nySq = edgeNormal.y * edgeNormal.y;
     float cornerArc = 4.0 * nxSq * nySq;
     float rimY = clamp(abs(edgeNormal.y), 0.0, 1.0);
-    float rimSmooth = smoothstep(0.48, 0.985, rimY);
+    float rimT = clamp((rimY - 0.68) / 0.32, 0.0, 1.0);
+    float rimSmooth = rimT * rimT * rimT * (rimT * (6.0 * rimT - 15.0) + 10.0);
     float topRimWeight = rimSmooth * rimSmooth;
-    float cornerRimWeight = cornerArc * cornerArc * 0.14 * smoothstep(0.42, 0.90, rimY);
+    float cornerRimWeight = cornerArc * cornerArc * 0.08 * rimSmooth;
     float dualRimWeight = 1.0 - (1.0 - topRimWeight) * (1.0 - cornerRimWeight);
 
-    float fresnelR0 = (uOptical.x - 1.0) / (uOptical.x + 1.0);
-    fresnelR0 *= fresnelR0;
-    float fresnelComplement = clamp(1.0 - domeNormal.z, 0.0, 1.0);
-    float fresnelSq = fresnelComplement * fresnelComplement;
-    float fresnelTerm = fresnelR0 + (1.0 - fresnelR0) * (fresnelSq * fresnelSq * fresnelComplement);
+    float fresnelCosI = clamp(domeNormal.z, 0.0, 1.0);
+    float fresnelN = max(1.01, uOptical.x);
+    float fresnelSinTSq = max(0.0, 1.0 - fresnelCosI * fresnelCosI) / (fresnelN * fresnelN);
+    float fresnelCosT = sqrt(max(0.0, 1.0 - fresnelSinTSq));
+    float fresnelRs = (fresnelCosI - fresnelN * fresnelCosT) / max(1e-5, fresnelCosI + fresnelN * fresnelCosT);
+    float fresnelRp = (fresnelCosT - fresnelN * fresnelCosI) / max(1e-5, fresnelCosT + fresnelN * fresnelCosI);
+    float fresnelTerm = 0.5 * (fresnelRs * fresnelRs + fresnelRp * fresnelRp);
     float fresnelRimBoost = mix(0.88, 1.18, clamp(fresnelTerm * 1.35, 0.0, 1.0));
-    float baseRimTerms = hairline * dualRimWeight * 0.96 * fresnelRimBoost;
+    float verticalRimBias = edgeNormal.y >= 0.0 ? 1.0 : 0.88;
+    float baseRimTerms = hairline * dualRimWeight * 0.96 * verticalRimBias * fresnelRimBoost;
     vec2 displacement = -dispDir * (bezel * refractedTilt * (1.35 + 0.14 * cornerArc));
     displacement *= (0.35 + 0.65 * bridgeNormFactor) * mix(1.0, 0.45, saddleBlend);
     displacement *= 1.0 + 0.10 * interferenceMask * (interferenceWave - 0.5);
@@ -723,20 +956,41 @@ void main() {
         float fadeWidth = max(invDpr, crossHalf * uRefraction.y - halfPixel);
         float t = clamp((crossHalf - abs(crossPosition) - halfPixel) / fadeWidth, 0.0, 1.0);
         float feather = t * t * t * (t * (6.0 * t - 15.0) + 10.0);
-        float mainNormal = dot(edgeNormal, axis);
+        float mainNormal = abs(dot(edgeNormal, axis));
+        float dirT = clamp((mainNormal - 0.45) / 0.55, 0.0, 1.0);
+        float dirSmooth = dirT * dirT * dirT * (dirT * (6.0 * dirT - 15.0) + 10.0);
         displacement = axis * (dot(displacement, axis) * feather);
-        directionalRim = mainNormal * mainNormal * feather;
+        directionalRim = dirSmooth * dirSmooth * feather;
         baseRimTerms = hairline * directionalRim * 0.96 * fresnelRimBoost;
     }
-    float chromaFactor = smoothstep(0.10, 0.88, meniscusTilt) * inBezelMask;
+    float chromaFactor = smoothstep(0.08, 0.82, meniscusTilt) * inBezelMask;
     float ambientSheen = evalAmbientSheen(vUv);
-    float additiveGlow = specSharp1 * 0.015 * hairline * directionalRim;
-    float darkRimWidth = max(0.58 / dprScale, 1.30 * invDpr);
+    float meniscusSpecMask =
+        smoothstep(0.04, 0.24, depthInBezel) *
+        (1.0 - smoothstep(0.30, 0.82, depthInBezel)) *
+        inBezelMask;
+    float bevelSkyLift = max(0.0, domeNormal.y);
+    float bevelDepthShade = max(0.0, -domeNormal.y);
+    float fresnelSpecGain = 0.55 + 0.95 * clamp(fresnelTerm * 1.5, 0.0, 1.0);
+    float additiveGlow =
+        (specSharp1 * 0.20 * hairline +
+            ((specSharp1 * 0.14 + specSharp2 * 0.06) * fresnelSpecGain +
+                bevelSkyLift * bevelSkyLift * fresnelTerm * 0.22) *
+                meniscusSpecMask) *
+        directionalRim;
+    float darkRimWidth = max(0.68 / dprScale, 1.42 * invDpr);
     float darkRimRatio = absSdRim / (darkRimWidth * 0.26);
     float darkRimInv = 1.0 / (1.0 + darkRimRatio * darkRimRatio);
-    float outerStroke = darkRimInv * darkRimInv * insideEdgeMask * (1.0 - saddleBlend) * directionalRim;
+    float outerStroke = clamp(
+        (darkRimInv * darkRimInv * insideEdgeMask +
+            bevelDepthShade * bevelDepthShade * meniscusSpecMask * 0.26) *
+            (1.0 - saddleBlend) *
+            directionalRim,
+        0.0,
+        1.0
+    );
     vec3 interferenceTint = uPeerCount > 0.5
-        ? (0.5 + 0.5 * cos(vec3(0.0, 2.094, 4.188) + interferencePhase)) * (interferenceMask * interferenceWave * 0.09)
+        ? (0.5 - 0.5 * cos(vec3(0.8185, 1.0, 1.1565) * interferencePhase)) * (interferenceMask * interferenceWave * 0.09)
         : vec3(0.0);
 #endif
 
@@ -773,20 +1027,22 @@ void main() {
     vec2 dispUv = dispPx * uvPerCssPx;
     vec2 uvG = sceneUv + dispUv;
     float chromaSpread = uHighlight.y * chromaFactor;
-    float chromaMix = spectralMix(dispPx * (chromaSpread * uDpr));
+    vec2 chromaShiftPx = dispPx * (chromaSpread * uDpr);
+    float dispersionPxSq = dot(chromaShiftPx, chromaShiftPx);
+    float chromaMix = spectralMix(chromaShiftPx);
+    vec2 sharpStep = uvPerCssPx * 0.65;
 #ifdef LG_SAMPLE_BLUR
 #ifndef LG_TRANSFER_SAMPLE
     float rimClarity = smoothstep(0.08, 0.62, depthInBezel);
 #endif
-    float dispAaPx = min(1.35, length(dispPx) * 0.055);
+    float dispAaPx = min(1.45, length(dispPx) * 0.065) * mix(1.0, 0.48, uSharpness);
     vec2 blurUv = uvPerCssPx * max(uHighlight.w * mix(0.45, 1.0, rimClarity), dispAaPx);
-    vec3 sceneColor = sampleBorderScene(uvG, dispUv, chromaSpread, blurUv, chromaMix);
+    vec3 sceneColor = sampleBorderScene(uvG, dispUv, chromaSpread, blurUv, sharpStep, chromaMix, dispersionPxSq, uSharpness);
 #else
-    vec3 sceneColor = sampleBorderScene(uvG, dispUv, chromaSpread, vec2(0.0), chromaMix);
+    vec3 sceneColor = sampleBorderScene(uvG, dispUv, chromaSpread, vec2(0.0), sharpStep, chromaMix, dispersionPxSq, uSharpness);
 #endif
     vec3 finalColor = compositeBorderScene(
         sceneColor,
-        uTint.rgb,
         ambientSheen,
         baseRimTerms,
         outerStroke,
@@ -797,7 +1053,6 @@ void main() {
     return;
 #endif
 #else
-    vec3 baseGlass = uTint.rgb;
     if (uHasSceneTex > 0.5) {
         vec2 uvPerCssPx = vec2(
             uSceneRect.z / max(1.0, uSize.x),
@@ -808,18 +1063,20 @@ void main() {
         vec2 blurUv = vec2(0.0);
         if (uHighlight.w > 0.0) {
             float rimClarity = smoothstep(0.08, 0.62, depthInBezel);
-            float dispAaPx = min(1.35, length(dispPx) * 0.055);
+            float dispAaPx = min(1.45, length(dispPx) * 0.065) * mix(1.0, 0.48, uSharpness);
             blurUv = uvPerCssPx * max(uHighlight.w * mix(0.45, 1.0, rimClarity), dispAaPx);
         }
         vec2 dispUv = dispPx * uvPerCssPx;
         vec2 uvG = vSceneUv + dispUv;
         float chromaSpread = uHighlight.y * chromaFactor;
-        float chromaMix = spectralMix(dispPx * (chromaSpread * uDpr));
-        vec3 sceneColor = sampleBorderScene(uvG, dispUv, chromaSpread, blurUv, chromaMix);
+        vec2 chromaShiftPx = dispPx * (chromaSpread * uDpr);
+        float dispersionPxSq = dot(chromaShiftPx, chromaShiftPx);
+        float chromaMix = spectralMix(chromaShiftPx);
+        vec2 sharpStep = uvPerCssPx * 0.65;
+        vec3 sceneColor = sampleBorderScene(uvG, dispUv, chromaSpread, blurUv, sharpStep, chromaMix, dispersionPxSq, uSharpness);
 
         vec3 finalColor = compositeBorderScene(
             sceneColor,
-            baseGlass,
             ambientSheen,
             baseRimTerms,
             outerStroke,
@@ -833,7 +1090,7 @@ void main() {
     float fallbackHighlight = computeWhiteRimFactor(baseRimTerms, ambientSheen, 1.0);
     float darkWeight = outerStroke * (1.0 - fallbackHighlight) * 0.40 * uHighlight.z;
     float fallbackAlpha = clamp(max(uTint.a, max(fallbackHighlight * 0.92, darkWeight)), 0.0, 0.96) * edgeAA;
-    vec3 fallbackBase = mix(baseGlass, vec3(0.0), darkWeight);
+    vec3 fallbackBase = mix(uTint.rgb, vec3(0.0), darkWeight);
     vec3 fallbackColor = clamp(mix(fallbackBase, vec3(1.0), fallbackHighlight) + vec3(1.0) * additiveGlow * uHighlight.x + interferenceTint, 0.0, 1.0);
     gl_FragColor = vec4(fallbackColor * fallbackAlpha, fallbackAlpha);
 #endif
@@ -889,10 +1146,10 @@ function compileShader(
     return shader;
 }
 
-const ROUNDED_MIN_WEBGL_PIXEL_RATIO = 1.5;
-const ROUNDED_MAX_WEBGL_PIXEL_RATIO = 2.5;
+const ROUNDED_MIN_WEBGL_PIXEL_RATIO = 2;
+const ROUNDED_MAX_WEBGL_PIXEL_RATIO = 3;
 const EXPLICIT_MAX_WEBGL_PIXEL_RATIO = 4;
-const UNROUNDED_WEBGL_PIXEL_RATIO = 0.25;
+const UNROUNDED_WEBGL_PIXEL_RATIO = 0.125;
 
 const MAX_WEBGL_FRAMEBUFFER_PIXELS = 4_194_304;
 
@@ -913,16 +1170,19 @@ export function resolveWebglPixelRatio(requestedPixelRatio?: number, radius = 18
 export class GlassWebglRenderer {
     private readonly canvas: HTMLCanvasElement;
     private readonly gl: WebGLRenderingContext;
+    private readonly isWebgl2: boolean;
     private readonly program: WebGLProgram;
     private readonly vertexBuffer: WebGLBuffer;
     private readonly maxViewportWidth: number;
     private readonly maxViewportHeight: number;
     private readonly maxTextureSize: number;
+    private readonly maxSceneTextureSize: number;
     private readonly smallMemory = useSmallMemoryBudget();
     private readonly framePixelLimit = this.smallMemory ? SMALL_FRAME_PIXELS : MAX_WEBGL_FRAMEBUFFER_PIXELS;
     private readonly opticalTexture: WebGLTexture;
     private readonly opticalLutSize: number;
-    private opticalLutPeak = 0;
+    private opticalLut: Uint8Array | null = null;
+    private opticalLutPeak: number | undefined;
     private opticalSurface: GlassSurface | null = null;
     private opticalIor = -1;
     private uploadCanvas: HTMLCanvasElement | null = null;
@@ -933,13 +1193,24 @@ export class GlassWebglRenderer {
     private lastRefractionDirection = -1;
     private lastRefractionEdgeFade = -1;
     private readonly uTintLoc: WebGLUniformLocation | null;
+    private readonly uMediumLoc: WebGLUniformLocation | null;
+    private mediumCoefficients: GlassMediumCoefficients | null = null;
+    private mediumTintR = Number.NaN;
+    private mediumTintG = Number.NaN;
+    private mediumTintB = Number.NaN;
+    private mediumTintA = Number.NaN;
+    private mediumThickness = Number.NaN;
+    private lastDirectMedium: GlassMediumCoefficients | null = null;
     private readonly uSaturationLoc: WebGLUniformLocation | null;
     private lastSaturation = -2;
+    private readonly uSharpnessLoc: WebGLUniformLocation | null;
+    private lastSharpness = -1;
     private readonly uHighlightLoc: WebGLUniformLocation | null;
     private readonly uSceneRectLoc: WebGLUniformLocation | null;
     private readonly uSceneTexLoc: WebGLUniformLocation | null;
     private readonly uHasSceneTexLoc: WebGLUniformLocation | null;
     private readonly uDprLoc: WebGLUniformLocation | null;
+    private readonly uPixelSizeLoc: WebGLUniformLocation | null;
     private readonly uInteriorMarginLoc: WebGLUniformLocation | null;
     private readonly uBlurOffset1Loc: WebGLUniformLocation | null;
     private readonly uBlurOffset2Loc: WebGLUniformLocation | null;
@@ -956,6 +1227,7 @@ export class GlassWebglRenderer {
     private boundSceneTexture: WebGLTexture | null = null;
     private hasSceneTextureData = false;
     private hasSceneTextureInitialized = false;
+    private sceneTextureMipmapped = false;
     private sceneCanvasWidth = 0;
     private sceneCanvasHeight = 0;
     private blurDownsampleProgram: WebGLProgram | null = null;
@@ -971,10 +1243,16 @@ export class GlassWebglRenderer {
     private sceneBlurDirty = false;
     private blurDownsampleFailed = false;
     private interiorProgram: WebGLProgram | null = null;
-    private interiorUOpticalLoc: WebGLUniformLocation | null = null;
+    private interiorUSizeLoc: WebGLUniformLocation | null = null;
     private interiorUTintLoc: WebGLUniformLocation | null = null;
+    private interiorUMediumLoc: WebGLUniformLocation | null = null;
     private interiorUSaturationLoc: WebGLUniformLocation | null = null;
+    private interiorUSharpnessLoc: WebGLUniformLocation | null = null;
+    private interiorUPixelSizeLoc: WebGLUniformLocation | null = null;
     private lastInteriorSaturation = -2;
+    private lastInteriorSharpness = -1;
+    private lastInteriorPixelSizeX = 0;
+    private lastInteriorPixelSizeY = 0;
     private interiorUHighlightLoc: WebGLUniformLocation | null = null;
     private interiorUSceneRectLoc: WebGLUniformLocation | null = null;
     private interiorUBlurOffset1Loc: WebGLUniformLocation | null = null;
@@ -988,11 +1266,7 @@ export class GlassWebglRenderer {
     private lastInteriorFrameW = -1;
     private lastInteriorFrameH = -1;
     private lastInteriorBlurPx = -1;
-    private lastInteriorThickness = -1;
-    private lastInteriorTintR = -1;
-    private lastInteriorTintG = -1;
-    private lastInteriorTintB = -1;
-    private lastInteriorTintA = -1;
+    private lastInteriorMedium: GlassMediumCoefficients | null = null;
     private lastInteriorHighlight = -1;
     private lastInteriorTiltH = Number.NaN;
     private lastInteriorTiltV = Number.NaN;
@@ -1011,6 +1285,8 @@ export class GlassWebglRenderer {
     private lastCssWidth = -1;
     private lastCssHeight = -1;
     private lastDpr = -1;
+    private lastPixelSizeX = 0;
+    private lastPixelSizeY = 0;
     private lastRadius = -1;
     private lastBezel = -1;
     private lastIor = -1;
@@ -1054,17 +1330,20 @@ export class GlassWebglRenderer {
     private constructor(
         canvas: HTMLCanvasElement,
         gl: WebGLRenderingContext,
+        isWebgl2: boolean,
         program: WebGLProgram,
         vertexBuffer: WebGLBuffer,
         opticalTexture: WebGLTexture,
     ) {
         this.canvas = canvas;
         this.gl = gl;
+        this.isWebgl2 = isWebgl2;
         this.program = program;
         this.vertexBuffer = vertexBuffer;
         const viewportDims = gl.getParameter(gl.MAX_VIEWPORT_DIMS) as ArrayLike<number> | null;
         const maxTextureSize = Math.max(256, Number(gl.getParameter(gl.MAX_TEXTURE_SIZE)) || 4096);
-        this.maxTextureSize = this.smallMemory ? Math.min(maxTextureSize, SMALL_SCENE_DIMENSION) : maxTextureSize;
+        this.maxTextureSize = maxTextureSize;
+        this.maxSceneTextureSize = this.smallMemory ? Math.min(maxTextureSize, SMALL_SCENE_DIMENSION) : maxTextureSize;
         this.opticalLutSize = Math.min(OPTICAL_LUT_SIZE, maxTextureSize);
         this.opticalTexture = opticalTexture;
         gl.activeTexture(gl.TEXTURE1);
@@ -1086,12 +1365,15 @@ export class GlassWebglRenderer {
         this.uOpticalLoc = gl.getUniformLocation(program, "uOptical");
         this.uRefractionLoc = gl.getUniformLocation(program, "uRefraction");
         this.uTintLoc = gl.getUniformLocation(program, "uTint");
+        this.uMediumLoc = gl.getUniformLocation(program, "uMedium");
         this.uSaturationLoc = gl.getUniformLocation(program, "uSaturation");
+        this.uSharpnessLoc = gl.getUniformLocation(program, "uSharpness");
         this.uHighlightLoc = gl.getUniformLocation(program, "uHighlight");
         this.uSceneRectLoc = gl.getUniformLocation(program, "uSceneRect");
         this.uSceneTexLoc = gl.getUniformLocation(program, "uSceneTex");
         this.uHasSceneTexLoc = gl.getUniformLocation(program, "uHasSceneTex");
         this.uDprLoc = gl.getUniformLocation(program, "uDpr");
+        this.uPixelSizeLoc = gl.getUniformLocation(program, "uPixelSize");
         this.uInteriorMarginLoc = gl.getUniformLocation(program, "uInteriorMargin");
         this.uBlurOffset1Loc = gl.getUniformLocation(program, "uBlurOffset1");
         this.uBlurOffset2Loc = gl.getUniformLocation(program, "uBlurOffset2");
@@ -1145,17 +1427,24 @@ export class GlassWebglRenderer {
         };
 
         let gl: WebGLRenderingContext | null = null;
+        let isWebgl2 = false;
         for (const version of ["webgl2", "webgl"] as const) {
             try {
                 gl = canvas.getContext(version, contextOptions) as WebGLRenderingContext | null;
-                if (gl) break;
+                if (gl) {
+                    isWebgl2 = version === "webgl2";
+                    break;
+                }
             } catch {
             }
         }
         if (!gl) return null;
 
-        const vertexShader = compileShader(gl, gl.VERTEX_SHADER, VERTEX_SHADER_SOURCE);
-        const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SHADER_SOURCE);
+        const programSources = isWebgl2
+            ? buildWebgl2Sources(VERTEX_SHADER_SOURCE, FRAGMENT_SHADER_SOURCE, ["LG_WEBGL2"], false)
+            : { vertex: VERTEX_SHADER_SOURCE, fragment: FRAGMENT_SHADER_SOURCE };
+        const vertexShader = compileShader(gl, gl.VERTEX_SHADER, programSources.vertex);
+        const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, programSources.fragment);
         if (!vertexShader || !fragmentShader) {
             if (vertexShader) gl.deleteShader(vertexShader);
             if (fragmentShader) gl.deleteShader(fragmentShader);
@@ -1202,10 +1491,14 @@ export class GlassWebglRenderer {
         gl.enableVertexAttribArray(posLocation);
         gl.vertexAttribPointer(posLocation, 2, gl.FLOAT, false, 0, 0);
 
-        return new GlassWebglRenderer(canvas, gl, program, vertexBuffer, opticalTexture);
+        return new GlassWebglRenderer(canvas, gl, isWebgl2, program, vertexBuffer, opticalTexture);
     }
 
-    setSceneCanvas(sourceCanvas: HTMLCanvasElement | null): void {
+    get hasSceneTexture(): boolean {
+        return this.hasSceneTextureData;
+    }
+
+    setSceneCanvas(sourceCanvas: HTMLCanvasElement | null, sharpness = 0): void {
         if (this.disposed) return;
         const { gl } = this;
         if (typeof gl.isContextLost === "function" && gl.isContextLost()) {
@@ -1217,17 +1510,29 @@ export class GlassWebglRenderer {
             return;
         }
 
+        const safeSharpness = Number.isFinite(sharpness) && sharpness > 0 ? Math.min(1, sharpness) : 0;
+        const effectiveMaxSceneDim =
+            safeSharpness > 0
+                ? Math.min(
+                      this.maxTextureSize,
+                      Math.max(
+                          this.maxSceneTextureSize,
+                          Math.round(SMALL_SCENE_DIMENSION + (4096 - SMALL_SCENE_DIMENSION) * safeSharpness),
+                      ),
+                  )
+                : this.maxSceneTextureSize;
+
         let uploadSource = sourceCanvas;
         if (
-            sourceCanvas.width > this.maxTextureSize ||
-            sourceCanvas.height > this.maxTextureSize
+            sourceCanvas.width > effectiveMaxSceneDim ||
+            sourceCanvas.height > effectiveMaxSceneDim
         ) {
             const fitScale = Math.min(
-                this.maxTextureSize / sourceCanvas.width,
-                this.maxTextureSize / sourceCanvas.height,
+                effectiveMaxSceneDim / sourceCanvas.width,
+                effectiveMaxSceneDim / sourceCanvas.height,
             );
-            const scaledWidth = Math.max(2, Math.floor(sourceCanvas.width * fitScale));
-            const scaledHeight = Math.max(2, Math.floor(sourceCanvas.height * fitScale));
+            const scaledWidth = Math.max(1, Math.floor(sourceCanvas.width * fitScale));
+            const scaledHeight = Math.max(1, Math.floor(sourceCanvas.height * fitScale));
             if (!this.uploadCanvas && typeof document !== "undefined") {
                 this.uploadCanvas = document.createElement("canvas");
             }
@@ -1260,6 +1565,8 @@ export class GlassWebglRenderer {
         gl.bindTexture(gl.TEXTURE_2D, this.sceneTexture);
         gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1);
         gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 0);
+        const canGenerateMipmap = this.supportsMipmapGeneration();
+        const minFilter = canGenerateMipmap ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR;
         if (
             this.hasSceneTextureInitialized &&
             uploadSource.width === this.sceneCanvasWidth &&
@@ -1267,13 +1574,21 @@ export class GlassWebglRenderer {
             typeof gl.texSubImage2D === "function"
         ) {
             gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, uploadSource);
+            if (this.sceneTextureMipmapped !== canGenerateMipmap) {
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, minFilter);
+                this.sceneTextureMipmapped = canGenerateMipmap;
+            }
         } else {
             gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, uploadSource);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, minFilter);
             this.hasSceneTextureInitialized = true;
+            this.sceneTextureMipmapped = canGenerateMipmap;
+        }
+        if (canGenerateMipmap) {
+            gl.generateMipmap(gl.TEXTURE_2D);
         }
         this.sceneCanvasWidth = uploadSource.width;
         this.sceneCanvasHeight = uploadSource.height;
@@ -1283,18 +1598,31 @@ export class GlassWebglRenderer {
         this.hasSceneTextureData = true;
     }
 
+    private supportsMipmapGeneration(): boolean {
+        return (
+            this.isWebgl2 &&
+            typeof this.gl.generateMipmap === "function" &&
+            typeof this.gl.LINEAR_MIPMAP_LINEAR === "number"
+        );
+    }
+
     private allocateHalfResTarget(
         fbo: WebGLFramebuffer,
         texture: WebGLTexture,
         width: number,
         height: number,
+        useMipmap = false,
     ): boolean {
         const { gl } = this;
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, texture);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(
+            gl.TEXTURE_2D,
+            gl.TEXTURE_MIN_FILTER,
+            useMipmap ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR,
+        );
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
         gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
@@ -1410,6 +1738,7 @@ export class GlassWebglRenderer {
                       this.blurHalfTexture,
                       halfWidth,
                       halfHeight,
+                      this.supportsMipmapGeneration(),
                   )
                 : false;
             gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -1479,17 +1808,39 @@ export class GlassWebglRenderer {
             gl.bindFramebuffer(gl.FRAMEBUFFER, null);
             gl.viewport(0, 0, this.pixelWidth, this.pixelHeight);
             gl.bindTexture(gl.TEXTURE_2D, this.blurHalfTexture);
+            if (this.supportsMipmapGeneration()) {
+                gl.generateMipmap(gl.TEXTURE_2D);
+            }
             this.boundSceneTexture = this.blurHalfTexture;
         }
 
         return this.blurHalfTexture;
     }
 
+    private getMediumCoefficients(frame: GlassFrameParams): GlassMediumCoefficients {
+        const [r, g, b] = frame.tintColor;
+        const { tintOpacity, thickness } = frame;
+        if (
+            this.mediumCoefficients === null || r !== this.mediumTintR || g !== this.mediumTintG ||
+            b !== this.mediumTintB || tintOpacity !== this.mediumTintA || thickness !== this.mediumThickness
+        ) {
+            this.mediumTintR = r;
+            this.mediumTintG = g;
+            this.mediumTintB = b;
+            this.mediumTintA = tintOpacity;
+            this.mediumThickness = thickness;
+            this.mediumCoefficients = resolveGlassMedium(r, g, b, tintOpacity, thickness);
+        }
+        return this.mediumCoefficients;
+    }
+
     private prepareCoarseInterior(
         frame: GlassFrameParams,
         activeSceneTex: WebGLTexture | null,
+        medium: GlassMediumCoefficients,
         blurRadiusPx: number,
         saturation: number,
+        sharpness: number,
         dpr: number,
         interiorMargin: number,
         lightTiltHorizontal: number,
@@ -1502,6 +1853,7 @@ export class GlassWebglRenderer {
             !activeSceneTex ||
             !frame.sceneRect ||
             blurRadiusPx <= 0 ||
+            sharpness > 0 ||
             innerCssW < 96 ||
             innerCssH < 96 ||
             this.pixelWidth * this.pixelHeight < 200_000
@@ -1511,15 +1863,21 @@ export class GlassWebglRenderer {
 
         const { gl } = this;
         if (!this.interiorProgram) {
+            const interiorSources = this.isWebgl2
+                ? buildWebgl2Sources(VERTEX_SHADER_SOURCE, FRAGMENT_SHADER_SOURCE, ["LG_WEBGL2", "LG_INTERIOR_PASS"], false)
+                : {
+                      vertex: `#define LG_INTERIOR_PASS\n${VERTEX_SHADER_SOURCE}`,
+                      fragment: `#define LG_INTERIOR_PASS\n${FRAGMENT_SHADER_SOURCE}`,
+                  };
             const vShader = compileShader(
                 gl,
                 gl.VERTEX_SHADER,
-                `#define LG_INTERIOR_PASS\n${VERTEX_SHADER_SOURCE}`,
+                interiorSources.vertex,
             );
             const fShader = compileShader(
                 gl,
                 gl.FRAGMENT_SHADER,
-                `#define LG_INTERIOR_PASS\n${FRAGMENT_SHADER_SOURCE}`,
+                interiorSources.fragment,
             );
             if (!vShader || !fShader) {
                 if (vShader) gl.deleteShader(vShader);
@@ -1549,9 +1907,12 @@ export class GlassWebglRenderer {
             gl.uniform1i(gl.getUniformLocation(prog, "uSceneTex"), 0);
             const bleedLoc = gl.getUniformLocation(prog, "uCoalesceBleed");
             if (bleedLoc) gl.uniform4f(bleedLoc, 0, 0, 0, 0);
-            this.interiorUOpticalLoc = gl.getUniformLocation(prog, "uOptical");
+            this.interiorUSizeLoc = gl.getUniformLocation(prog, "uSize");
             this.interiorUTintLoc = gl.getUniformLocation(prog, "uTint");
+            this.interiorUMediumLoc = gl.getUniformLocation(prog, "uMedium");
             this.interiorUSaturationLoc = gl.getUniformLocation(prog, "uSaturation");
+            this.interiorUSharpnessLoc = gl.getUniformLocation(prog, "uSharpness");
+            this.interiorUPixelSizeLoc = gl.getUniformLocation(prog, "uPixelSize");
             this.interiorUHighlightLoc = gl.getUniformLocation(prog, "uHighlight");
             this.interiorUSceneRectLoc = gl.getUniformLocation(prog, "uSceneRect");
             this.interiorUBlurOffset1Loc = gl.getUniformLocation(prog, "uBlurOffset1");
@@ -1578,8 +1939,8 @@ export class GlassWebglRenderer {
         }
 
         const interiorScale = Math.min(dpr, this.smallMemory ? 0.5 : 1, Math.max(0.5, dpr * 0.4));
-        const interiorW = Math.min(this.maxTextureSize, Math.max(32, Math.round(frame.width * interiorScale)));
-        const interiorH = Math.min(this.maxTextureSize, Math.max(32, Math.round(frame.height * interiorScale)));
+        const interiorW = Math.min(this.maxSceneTextureSize, Math.max(32, Math.round(frame.width * interiorScale)));
+        const interiorH = Math.min(this.maxSceneTextureSize, Math.max(32, Math.round(frame.height * interiorScale)));
 
         if (interiorW !== this.interiorWidth || interiorH !== this.interiorHeight) {
             this.interiorWidth = interiorW;
@@ -1616,11 +1977,8 @@ export class GlassWebglRenderer {
             frame.height !== this.lastInteriorFrameH ||
             blurRadiusPx !== this.lastInteriorBlurPx ||
             saturation !== this.lastInteriorSaturation ||
-            frame.thickness !== this.lastInteriorThickness ||
-            frame.tintColor[0] !== this.lastInteriorTintR ||
-            frame.tintColor[1] !== this.lastInteriorTintG ||
-            frame.tintColor[2] !== this.lastInteriorTintB ||
-            frame.tintOpacity !== this.lastInteriorTintA ||
+            sharpness !== this.lastInteriorSharpness ||
+            medium !== this.lastInteriorMedium ||
             frame.highlight !== this.lastInteriorHighlight ||
             lightTiltHorizontal !== this.lastInteriorTiltH ||
             lightTiltVertical !== this.lastInteriorTiltV ||
@@ -1654,26 +2012,33 @@ export class GlassWebglRenderer {
             gl.bindTexture(gl.TEXTURE_2D, activeSceneTex);
             this.boundSceneTexture = activeSceneTex;
 
-            if (this.interiorUOpticalLoc) {
-                gl.uniform4f(
-                    this.interiorUOpticalLoc,
-                    frame.ior,
-                    frame.thickness,
-                    frame.scaleRatio,
-                    0,
-                );
+            if (this.interiorUSizeLoc && (frame.width !== this.lastInteriorFrameW || frame.height !== this.lastInteriorFrameH)) {
+                gl.uniform2f(this.interiorUSizeLoc, frame.width, frame.height);
+            }
+            const interiorPixelSizeX = frame.width / interiorW;
+            const interiorPixelSizeY = frame.height / interiorH;
+            if (
+                this.interiorUPixelSizeLoc &&
+                (interiorPixelSizeX !== this.lastInteriorPixelSizeX ||
+                    interiorPixelSizeY !== this.lastInteriorPixelSizeY)
+            ) {
+                this.lastInteriorPixelSizeX = interiorPixelSizeX;
+                this.lastInteriorPixelSizeY = interiorPixelSizeY;
+                gl.uniform2f(this.interiorUPixelSizeLoc, interiorPixelSizeX, interiorPixelSizeY);
             }
             if (this.interiorUSaturationLoc && saturation !== this.lastInteriorSaturation) {
                 gl.uniform1f(this.interiorUSaturationLoc, saturation);
             }
-            if (this.interiorUTintLoc) {
-                gl.uniform4f(
-                    this.interiorUTintLoc,
-                    frame.tintColor[0],
-                    frame.tintColor[1],
-                    frame.tintColor[2],
-                    frame.tintOpacity,
-                );
+            if (this.interiorUSharpnessLoc && sharpness !== this.lastInteriorSharpness) {
+                gl.uniform1f(this.interiorUSharpnessLoc, sharpness);
+            }
+            if (medium !== this.lastInteriorMedium) {
+                if (this.interiorUTintLoc) {
+                    gl.uniform4f(this.interiorUTintLoc, ...frame.tintColor, frame.tintOpacity);
+                }
+                if (this.interiorUMediumLoc) {
+                    gl.uniform4f(this.interiorUMediumLoc, ...medium);
+                }
             }
             if (this.interiorUHighlightLoc) {
                 gl.uniform4f(this.interiorUHighlightLoc, frame.highlight, 0, 4.0, blurRadiusPx);
@@ -1704,11 +2069,8 @@ export class GlassWebglRenderer {
             this.lastInteriorFrameH = frame.height;
             this.lastInteriorBlurPx = blurRadiusPx;
             this.lastInteriorSaturation = saturation;
-            this.lastInteriorThickness = frame.thickness;
-            this.lastInteriorTintR = frame.tintColor[0];
-            this.lastInteriorTintG = frame.tintColor[1];
-            this.lastInteriorTintB = frame.tintColor[2];
-            this.lastInteriorTintA = frame.tintOpacity;
+            this.lastInteriorSharpness = sharpness;
+            this.lastInteriorMedium = medium;
             this.lastInteriorHighlight = frame.highlight;
             this.lastInteriorTiltH = lightTiltHorizontal;
             this.lastInteriorTiltV = lightTiltVertical;
@@ -1744,8 +2106,26 @@ export class GlassWebglRenderer {
         const cssCanvasWidth = frame.width + bleedPx * 2;
         const cssCanvasHeight = frame.height + bleedPx * 2;
 
-        const desiredDpr = resolveWebglPixelRatio(frame.pixelRatio, frame.radius);
-        const maxAreaScale = Math.sqrt(this.framePixelLimit / (cssCanvasWidth * cssCanvasHeight));
+        const sharpness = resolveGlassSharpness(frame.sharpness, frame.blur);
+        const deviceDpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+        const requestedPixelRatio =
+            frame.pixelRatio ??
+            (sharpness > 0 ? resolveSharpnessPixelRatio(sharpness, deviceDpr) : undefined);
+        const desiredDpr = resolveWebglPixelRatio(requestedPixelRatio, frame.radius);
+        const explicitDeviceMemory =
+            typeof navigator !== "undefined"
+                ? (navigator as Navigator & { deviceMemory?: number }).deviceMemory
+                : undefined;
+        const hasConstrainedMemoryHint =
+            typeof explicitDeviceMemory === "number" &&
+            Number.isFinite(explicitDeviceMemory) &&
+            explicitDeviceMemory <= 4;
+        const activeFramePixelLimit =
+            (frame.sharpness !== undefined && frame.sharpness > 0) ||
+            (sharpness > 0 && !hasConstrainedMemoryHint)
+                ? Math.max(this.framePixelLimit, MAX_WEBGL_FRAMEBUFFER_PIXELS)
+                : this.framePixelLimit;
+        const maxAreaScale = Math.sqrt(activeFramePixelLimit / (cssCanvasWidth * cssCanvasHeight));
         const maxDimScale = Math.min(
             this.maxViewportWidth / Math.max(1, cssCanvasWidth),
             this.maxViewportHeight / Math.max(1, cssCanvasHeight),
@@ -1778,33 +2158,33 @@ export class GlassWebglRenderer {
             cornerStyle !== this.stableGeomCornerStyle;
         this.stableGeomCornerStyle = cornerStyle;
         if (geometryChanged) {
-            this.transferCache?.invalidate(
-                dimensionsChanged ||
-                    frame.width !== this.lastCssWidth ||
-                    frame.height !== this.lastCssHeight ||
-                    dpr !== this.lastDpr,
-            );
+            this.transferCache?.invalidate(dimensionsChanged);
         }
         this.stableGeometryFrames = geometryChanged ? 0 : this.stableGeometryFrames + 1;
         if (frame.surface !== this.opticalSurface || frame.ior !== this.opticalIor) {
-            gl.activeTexture(gl.TEXTURE1);
-            gl.bindTexture(gl.TEXTURE_2D, this.opticalTexture);
-            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
-            gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 0);
             const lut = buildOpticalLut(frame.surface, frame.ior, this.opticalLutSize);
-            this.opticalLutPeak = getOpticalLutPeak(lut);
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, this.opticalLutSize, 1, 0,
-                gl.RGBA, gl.UNSIGNED_BYTE, lut);
-            gl.activeTexture(gl.TEXTURE0);
+            if (lut !== this.opticalLut) {
+                gl.activeTexture(gl.TEXTURE1);
+                gl.bindTexture(gl.TEXTURE_2D, this.opticalTexture);
+                gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
+                gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 0);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, this.opticalLutSize, 1, 0,
+                    gl.RGBA, gl.UNSIGNED_BYTE, lut);
+                gl.activeTexture(gl.TEXTURE0);
+                this.opticalLut = lut;
+                this.opticalLutPeak = undefined;
+            }
             this.opticalSurface = frame.surface;
             this.opticalIor = frame.ior;
         }
 
         const blurRadiusPx = frame.blur > 0 ? Math.min(22.0, frame.blur * 2.2) : 0;
         const saturation = resolveGlassSaturation(frame.saturation) ?? -1;
-        const materialSpread = Math.min(1.65, Math.max(0.35, (frame.ior - 1) / 1.15));
-        const spectralCoreGain = blurRadiusPx > 0 ? 1.15 : 1;
-        const chromaStrength = resolveChromaticAberration(frame.chromaticAberration, frame.abbeNumber) * materialSpread;
+        const chromaStrength = resolveEffectiveChromaticAberration(
+            frame.chromaticAberration,
+            frame.abbeNumber,
+            frame.ior,
+        );
         let scaleRatio = Math.max(0, frame.scaleRatio);
         const travelSpan = getRefractionSpan(frame.width, frame.height, frame.refractionDirection);
         const travelLimit = frame.adaptiveRefraction === true ? resolveRefractionTravel(travelSpan, bezel) : Infinity;
@@ -1813,15 +2193,17 @@ export class GlassWebglRenderer {
             Math.max(0, frame.maxScaleMultiplier ?? Infinity) * bezel * 0.5,
             Math.max(0, frame.maxRefractionPx ?? Infinity),
         );
-        if (Number.isFinite(maxTravel) && this.opticalLutPeak > 0) {
+        if (scaleRatio > 0 && this.opticalLut && Number.isFinite(maxTravel)) {
+            const peak = this.opticalLutPeak ??= getOpticalLutPeak(this.opticalLut);
             const thicknessBoost = Math.min(2.25, Math.max(1, 0.95 + frame.thickness * 0.015625));
-            const blueGain = 1 + 1.28 * spectralCoreGain * chromaStrength;
+            const { blueMultiplier: blueGain } = resolveChromaticChannelScales(1, chromaStrength);
             const interferenceGain = 1 + 0.10 * Math.max(0, peerCount - 0.5);
             const geometryGain = (1.35 + 0.14) * interferenceGain;
-            const peakTravel = bezel * this.opticalLutPeak * geometryGain * thicknessBoost * blueGain;
-            scaleRatio = Math.min(scaleRatio, maxTravel / peakTravel);
+            const peakTravel = bezel * peak * geometryGain * thicknessBoost * blueGain;
+            if (peakTravel > 0) scaleRatio = Math.min(scaleRatio, maxTravel / peakTravel);
         }
         const useSceneFlag = this.hasSceneTextureData && Boolean(frame.sceneRect) ? 1.0 : 0.0;
+        const medium = useSceneFlag > 0.5 ? this.getMediumCoefficients(frame) : null;
         const activeSceneTex = this.prepareActiveSceneTexture(frame.blur, useSceneFlag > 0.5);
         if (useSceneFlag > 0.5 && activeSceneTex && activeSceneTex !== this.boundSceneTexture) {
             gl.activeTexture(gl.TEXTURE0);
@@ -1832,12 +2214,14 @@ export class GlassWebglRenderer {
         const lightTiltHorizontal = frame.lightTilt?.horizontal ?? 0;
         const lightTiltVertical = frame.lightTilt?.vertical ?? 0;
         const useInteriorTex =
-            useSceneFlag > 0.5 && peerCount === 0 && bleedPx === 0
+            medium && peerCount === 0 && bleedPx === 0
                 ? this.prepareCoarseInterior(
                       frame,
                       activeSceneTex ?? this.sceneTexture,
+                      medium,
                       blurRadiusPx,
                       saturation,
+                      sharpness,
                       dpr,
                       interiorMargin,
                       lightTiltHorizontal,
@@ -1845,7 +2229,7 @@ export class GlassWebglRenderer {
                   )
                 : false;
         if (this.stableGeometryFrames >= 2 && peerCount === 0 && bleedPx === 0) {
-            if (!this.transferCacheChecked) {
+            if (!this.transferCacheChecked && canAllocateOpticalTransfer(targetWidth, targetHeight, this.maxTextureSize)) {
                 this.transferCacheChecked = true;
                 this.transferCache = OpticalTransferCache.create(gl, VERTEX_SHADER_SOURCE, FRAGMENT_SHADER_SOURCE);
             }
@@ -1865,6 +2249,8 @@ export class GlassWebglRenderer {
                     blurRadiusPx,
                     scaleRatio > 0 ? chromaStrength : 0,
                     saturation,
+                    sharpness,
+                    medium,
                     useInteriorTex,
                 )
             ) {
@@ -1900,6 +2286,13 @@ export class GlassWebglRenderer {
         if (dpr !== this.lastDpr) {
             this.lastDpr = dpr;
             gl.uniform1f(this.uDprLoc, dpr);
+        }
+        const pixelSizeX = cssCanvasWidth / targetWidth;
+        const pixelSizeY = cssCanvasHeight / targetHeight;
+        if (pixelSizeX !== this.lastPixelSizeX || pixelSizeY !== this.lastPixelSizeY) {
+            this.lastPixelSizeX = pixelSizeX;
+            this.lastPixelSizeY = pixelSizeY;
+            gl.uniform2f(this.uPixelSizeLoc, pixelSizeX, pixelSizeY);
         }
         if (
             frame.width !== this.lastCssWidth ||
@@ -1955,11 +2348,21 @@ export class GlassWebglRenderer {
                 frame.tintOpacity,
             );
         }
+        if (medium && medium !== this.lastDirectMedium) {
+            this.lastDirectMedium = medium;
+            if (this.uMediumLoc) {
+                gl.uniform4f(this.uMediumLoc, ...medium);
+            }
+        }
 
         const darkRimScale = frame.darkRimScale ?? 1;
         if (this.uSaturationLoc && saturation !== this.lastSaturation) {
             this.lastSaturation = saturation;
             gl.uniform1f(this.uSaturationLoc, saturation);
+        }
+        if (this.uSharpnessLoc && sharpness !== this.lastSharpness) {
+            this.lastSharpness = sharpness;
+            gl.uniform1f(this.uSharpnessLoc, sharpness);
         }
         const samplingChroma = scaleRatio > 0 ? chromaStrength : 0;
         if (
@@ -2146,6 +2549,7 @@ export class GlassWebglRenderer {
         this.boundSceneTexture = null;
         this.boundInteriorTexture = null;
         this.hasSceneTextureInitialized = false;
+        this.sceneTextureMipmapped = false;
         this.hasSceneTextureData = false;
         this.releaseUploadCanvas();
     }
@@ -2153,6 +2557,7 @@ export class GlassWebglRenderer {
     dispose(releaseContext = false): void {
         if (this.disposed) return;
         this.disposed = true;
+        this.opticalLut = null;
         this.releaseSceneStorage();
         if (this.blurDownsampleProgram) {
             this.gl.deleteProgram(this.blurDownsampleProgram);

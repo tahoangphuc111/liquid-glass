@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mount } from "@vue/test-utils";
 import { defineComponent, h, nextTick, ref } from "vue";
 import {
@@ -7,8 +7,10 @@ import {
     LiquidGlassProvider,
     LiquidGlassSlider,
     LiquidGlassSwitch,
+    useLiquidGlass,
 } from "../src/vue/index.js";
 import { destroyLiquidGlass } from "../src/index.js";
+import * as sceneCapture from "../src/core/sceneCapture.js";
 
 function setForcedChromium(value: boolean | undefined): void {
     const win = window as unknown as { __LG_FORCE_CHROMIUM__?: boolean };
@@ -23,6 +25,30 @@ describe("Vue 3 bindings", () => {
     afterEach(() => {
         destroyLiquidGlass();
         setForcedChromium(undefined);
+        vi.restoreAllMocks();
+    });
+
+    it("captures the Vue provider wrapper when switching away from an external scene", async () => {
+        const external = document.body.appendChild(document.createElement("section"));
+        const acquireCapture = vi.spyOn(sceneCapture, "acquireSharedSceneCapture").mockImplementation((source) => ({
+            source,
+            canvas: null,
+            subscribe: () => () => {},
+            scheduleCapture: () => {},
+            destroy: () => {},
+        }));
+        const provider = mount(LiquidGlassProvider, {
+            props: { sceneElement: external, captureScene: "always" },
+            slots: { default: () => h("span", { class: "provider-child" }) },
+        });
+        try {
+            expect(acquireCapture.mock.calls[0]?.[0]).toBe(external);
+            await provider.setProps({ sceneElement: null });
+            expect(acquireCapture.mock.calls[1]?.[0]).toBe(provider.find(".provider-child").element.parentElement);
+        } finally {
+            provider.unmount();
+            external.remove();
+        }
     });
 
     it("renders LiquidGlass inside LiquidGlassProvider", () => {
@@ -202,6 +228,96 @@ describe("Vue 3 bindings", () => {
 
         wrapper.vm.showSlider = false;
         await expect(nextTick()).resolves.toBeUndefined();
+        wrapper.unmount();
+    });
+
+    it("forwards onDragChange through useLiquidGlass and avoids redundant updates on unchanged options", async () => {
+        const dragEvents: Array<{ offsetX: number; offsetY: number; isDragging: boolean }> = [];
+        const DragComp = defineComponent({
+            setup() {
+                const targetRef = ref<HTMLElement | null>(null);
+                const blurRadius = ref(12);
+                useLiquidGlass(targetRef, () => ({
+                    engine: "css",
+                    pill: true,
+                    draggable: "free",
+                    blur: blurRadius.value,
+                    onDragChange: (offsetX, offsetY, isDragging) => {
+                        dragEvents.push({ offsetX, offsetY, isDragging });
+                    },
+                }));
+                return () => h("button", { ref: targetRef, "data-test": "drag-glass" }, "Draggable");
+            },
+        });
+
+        const wrapper = mount(DragComp);
+        const dragEl = wrapper.find("[data-test='drag-glass']").element as HTMLElement;
+        dragEl.getBoundingClientRect = () => new DOMRect(0, 0, 120, 48);
+
+        dragEl.dispatchEvent(new MouseEvent("pointerdown", { clientX: 20, clientY: 20, bubbles: true }));
+        dragEl.dispatchEvent(new MouseEvent("pointermove", { clientX: 45, clientY: 35, bubbles: true }));
+        dragEl.dispatchEvent(new MouseEvent("pointerup", { clientX: 45, clientY: 35, bubbles: true }));
+
+        expect(dragEvents.length).toBeGreaterThanOrEqual(2);
+        expect(dragEvents[0]?.isDragging).toBe(true);
+        expect(dragEvents[dragEvents.length - 1]?.isDragging).toBe(false);
+        wrapper.unmount();
+    });
+
+    it("forwards sharpness in Vue LiquidGlassProvider scene capture and reschedules when sharpness or blur changes", async () => {
+        const scheduleCapture = vi.fn();
+        let qualityGetter: (() => unknown) | undefined;
+        vi.spyOn(sceneCapture, "acquireSharedSceneCapture").mockImplementation((sourceEl, getQuality) => {
+            qualityGetter = getQuality;
+            return {
+                canvas: document.createElement("canvas"),
+                source: sourceEl,
+                subscribe: () => () => {},
+                scheduleCapture,
+                setActive: vi.fn(),
+                destroy: vi.fn(),
+            };
+        });
+
+        const Host = defineComponent({
+            setup() {
+                const blur = ref(0);
+                const sharpness = ref<number | undefined>(undefined);
+                return { blur, sharpness };
+            },
+            render() {
+                return h(
+                    LiquidGlassProvider,
+                    {
+                        captureScene: "always",
+                        defaults: {
+                            blur: this.blur,
+                            sharpness: this.sharpness,
+                        },
+                    },
+                    {
+                        default: () => h("span", "Scene"),
+                    },
+                );
+            },
+        });
+
+        const wrapper = mount(Host);
+        expect(qualityGetter?.()).toMatchObject({ sharpness: 0.65 });
+
+        scheduleCapture.mockClear();
+        wrapper.vm.sharpness = 1;
+        await nextTick();
+        expect(scheduleCapture).toHaveBeenCalledTimes(1);
+        expect(qualityGetter?.()).toMatchObject({ sharpness: 1 });
+
+        scheduleCapture.mockClear();
+        wrapper.vm.blur = 8;
+        wrapper.vm.sharpness = undefined;
+        await nextTick();
+        expect(scheduleCapture).toHaveBeenCalledTimes(1);
+        expect(qualityGetter?.()).not.toHaveProperty("sharpness");
+
         wrapper.unmount();
     });
 });

@@ -47,7 +47,7 @@ export const CSS_FALLBACK_BACKDROP = "blur(8px) saturate(210%) brightness(1.04)"
 
 export const MAP_MAX_SCALE = 1.0;
 export const MAP_MIN_SCALE = 0.5;
-export const UNROUNDED_MAP_SCALE = 0.125;
+export const UNROUNDED_MAP_SCALE = 0.0625;
 export const MAP_MAX_PIXELS = 262_144;
 export const MAP_PRELOAD_TIMEOUT_MS = 350;
 
@@ -67,7 +67,7 @@ export function pickMapScale(
     const scaleBudget =
         area > MAP_MAX_PIXELS ? Math.sqrt(MAP_MAX_PIXELS / Math.max(1, area)) : 1.0;
     const effectiveCurvatureRadius = Math.max(1.0, Math.min(radius, bezel > 0 ? bezel : radius));
-    const curvatureRetention = Math.min(1.0, 18.0 / effectiveCurvatureRadius);
+    const curvatureRetention = Math.min(1.0, 24.0 / effectiveCurvatureRadius);
     const excessBlur = blur > 8.0 ? blur - 8.0 : 0.0;
     const blurAttenuation =
         excessBlur > 0.0
@@ -87,9 +87,41 @@ export function pickMapScale(
     return 0.5;
 }
 
+export const DEFAULT_CLEAR_SHARPNESS = 0.65;
+
 export function resolveGlassSaturation(value?: number): number | undefined {
     return typeof value === "number" && Number.isFinite(value)
         ? Math.min(4, Math.max(0, value))
+        : undefined;
+}
+
+export function resolveGlassSharpness(sharpness?: number, blur?: number): number {
+    if (typeof sharpness === "number" && Number.isFinite(sharpness)) {
+        return Math.min(1, Math.max(0, sharpness));
+    }
+    return typeof blur === "number" && Number.isFinite(blur) && blur <= 0
+        ? DEFAULT_CLEAR_SHARPNESS
+        : 0;
+}
+
+export function resolveSceneCaptureSharpness(options: Partial<LiquidGlassOptions>): number {
+    const resolvedBlur =
+        options.blur !== undefined || options.preset !== undefined
+            ? resolveGlassConfig(options).blur
+            : undefined;
+    return resolveGlassSharpness(options.sharpness, resolvedBlur);
+}
+
+export function resolveSharpnessPixelRatio(sharpness: number, baseDpr = 1): number {
+    const safeDpr = Number.isFinite(baseDpr) && baseDpr > 0 ? baseDpr : 1;
+    const safeSharpness = Number.isFinite(sharpness) ? Math.min(1, Math.max(0, sharpness)) : 0;
+    if (safeSharpness <= 0) return Math.min(4, safeDpr);
+    return Math.min(4, Math.max(safeDpr, 2) + safeSharpness * 2);
+}
+
+function resolveOptionalSharpness(sharpness?: number): number | undefined {
+    return typeof sharpness === "number" && Number.isFinite(sharpness)
+        ? Math.min(1, Math.max(0, sharpness))
         : undefined;
 }
 
@@ -183,6 +215,17 @@ export function resolveGlassTheme(
 }
 
 export const DEFAULT_ABBE_NUMBER = 58.5;
+export const MIN_ABBE_NUMBER = 10;
+export const MAX_ABBE_NUMBER = 120;
+export const DEFAULT_CHROMATIC_ABERRATION = 0.35;
+export const CHROMATIC_BASE_SPREAD = 0.65;
+export const MAX_CHROMATIC_SPREAD = 0.58;
+export const CHROMATIC_RED_SHIFT_RATIO = 0.72;
+export const CHROMATIC_BLUE_SHIFT_RATIO = 1.28;
+export const MIN_CHROMATIC_IOR_SPREAD = 0.35;
+export const MAX_CHROMATIC_IOR_SPREAD = 1.65;
+
+const REFERENCE_DISPERSION_IOR_DELTA = DEFAULT_GLASS_CONFIG.ior - 1;
 
 export const GLASS_PRESETS: Record<GlassPreset, Partial<LiquidGlassOptions>> = {
     apple_liquid: {
@@ -226,7 +269,7 @@ export const GLASS_PRESETS: Record<GlassPreset, Partial<LiquidGlassOptions>> = {
         blur: 1,
         ior: 1.333,
         highlight: 0.85,
-        chromaticAberration: 0.04,
+        chromaticAberration: 0.2,
         abbeNumber: 55.7,
     },
     obsidian: {
@@ -357,6 +400,7 @@ export function parseElementGlassAttributes(
     }
 
     assign("blur", parseOptionalFiniteNumber(element.getAttribute("data-lg-blur")));
+    assign("sharpness", parseOptionalFiniteNumber(element.getAttribute("data-lg-sharpness")));
     assign("saturation", parseOptionalFiniteNumber(element.getAttribute("data-lg-saturation")));
     assign("thickness", parseOptionalFiniteNumber(element.getAttribute("data-lg-thickness")));
     assign("bezel", parseOptionalFiniteNumber(element.getAttribute("data-lg-bezel")));
@@ -407,11 +451,16 @@ export function parseElementGlassAttributes(
         assign("dragBounds", dragBoundsRaw);
     }
 
-    const chromaRaw = element.getAttribute("data-lg-chromatic-aberration")?.trim().toLowerCase();
-    if (chromaRaw === "true" || chromaRaw === "false") {
-        assign("chromaticAberration", chromaRaw === "true");
-    } else if (chromaRaw) {
-        assign("chromaticAberration", parseOptionalFiniteNumber(chromaRaw));
+    const chromaAttr = element.getAttribute("data-lg-chromatic-aberration");
+    if (chromaAttr !== null) {
+        const chromaRaw = chromaAttr.trim().toLowerCase();
+        if (chromaRaw === "" || chromaRaw === "true") {
+            assign("chromaticAberration", true);
+        } else if (chromaRaw === "false") {
+            assign("chromaticAberration", false);
+        } else {
+            assign("chromaticAberration", parseOptionalFiniteNumber(chromaRaw));
+        }
     }
 
     const tintColorRaw = element.getAttribute("data-lg-tint-color")?.trim();
@@ -478,9 +527,23 @@ export function computeMergedOptionPatch<T extends object>(
     nextOptions: T,
 ): T {
     if (!prevOptions) return nextOptions;
-    const patch = { ...nextOptions } as Record<string, unknown>;
-    for (const key of Object.keys(prevOptions)) {
-        if (!(key in patch)) {
+    const prevRecord = prevOptions as Record<string, unknown>;
+    const nextRecord = nextOptions as Record<string, unknown>;
+    const patch: Record<string, unknown> = {};
+    for (const key of Object.keys(nextRecord)) {
+        const nextValue = nextRecord[key];
+        const prevValue = prevRecord[key];
+        const isChanged =
+            key === "lightTilt"
+                ? serializeLightTiltKey(prevValue as GlassLightTiltMode | undefined) !==
+                  serializeLightTiltKey(nextValue as GlassLightTiltMode | undefined)
+                : !Object.is(prevValue, nextValue);
+        if (isChanged) {
+            patch[key] = nextValue;
+        }
+    }
+    for (const key of Object.keys(prevRecord)) {
+        if (!(key in nextRecord) && prevRecord[key] !== undefined) {
             patch[key] = undefined;
         }
     }
@@ -495,19 +558,92 @@ export function serializeLightTiltKey(lightTilt: GlassLightTiltMode | undefined)
     return "";
 }
 
+export interface ChromaticChannelScales {
+    readonly redScale: number;
+    readonly blueScale: number;
+    readonly blueMultiplier: number;
+}
+
+export function resolveAbbeNumber(abbeNumber?: number): number | undefined {
+    if (typeof abbeNumber !== "number" || !Number.isFinite(abbeNumber) || abbeNumber <= 0) {
+        return undefined;
+    }
+    return Math.min(MAX_ABBE_NUMBER, Math.max(MIN_ABBE_NUMBER, abbeNumber));
+}
+
+export function normalizeChromaticAberrationOption(
+    value?: boolean | number,
+    abbeNumber?: number,
+): boolean | number {
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") {
+        return Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : false;
+    }
+    return resolveAbbeNumber(abbeNumber) !== undefined;
+}
+
+export function resolveChromaticMaterialSpread(ior?: number): number {
+    if (typeof ior !== "number" || !Number.isFinite(ior)) return 1;
+    return Math.min(
+        MAX_CHROMATIC_IOR_SPREAD,
+        Math.max(MIN_CHROMATIC_IOR_SPREAD, (ior - 1) / REFERENCE_DISPERSION_IOR_DELTA),
+    );
+}
+
+function compressChromaticSpread(rawSpread: number): number {
+    if (!Number.isFinite(rawSpread) || rawSpread <= 0) return 0;
+    return rawSpread / (1 + rawSpread / MAX_CHROMATIC_SPREAD);
+}
+
+function computeRawChromaticSpread(
+    value?: boolean | number,
+    abbeNumber?: number,
+    ior?: number,
+): number {
+    if (value === false) return 0;
+    const normalizedAbbe = resolveAbbeNumber(abbeNumber);
+    let normalizedIntensity = 0;
+    if (typeof value === "number") {
+        if (!Number.isFinite(value) || value <= 0) return 0;
+        normalizedIntensity = Math.min(1, value);
+    } else if (value === true || normalizedAbbe !== undefined) {
+        normalizedIntensity = DEFAULT_CHROMATIC_ABERRATION;
+    } else {
+        return 0;
+    }
+    const abbeGain = normalizedAbbe !== undefined ? DEFAULT_ABBE_NUMBER / normalizedAbbe : 1;
+    const iorSpread = resolveChromaticMaterialSpread(ior);
+    return normalizedIntensity * CHROMATIC_BASE_SPREAD * abbeGain * iorSpread;
+}
+
 export function resolveChromaticAberration(
     value?: boolean | number,
     abbeNumber?: number,
 ): number {
-    if (value === false) return 0;
-    const hasCustomAbbe = typeof abbeNumber === "number" && Number.isFinite(abbeNumber) && abbeNumber > 0;
-    const materialGain = hasCustomAbbe
-        ? DEFAULT_ABBE_NUMBER / Math.min(120, Math.max(10, abbeNumber))
-        : 1;
-    if (typeof value === "number") {
-        return Number.isFinite(value) ? Math.min(1, Math.max(0, Math.min(1, value) * materialGain)) : 0;
-    }
-    return value === true || hasCustomAbbe ? Math.min(0.25, 0.085 * materialGain) : 0;
+    return compressChromaticSpread(computeRawChromaticSpread(value, abbeNumber));
+}
+
+export function resolveEffectiveChromaticAberration(
+    value?: boolean | number,
+    abbeNumber?: number,
+    ior?: number,
+): number {
+    return compressChromaticSpread(computeRawChromaticSpread(value, abbeNumber, ior));
+}
+
+export function resolveChromaticChannelScales(
+    baseScale: number,
+    effectiveChroma: number,
+): ChromaticChannelScales {
+    const safeScale = Number.isFinite(baseScale) ? Math.max(0, baseScale) : 0;
+    const safeChroma = Number.isFinite(effectiveChroma) ? Math.max(0, effectiveChroma) : 0;
+    const redOffset = Math.min(1, safeChroma * CHROMATIC_RED_SHIFT_RATIO);
+    const blueOffset = safeChroma * CHROMATIC_BLUE_SHIFT_RATIO;
+    return {
+        redScale: safeScale * (1 - redOffset),
+        blueScale: safeScale * (1 + blueOffset),
+        blueMultiplier: 1 + blueOffset,
+    };
 }
 
 export function resolveGlassConfig(options: LiquidGlassOptions = {}): GlassConfig {
@@ -539,6 +675,8 @@ export function resolveGlassConfig(options: LiquidGlassOptions = {}): GlassConfi
         Number.isFinite(effectiveOptions.blur)
             ? Math.max(0, effectiveOptions.blur!)
             : DEFAULT_GLASS_CONFIG.blur;
+    const sharpness = resolveOptionalSharpness(effectiveOptions.sharpness);
+    const effectiveSharpness = resolveGlassSharpness(sharpness, blur);
     const saturation = resolveGlassSaturation(effectiveOptions.saturation);
     const ior =
         Number.isFinite(effectiveOptions.ior)
@@ -555,13 +693,12 @@ export function resolveGlassConfig(options: LiquidGlassOptions = {}): GlassConfi
     const hollow = effectiveOptions.hollow ?? DEFAULT_GLASS_CONFIG.hollow;
     const alwaysOn = effectiveOptions.alwaysOn ?? DEFAULT_GLASS_CONFIG.alwaysOn;
     const coreFilter = effectiveOptions.coreFilter ?? DEFAULT_GLASS_CONFIG.coreFilter;
-    const abbeNumber =
-        typeof effectiveOptions.abbeNumber === "number" && Number.isFinite(effectiveOptions.abbeNumber)
-            ? effectiveOptions.abbeNumber
-            : undefined;
-    const chromaticAberration =
-        effectiveOptions.chromaticAberration ?? (abbeNumber !== undefined && abbeNumber > 0);
-    const chromaAmount = resolveChromaticAberration(chromaticAberration, abbeNumber);
+    const abbeNumber = resolveAbbeNumber(effectiveOptions.abbeNumber);
+    const chromaticAberration = normalizeChromaticAberrationOption(
+        effectiveOptions.chromaticAberration,
+        abbeNumber,
+    );
+    const chromaAmount = resolveEffectiveChromaticAberration(chromaticAberration, abbeNumber, ior);
 
     const idParts = [
         "lg",
@@ -579,6 +716,7 @@ export function resolveGlassConfig(options: LiquidGlassOptions = {}): GlassConfi
         chromaAmount > 0 ? `ca${chromaAmount.toFixed(3)}` : "ca0",
     ];
     if (saturation !== undefined) idParts.push(`sat${saturation}`);
+    if (effectiveSharpness > 0) idParts.push(`sh${effectiveSharpness.toFixed(2)}`);
     if (cornerStyle === "squircle") {
         idParts.push("sq");
     }
@@ -597,6 +735,7 @@ export function resolveGlassConfig(options: LiquidGlassOptions = {}): GlassConfi
         scaleRatio,
         maxScaleMultiplier,
         blur,
+        ...(sharpness !== undefined ? { sharpness } : {}),
         saturation,
         ior,
         radius,

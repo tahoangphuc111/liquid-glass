@@ -157,6 +157,7 @@ For selector-driven pages without per-element controllers:
 | `scaleRatio` | `number` | `2.35` | Displacement strength multiplier |
 | `maxScaleMultiplier` | `number` | `5.5` | Upper clamp on displacement scale relative to the fitted bezel |
 | `blur` | `number` | `2` | Backdrop blur radius in px (`0` on switches) |
+| `sharpness` | `number` | auto (`0.65` when `blur <= 0`, otherwise `0`) | Backdrop resolution & crispness multiplier from `0` (standard budget) to `1` (up to `4x` supersampling / `4096px` scene capture). Omit to automatically increase resolution when `blur` is `0` |
 | `saturation` | `number` | renderer default | Backdrop color multiplier from 0 (grayscale) through 1 (unchanged color) to 4 |
 | `ior` | `number` | `2.15` | Index of refraction (`1.0` air, `1.33` water, `1.5+` glass) |
 | `radius` | `number` | `18` | Fallback corner radius in px when CSS border-radius is unset |
@@ -168,7 +169,8 @@ For selector-driven pages without per-element controllers:
 | `tintOpacity` | `number` | `0.12` (WebGL) | Tint blend opacity (`0` to `1`) |
 | `highlight` | `number` | `0.44` (WebGL) | Rim highlight intensity |
 | `pixelRatio` | `number` | Device DPR | Render scale override for WebGL / scene capture |
-| `chromaticAberration` | `boolean \| number` | `false` | RGB edge dispersion from 0 to 1. Use `true` for the default material strength or `false` to disable it |
+| `chromaticAberration` | `boolean \| number` | `false` | Normalized RGB edge dispersion from 0 (off) to 1 (full optical crystal strength). Use `true` for the default strength (`0.35`) or `false` to disable it |
+| `abbeNumber` | `number` | `58.5` | Material Abbe number (`10` to `120`; lower values increase dispersion). Setting a positive `abbeNumber` activates dispersion unless `chromaticAberration: false` |
 | `interactive` | `boolean` | `false` | Hover/press spring response |
 | `draggable` | `boolean \| "elastic"` | `false` | Drag translation or elastic droplet stretch |
 | `coalesce` | `boolean` | `true` | Merges nearby WebGL glass surfaces smoothly |
@@ -200,6 +202,6 @@ const glass = createLiquidGlass(panel, {
 glass.update({ saturation: undefined, chromaticAberration: undefined });
 ```
 
-Omit these options to keep the renderer's existing look and the selected preset's dispersion. Saturation affects the backdrop before the tint is composited. A custom `coreFilter` controls its own CSS filter stack. WASM/SVG and WebGL support chromatic aberration, while the CSS fallback supports saturation.
+Omit these options to keep the renderer's existing look and the selected preset's dispersion. Saturation affects the backdrop before the tint is composited. A custom `coreFilter` controls its own CSS filter stack. WASM/SVG and WebGL share the same chromatic dispersion model (combining `chromaticAberration`, `abbeNumber`, and `ior` with asymmetric red/blue channel ratios), while the CSS fallback supports saturation.
 
-Use `data-lg-saturation="1.3"` and `data-lg-chromatic-aberration="0.18"` in HTML. The value `1` selects full strength, and `true` selects the default strength. The `<liquid-glass>` element also accepts `saturation` and `chromatic-aberration` without the `data-lg-` prefix.
+Use `data-lg-saturation="1.3"`, `data-lg-chromatic-aberration="0.18"`, and `data-lg-abbe-number="28"` in HTML. The value `1` selects full strength, and `true` (or an empty boolean attribute such as `<liquid-glass chromatic-aberration>`) selects the default strength. The `<liquid-glass>` element also accepts `saturation`, `chromatic-aberration`, and `abbe-number` without the `data-lg-` prefix.

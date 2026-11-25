@@ -1,5 +1,6 @@
 import { mergeGlassOptions } from "./config.js";
-import { createLiquidGlass, createLiquidGlassController, observeSharedElementResize } from "./controller.js";
+import { createLiquidGlass, createLiquidGlassController } from "./controller.js";
+import { getMediaQueries, observeSharedElementResize } from "./observer.js";
 import { buildSpringPropagator, type SpringPropagator } from "./spring.js";
 import type {
     GlassEngine,
@@ -9,21 +10,22 @@ import type {
     LiquidGlassSwitchOptions,
 } from "./types.js";
 
-const POSITION_STIFFNESS = 380;
-const POSITION_DAMPING = 26;
+const POSITION_STIFFNESS = 540;
+const POSITION_DAMPING = 40;
 
-const SWELL_STIFFNESS = 420;
-const SWELL_DAMPING = 22;
-const SWELL_PEAK = 1.14;
+const SWELL_STIFFNESS = 590;
+const SWELL_DAMPING = 35;
+const SWELL_PEAK = 1.10;
+const MOUSE_SWELL = 1.055;
 const INV_SWELL_SPAN = 1 / (SWELL_PEAK - 1);
-const FLIGHT_SWELL_COEFF = ((SWELL_PEAK - 1) * 0.6) / 800;
-const TAP_HOP_DURATION_MS = 60;
+const FLIGHT_SWELL_COEFF = 0.045 / 800;
+const TAP_HOP_DURATION_MS = 50;
 
-const WOBBLE_STIFFNESS = 540;
-const WOBBLE_DAMPING = 16;
-const WOBBLE_MAX_STRETCH = 0.2;
-const WOBBLE_MAX_SQUASH = -0.12;
-const WOBBLE_IMPACT_FACTOR = 0.00018;
+const WOBBLE_STIFFNESS = 620;
+const WOBBLE_DAMPING = 31;
+const WOBBLE_MAX_STRETCH = 0.075;
+const WOBBLE_MAX_SQUASH = -0.055;
+const WOBBLE_IMPACT_FACTOR = 0.00009;
 
 const DRAG_THRESHOLD_PX = 4;
 const RUBBER_OVERDRAG_RANGE_PX = 38;
@@ -347,12 +349,32 @@ export function createGlassSwitch(
     let onChangeCallback = options.onChange;
     let userOnEngineChange = options.onEngineChange;
     let isSwitchInitialized = false;
+    let isGliderHighlightActive = false;
+    let appliedGliderHighlight: number | null = null;
+    let syncingGliderHighlight = false;
+    let gliderGlassRef: (LiquidGlassInstance & { refreshMotion(sceneChanged?: boolean): void }) | null = null;
+
+    function syncGliderHighlightForEngine(engine: GlassEngine): void {
+        if (!gliderGlassRef || syncingGliderHighlight) return;
+        const baseHighlight = gliderOptions.highlight ?? 0.62;
+        const desiredHighlight = engine === "webgl" && !isGliderHighlightActive ? 0 : baseHighlight;
+        if (appliedGliderHighlight === desiredHighlight) return;
+        appliedGliderHighlight = desiredHighlight;
+        syncingGliderHighlight = true;
+        try {
+            gliderGlassRef.update({ highlight: desiredHighlight });
+        } finally {
+            syncingGliderHighlight = false;
+        }
+    }
+
     function syncGlassAttribute(nextEngine: GlassEngine): void {
         if (nextEngine === "css") {
             element.removeAttribute("data-lg-switch-glass");
         } else {
             element.setAttribute("data-lg-switch-glass", "1");
         }
+        syncGliderHighlightForEngine(nextEngine);
         if (isSwitchInitialized) {
             renderGliderTransform(true);
         }
@@ -374,7 +396,7 @@ export function createGlassSwitch(
             scaleRatio: glider ? 2.1 : 1.05,
             maxScaleMultiplier: glider ? 2.8 : 1.8,
             tintOpacity: glider ? 0.07 : 0.06,
-            highlight: glider ? 0.46 : 0.34,
+            highlight: glider ? 0.62 : 0.48,
             ...stripSwitchOwnOptions(switchOptions),
             blur: 0,
             pill: true,
@@ -393,26 +415,19 @@ export function createGlassSwitch(
 
     let trackOptions = resolvePartOptions(false);
     let gliderOptions = resolvePartOptions(true);
-    let isGliderHighlightActive = false;
     const trackGlass: LiquidGlassInstance = createLiquidGlass(element, trackOptions);
     const gliderGlass = createLiquidGlassController(gliderEl, gliderOptions);
-    if (gliderGlass.engine === "webgl") {
-        gliderGlass.update({ highlight: 0 });
-    }
+    gliderGlassRef = gliderGlass;
+    appliedGliderHighlight = gliderOptions.highlight ?? 0.62;
     syncGlassAttribute(gliderGlass.engine);
 
     function syncGliderWebglHighlight(active: boolean): void {
         if (isGliderHighlightActive === active) return;
         isGliderHighlightActive = active;
-        if (gliderGlass.engine === "webgl") {
-            gliderGlass.update({ highlight: active ? (gliderOptions.highlight ?? 0.46) : 0 });
-        }
+        syncGliderHighlightForEngine(gliderGlass.engine);
     }
 
-    const reducedMotionQuery =
-        typeof window !== "undefined" && typeof window.matchMedia === "function"
-            ? window.matchMedia("(prefers-reduced-motion: reduce)")
-            : null;
+    const { reducedMotionQuery } = getMediaQueries();
 
     let lastPropagatorDt = -1;
     let lastPropagatorSlot = -1;
@@ -1007,14 +1022,14 @@ export function createGlassSwitch(
             }
         }
 
-        const rawVel = isDragging ? smoothedDragVel : velX * 0.001;
+        const rawVel = reducedMotionQuery?.matches ? 0 : isDragging ? smoothedDragVel : velX * 0.001;
         const speedMs = Math.abs(rawVel);
         const direction = rawVel > 0 ? 1 : rawVel < 0 ? -1 : 0;
         const stepSpan =
             anchors.length >= 2
                 ? getTravelSpan() / Math.max(1, anchors.length - 1)
                 : anchors[0]!.width;
-        const lead = direction * speedMs * 0.06 * stepSpan;
+        const lead = direction * Math.min(4, speedMs * 0.03 * stepSpan);
 
         const clampedWobble = Math.max(
             WOBBLE_MAX_SQUASH,
@@ -1064,7 +1079,7 @@ export function createGlassSwitch(
     }
 
     function checkSettled(restingSwell: number): boolean {
-        if (isDragging && !reducedMotionQuery?.matches && Math.abs(smoothedDragVel) >= 0.005) return false;
+        if (isDragging && Math.abs(smoothedDragVel) >= 0.005) return false;
         if (performance.now() < holdSwellUntil) {
             return false;
         }
@@ -1083,20 +1098,7 @@ export function createGlassSwitch(
             return;
         }
 
-        if (reducedMotionQuery?.matches) {
-            const lerpFactor = Math.min(1, dt * 18);
-            posX += (targetPosX - posX) * lerpFactor;
-            velX = 0;
-            swell = 1.0;
-            velSwell = 0;
-            wobble = 0;
-            velWobble = 0;
-            renderGliderTransform();
-            return;
-        }
-
-        const clampedDt = Math.min(0.064, Math.max(0.001, dt));
-        syncPropagator(clampedDt);
+        syncPropagator(dt);
         const isHoldingSwell = performance.now() < holdSwellUntil;
 
         if (!isDragging) {
@@ -1107,13 +1109,9 @@ export function createGlassSwitch(
         }
 
         const absVelX = Math.abs(velX);
-        const flightSwell =
-            1 +
-            (absVelX < 800
-                ? absVelX * FLIGHT_SWELL_COEFF
-                : (SWELL_PEAK - 1) * 0.6);
+        const flightSwell = 1 + Math.min(absVelX, 800) * FLIGHT_SWELL_COEFF;
         const desiredSwell = isHoldingSwell
-            ? SWELL_PEAK
+            ? Math.max(MOUSE_SWELL, flightSwell)
             : Math.max(targetSwell, flightSwell);
 
         const dispSwell = swell - desiredSwell;
@@ -1129,16 +1127,16 @@ export function createGlassSwitch(
         const speedMs = Math.abs(rawVel);
 
         if (isDragging) {
-            targetWobble = speedMs * 0.09;
+            targetWobble = Math.min(WOBBLE_MAX_STRETCH, speedMs * 0.045);
         } else {
-            targetWobble = speedMs * 0.08;
+            targetWobble = Math.min(WOBBLE_MAX_STRETCH, speedMs * 0.04);
             const distToTarget = Math.abs(posX - targetPosX);
             if (
                 distToTarget < 14 &&
                 absVelX > 25 &&
                 (velX * (targetPosX - posX) <= 0 || absVelX < Math.abs(prevVelX))
             ) {
-                velWobble -= WOBBLE_IMPACT_FACTOR * absVelX * (clampedDt * 60);
+                velWobble -= WOBBLE_IMPACT_FACTOR * absVelX * (dt * 60);
             }
         }
         prevVelX = velX;
@@ -1160,7 +1158,25 @@ export function createGlassSwitch(
             rafId = 0;
         }
         element.classList.remove("is-animating");
-        gliderEl.style.willChange = "auto";
+    }
+
+    function settleGlider(restingSwell = 1): void {
+        posX = targetPosX;
+        velX = 0;
+        swell = restingSwell;
+        velSwell = 0;
+        wobble = 0;
+        velWobble = 0;
+        prevVelX = 0;
+        renderGliderTransform();
+        stopLoop();
+    }
+
+    function onReducedMotionChange(): void {
+        if (!reducedMotionQuery?.matches) return;
+        holdSwellUntil = 0;
+        targetSwell = 1;
+        settleGlider();
     }
 
     function onAnimationFrame(timestamp: number): void {
@@ -1168,26 +1184,19 @@ export function createGlassSwitch(
             return;
         }
 
-        const dt =
-            lastFrameTime > 0
-                ? Math.min(0.064, Math.max(0.001, (timestamp - lastFrameTime) * 0.001))
-                : 1 / 60;
+        if (reducedMotionQuery?.matches) {
+            onReducedMotionChange();
+            return;
+        }
+
+        const dt = Math.min(0.064, Math.max(0.001, (timestamp - lastFrameTime) * 0.001));
         lastFrameTime = timestamp;
 
         stepPhysics(dt);
 
-        const restingSwell = reducedMotionQuery?.matches ? 1 : targetSwell;
-        if (checkSettled(restingSwell)) {
-            posX = targetPosX;
-            velX = 0;
-            swell = restingSwell;
-            velSwell = 0;
-            wobble = 0;
-            velWobble = 0;
-            prevVelX = 0;
+        if (checkSettled(targetSwell)) {
             if (isDragging) smoothedDragVel = 0;
-            renderGliderTransform(true);
-            stopLoop();
+            settleGlider(targetSwell);
             return;
         }
 
@@ -1198,10 +1207,13 @@ export function createGlassSwitch(
         if (isDestroyed) {
             return;
         }
-        element.classList.add("is-animating");
-        gliderEl.style.willChange = "transform";
+        if (reducedMotionQuery?.matches) {
+            onReducedMotionChange();
+            return;
+        }
         if (!rafId) {
-            lastFrameTime = 0;
+            element.classList.add("is-animating");
+            lastFrameTime = performance.now();
             rafId = requestAnimationFrame(onAnimationFrame);
         }
     }
@@ -1224,19 +1236,13 @@ export function createGlassSwitch(
         targetPosX = targetAnchor.left;
 
         if (!animate || reducedMotionQuery?.matches) {
-            posX = targetPosX;
-            velX = 0;
-            swell = 1.0;
-            velSwell = 0;
-            wobble = 0;
-            velWobble = 0;
-            renderGliderTransform(true);
-            stopLoop();
+            holdSwellUntil = 0;
+            settleGlider();
         } else {
             if (fromTapHop) {
                 targetSwell = 1.0;
                 holdSwellUntil = performance.now() + TAP_HOP_DURATION_MS;
-                velWobble += 0.18;
+                velWobble += 0.10;
             }
             startLoop();
         }
@@ -1292,10 +1298,8 @@ export function createGlassSwitch(
         syncGliderWebglHighlight(true);
 
         if (!reducedMotionQuery?.matches) {
-            targetSwell = SWELL_PEAK;
+            targetSwell = event.pointerType === "touch" || event.pointerType === "pen" ? SWELL_PEAK : MOUSE_SWELL;
             holdSwellUntil = 0;
-            wobble = -0.05;
-            velWobble = -0.16;
             startLoop();
         }
 
@@ -1418,7 +1422,7 @@ export function createGlassSwitch(
             velX = releaseVel * 1000;
             targetSwell = 1.0;
             holdSwellUntil = 0;
-            velWobble += Math.abs(releaseVel) * 0.22;
+            velWobble += Math.abs(releaseVel) * 0.12;
 
             commitActiveIndex(nextIndex, true, true, false);
         } else {
@@ -1553,6 +1557,7 @@ export function createGlassSwitch(
     element.addEventListener("lostpointercapture", handlePointerCancel);
     element.addEventListener("click", handleContainerClick);
     element.addEventListener("keydown", handleKeyDown);
+    reducedMotionQuery?.addEventListener?.("change", onReducedMotionChange);
 
     function refreshAnchorLayout(): void {
         if (isDestroyed) return;
@@ -1659,7 +1664,7 @@ export function createGlassSwitch(
             commitActiveIndex(boundedIndex, animate, true, true);
         },
         update(nextOptions: Partial<LiquidGlassSwitchOptions>): void {
-            if (isDestroyed) return;
+            if (isDestroyed || Object.keys(nextOptions).length === 0) return;
             switchOptions = { ...switchOptions, ...nextOptions };
             if ("onChange" in nextOptions) onChangeCallback = nextOptions.onChange;
             if ("onEngineChange" in nextOptions) userOnEngineChange = nextOptions.onEngineChange;
@@ -1711,15 +1716,17 @@ export function createGlassSwitch(
                 "gliderOptions" in nextOptions ||
                 Object.keys(nextOptions).some((key) => !SWITCH_GLASS_OWN_OPTION_KEYS.has(key) && key !== "onEngineChange")
             ) {
+                const prevTrack = trackOptions;
+                const prevGlider = gliderOptions;
                 const nextTrack = resolvePartOptions(false);
                 const nextGlider = resolvePartOptions(true);
-                updateGlassPart(trackGlass, trackOptions, nextTrack);
-                updateGlassPart(gliderGlass, gliderOptions, nextGlider);
                 trackOptions = nextTrack;
                 gliderOptions = nextGlider;
-                if (gliderGlass.engine === "webgl" && !isGliderHighlightActive) {
-                    gliderGlass.update({ highlight: 0 });
+                if (nextGlider.highlight !== prevGlider.highlight) {
+                    appliedGliderHighlight = nextGlider.highlight ?? 0.46;
                 }
+                updateGlassPart(trackGlass, prevTrack, nextTrack);
+                updateGlassPart(gliderGlass, prevGlider, nextGlider);
                 syncGlassAttribute(gliderGlass.engine);
             }
         },
@@ -1764,6 +1771,7 @@ export function createGlassSwitch(
             element.removeEventListener("lostpointercapture", handlePointerCancel);
             element.removeEventListener("click", handleContainerClick);
             element.removeEventListener("keydown", handleKeyDown);
+            reducedMotionQuery?.removeEventListener?.("change", onReducedMotionChange);
             unobserveSwitchResize();
             for (const unsubscribe of itemResizeSubscriptions.values()) unsubscribe();
             itemResizeSubscriptions.clear();
@@ -1782,7 +1790,6 @@ export function createGlassSwitch(
                 gliderEl.style.removeProperty("left");
                 gliderEl.style.removeProperty("top");
                 gliderEl.style.removeProperty("opacity");
-                gliderEl.style.removeProperty("will-change");
             }
             if (createdTrack) {
                 trackEl.remove();

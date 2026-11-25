@@ -1,6 +1,13 @@
-import { parseCssCornerRadiusPx } from "./config.js";
+import { parseCssCornerRadiusPx, resolveSharpnessPixelRatio } from "./config.js";
 import { automaticRoundedPixelRatio, resizeCanvas, SMALL_SCENE_DIMENSION, useSmallMemoryBudget } from "./renderBudget.js";
 import { parseCssColorToRgbaReadonly } from "./cssColor.js";
+import { observeSharedElementResize } from "./observer.js";
+import { subscribeSceneCaptureSignals } from "./sceneCaptureSignals.js";
+import {
+    prepareSceneTextLayouts,
+    resolveWrappedTextLines,
+    type SceneTextLayouts,
+} from "./sceneTextLayout.js";
 import type { SceneCaptureController } from "./types.js";
 
 const MODERN_COLOR_PREFIX_PATTERN = /^(?:oklch|oklab|lch|lab|hwb|color-mix|color)\(/i;
@@ -185,18 +192,51 @@ interface ParsedStopToken {
 const MAX_PARSED_STOPS_CACHE = 128;
 const parsedGradientStopsCache = new Map<string, readonly ParsedStopToken[]>();
 
+function extractGradientStopColorAndRest(part: string): { colorToken: string; rest: string } | null {
+    const trimmed = part.trim();
+    if (!trimmed) return null;
+    const parenIndex = trimmed.indexOf("(");
+    if (
+        parenIndex > 0 &&
+        /^(?:color-mix|rgba?|hsla?|hwb|oklch|oklab|lch|lab|color)$/i.test(
+            trimmed.slice(0, parenIndex),
+        )
+    ) {
+        let depth = 0;
+        for (let index = parenIndex; index < trimmed.length; index++) {
+            const char = trimmed[index];
+            if (char === "(") {
+                depth++;
+            } else if (char === ")") {
+                depth--;
+                if (depth === 0) {
+                    return {
+                        colorToken: trimmed.slice(0, index + 1),
+                        rest: trimmed.slice(index + 1).trim(),
+                    };
+                }
+            }
+        }
+        return null;
+    }
+    const simpleMatch = trimmed.match(/^(#[0-9a-fA-F]{3,8}|[a-zA-Z]{3,20})(.*)$/);
+    if (!simpleMatch) return null;
+    return {
+        colorToken: simpleMatch[1]!,
+        rest: simpleMatch[2]!.trim(),
+    };
+}
+
 function getCachedStopTokens(cacheKey: string, args: readonly string[], angleStops: boolean): readonly ParsedStopToken[] {
     const cached = lruGet(parsedGradientStopsCache, cacheKey);
     if (cached !== undefined) return cached;
     const tokens: ParsedStopToken[] = [];
     for (let idx = 0; idx < args.length; idx++) {
         const part = args[idx]!;
-        const colorMatch = part.match(
-            /^(#[0-9a-fA-F]{3,8}|color-mix\((?:[^()]+|\([^()]*\))+\)|(?:rgba?|hsla?|hwb|oklch|oklab|lch|lab|color)\([^)]+\)|[a-zA-Z]{3,20})(.*)$/,
-        );
-        if (!colorMatch) continue;
-        const color = toCanvasCssColor(colorMatch[1]);
-        const rest = colorMatch[2].trim();
+        const parsedStop = extractGradientStopColorAndRest(part);
+        if (!parsedStop) continue;
+        const color = toCanvasCssColor(parsedStop.colorToken);
+        const rest = parsedStop.rest;
         if (!rest) {
             tokens.push({ color, kind: "none", value: 0 });
             continue;
@@ -822,14 +862,16 @@ function drawBackgroundUrlLayer(
     if (typeof Image === "undefined" || typeof ctx.drawImage !== "function") return false;
     const imageUrl = extractCssUrl(layer);
     if (!imageUrl) return false;
+    const baseUrl = (ctx.canvas?.ownerDocument ?? document).baseURI;
+    const cacheKey = `${baseUrl}\n${imageUrl}`;
 
-    let entry = backgroundUrlCache.get(imageUrl);
+    let entry = lruGet(backgroundUrlCache, cacheKey);
     if (!entry) {
-        if (backgroundUrlCache.size >= MAX_BG_URL_CACHE_ENTRIES) {
-            const oldestKey = backgroundUrlCache.keys().next().value;
-            if (oldestKey !== undefined) {
-                backgroundUrlCache.delete(oldestKey);
-            }
+        let url: URL;
+        try {
+            url = new URL(imageUrl, baseUrl);
+        } catch {
+            return false;
         }
         const createdEntry: BackgroundUrlCacheEntry = {
             image: null,
@@ -838,19 +880,17 @@ function drawBackgroundUrlLayer(
         };
         entry = createdEntry;
         if (onAsyncAssetReady) createdEntry.listeners.add(onAsyncAssetReady);
-        backgroundUrlCache.set(imageUrl, createdEntry);
+        lruSet(backgroundUrlCache, cacheKey, createdEntry, MAX_BG_URL_CACHE_ENTRIES);
 
         const img = new Image();
-        if (
-            typeof window !== "undefined" &&
-            window.location &&
-            /^https?:/i.test(imageUrl) &&
-            !imageUrl.startsWith(window.location.origin)
-        ) {
-            img.crossOrigin = "anonymous";
-        }
+        if (url.protocol === "http:" || url.protocol === "https:") img.crossOrigin = "anonymous";
         const finalize = (success: boolean) => {
-            if (backgroundUrlCache.get(imageUrl) !== createdEntry) return;
+            img.onload = null;
+            img.onerror = null;
+            if (backgroundUrlCache.get(cacheKey) !== createdEntry) {
+                createdEntry.listeners.clear();
+                return;
+            }
             if (success && img.naturalWidth > 0 && img.naturalHeight > 0) {
                 createdEntry.image = img;
                 createdEntry.status = "ready";
@@ -867,8 +907,10 @@ function drawBackgroundUrlLayer(
         };
         img.onload = () => finalize(true);
         img.onerror = () => finalize(false);
-        img.src = imageUrl;
+        img.src = url.href;
         if (img.complete && img.naturalWidth > 0 && img.naturalHeight > 0) {
+            img.onload = null;
+            img.onerror = null;
             createdEntry.image = img;
             createdEntry.status = "ready";
             createdEntry.listeners.clear();
@@ -986,10 +1028,26 @@ function drawBackgroundImageLayers(
     }
 }
 
+type TextBounds = Pick<DOMRect, "left" | "top" | "width" | "height">;
+
+function getTextBounds(rects: DOMRectList): TextBounds | undefined {
+    if (rects.length <= 1) return rects[0];
+    const first = rects[0]!;
+    let { left, top, right, bottom } = first;
+    for (let index = 1; index < rects.length; index++) {
+        const line = rects[index]!;
+        left = Math.min(left, line.left);
+        top = Math.min(top, line.top);
+        right = Math.max(right, line.right);
+        bottom = Math.max(bottom, line.bottom);
+    }
+    return { left, top, width: right - left, height: bottom - top };
+}
+
 function resolveTextFill(
     ctx: CanvasRenderingContext2D,
     style: CSSStyleDeclaration,
-    rect: DOMRect,
+    rect: TextBounds,
     sourceRect: DOMRect,
 ): string | CanvasGradient {
     const clip =
@@ -1084,10 +1142,42 @@ interface ParsedBoxShadow {
 }
 
 const MAX_BOX_SHADOW_CACHE = 200;
-const boxShadowCache = new Map<string, ParsedBoxShadow[]>();
+const boxShadowCache = new Map<string, readonly ParsedBoxShadow[]>();
+const EMPTY_BOX_SHADOWS: readonly ParsedBoxShadow[] = Object.freeze([]);
 
-function parseCssBoxShadows(boxShadowStr: string): ParsedBoxShadow[] {
-    if (!boxShadowStr || boxShadowStr === "none") return [];
+function isOverflowClipped(value: string): boolean {
+    return value === "hidden" || value === "clip" || value === "auto" || value === "scroll";
+}
+
+function splitTopLevelWhitespace(text: string): string[] {
+    const tokens: string[] = [];
+    let depth = 0;
+    let tokenStart = -1;
+    for (let index = 0; index < text.length; index++) {
+        const code = text.charCodeAt(index);
+        if (code === 40) {
+            if (tokenStart < 0) tokenStart = index;
+            depth++;
+        } else if (code === 41) {
+            if (tokenStart < 0) tokenStart = index;
+            if (depth > 0) depth--;
+        } else if (code <= 32 && depth === 0) {
+            if (tokenStart >= 0) {
+                tokens.push(text.slice(tokenStart, index));
+                tokenStart = -1;
+            }
+        } else if (tokenStart < 0) {
+            tokenStart = index;
+        }
+    }
+    if (tokenStart >= 0) {
+        tokens.push(text.slice(tokenStart));
+    }
+    return tokens;
+}
+
+function parseCssBoxShadows(boxShadowStr: string): readonly ParsedBoxShadow[] {
+    if (!boxShadowStr || boxShadowStr === "none") return EMPTY_BOX_SHADOWS;
     const cached = lruGet(boxShadowCache, boxShadowStr);
     if (cached) return cached;
 
@@ -1102,15 +1192,12 @@ function parseCssBoxShadows(boxShadowStr: string): ParsedBoxShadow[] {
         const lengths: number[] = [];
         let color = "rgba(0, 0, 0, 0.25)";
 
-        const tokens =
-            layer.match(
-                /color-mix\((?:[^()]+|\([^()]*\))+\)|(?:rgba?|hsla?|hwb|oklch|oklab|lab|lch|color)\([^)]+\)|#[0-9a-fA-F]+|\S+/g,
-            ) ?? [];
+        const tokens = splitTopLevelWhitespace(layer);
         for (let tokenIndex = 0; tokenIndex < tokens.length; tokenIndex++) {
-            const token = tokens[tokenIndex];
+            const token = tokens[tokenIndex]!;
             if (token.toLowerCase() === "inset") {
                 inset = true;
-            } else if (/^-?(?:\d+\.?\d*|\.\d+)(?:px)?$/i.test(token)) {
+            } else if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:px)?$/i.test(token)) {
                 const value = Number.parseFloat(token);
                 if (Number.isFinite(value)) lengths.push(value);
             } else {
@@ -1136,7 +1223,7 @@ function parseCssBoxShadows(boxShadowStr: string): ParsedBoxShadow[] {
 
 function drawBoxShadows(
     ctx: CanvasRenderingContext2D,
-    shadows: ParsedBoxShadow[],
+    shadows: readonly ParsedBoxShadow[],
     leftPx: number,
     topPx: number,
     widthPx: number,
@@ -1218,6 +1305,21 @@ function drawBoxShadows(
     }
 }
 
+function applyBorderLineDash(
+    ctx: CanvasRenderingContext2D,
+    borderStyle: string,
+    lineWidth: number,
+): void {
+    if (typeof ctx.setLineDash !== "function") return;
+    if (borderStyle === "dashed") {
+        ctx.setLineDash([Math.max(2, lineWidth * 3), Math.max(2, lineWidth * 2)]);
+    } else if (borderStyle === "dotted") {
+        ctx.setLineDash([Math.max(1, lineWidth), Math.max(1, lineWidth)]);
+    } else {
+        ctx.setLineDash([]);
+    }
+}
+
 function drawElementBorder(
     ctx: CanvasRenderingContext2D,
     style: CSSStyleDeclaration,
@@ -1229,10 +1331,14 @@ function drawElementBorder(
 ): void {
     if (typeof ctx.stroke !== "function") return;
     const hasBorderStyle = (value: string) => Boolean(value && value !== "none" && value !== "hidden");
-    const topW = hasBorderStyle(style.borderTopStyle) ? Number.parseFloat(style.borderTopWidth || "0") || 0 : 0;
-    const rightW = hasBorderStyle(style.borderRightStyle) ? Number.parseFloat(style.borderRightWidth || "0") || 0 : 0;
-    const bottomW = hasBorderStyle(style.borderBottomStyle) ? Number.parseFloat(style.borderBottomWidth || "0") || 0 : 0;
-    const leftW = hasBorderStyle(style.borderLeftStyle) ? Number.parseFloat(style.borderLeftWidth || "0") || 0 : 0;
+    const topStyle = style.borderTopStyle;
+    const rightStyle = style.borderRightStyle;
+    const bottomStyle = style.borderBottomStyle;
+    const leftStyle = style.borderLeftStyle;
+    const topW = hasBorderStyle(topStyle) ? Number.parseFloat(style.borderTopWidth || "0") || 0 : 0;
+    const rightW = hasBorderStyle(rightStyle) ? Number.parseFloat(style.borderRightWidth || "0") || 0 : 0;
+    const bottomW = hasBorderStyle(bottomStyle) ? Number.parseFloat(style.borderBottomWidth || "0") || 0 : 0;
+    const leftW = hasBorderStyle(leftStyle) ? Number.parseFloat(style.borderLeftWidth || "0") || 0 : 0;
     if (topW <= 0 && rightW <= 0 && bottomW <= 0 && leftW <= 0) return;
 
     const topColor = style.borderTopColor;
@@ -1244,6 +1350,9 @@ function drawElementBorder(
         topW === rightW &&
         topW === bottomW &&
         topW === leftW &&
+        topStyle === rightStyle &&
+        topStyle === bottomStyle &&
+        topStyle === leftStyle &&
         topColor === rightColor &&
         topColor === bottomColor &&
         topColor === leftColor;
@@ -1256,6 +1365,7 @@ function drawElementBorder(
         if (strokeW <= 0 || strokeH <= 0) return;
         ctx.strokeStyle = toCanvasCssColor(topColor);
         ctx.lineWidth = topW;
+        applyBorderLineDash(ctx, topStyle, topW);
         if (traceRoundedOrRectPath(ctx, leftPx + inset, topPx + inset, strokeW, strokeH, offsetCornerRadii(radiusPx, -inset))) {
             ctx.stroke();
         } else if (typeof ctx.strokeRect === "function") {
@@ -1271,19 +1381,28 @@ function drawElementBorder(
     if (typeof ctx.beginPath !== "function" || typeof ctx.moveTo !== "function" || typeof ctx.lineTo !== "function") {
         return;
     }
-    const drawSide = (edgeW: number, color: string, x1: number, y1: number, x2: number, y2: number) => {
+    const drawSide = (
+        edgeW: number,
+        edgeStyle: string,
+        color: string,
+        x1: number,
+        y1: number,
+        x2: number,
+        y2: number,
+    ) => {
         if (edgeW <= 0 || !color || color === "transparent" || color === "rgba(0, 0, 0, 0)") return;
         ctx.beginPath();
         ctx.strokeStyle = toCanvasCssColor(color);
         ctx.lineWidth = edgeW;
+        applyBorderLineDash(ctx, edgeStyle, edgeW);
         ctx.moveTo(x1, y1);
         ctx.lineTo(x2, y2);
         ctx.stroke();
     };
-    drawSide(topW, topColor, leftPx, topPx + topW * 0.5, leftPx + widthPx, topPx + topW * 0.5);
-    drawSide(rightW, rightColor, leftPx + widthPx - rightW * 0.5, topPx, leftPx + widthPx - rightW * 0.5, topPx + heightPx);
-    drawSide(bottomW, bottomColor, leftPx, topPx + heightPx - bottomW * 0.5, leftPx + widthPx, topPx + heightPx - bottomW * 0.5);
-    drawSide(leftW, leftColor, leftPx + leftW * 0.5, topPx, leftPx + leftW * 0.5, topPx + heightPx);
+    drawSide(topW, topStyle, topColor, leftPx, topPx + topW * 0.5, leftPx + widthPx, topPx + topW * 0.5);
+    drawSide(rightW, rightStyle, rightColor, leftPx + widthPx - rightW * 0.5, topPx, leftPx + widthPx - rightW * 0.5, topPx + heightPx);
+    drawSide(bottomW, bottomStyle, bottomColor, leftPx, topPx + heightPx - bottomW * 0.5, leftPx + widthPx, topPx + heightPx - bottomW * 0.5);
+    drawSide(leftW, leftStyle, leftColor, leftPx + leftW * 0.5, topPx, leftPx + leftW * 0.5, topPx + heightPx);
 }
 
 function parseObjectPositionFraction(token: string, axisSize: number, contentSize: number): number {
@@ -1445,13 +1564,18 @@ function drawInlineSvgElement(
     const blobUrl = URL.createObjectURL(blob);
     const img = new Image();
     const finalize = (success: boolean) => {
+        img.onload = null;
+        img.onerror = null;
         if (typeof URL.revokeObjectURL === "function") {
             try {
                 URL.revokeObjectURL(blobUrl);
             } catch {
             }
         }
-        if (svgRasterCache.get(svgEl) !== entry) return;
+        if (svgRasterCache.get(svgEl) !== entry) {
+            entry.listeners.clear();
+            return;
+        }
         const pendingListeners = Array.from(entry.listeners);
         entry.listeners.clear();
         if (success) {
@@ -1490,33 +1614,17 @@ function intersectsClipBounds(
     );
 }
 
-function extractWordOffsets(normalizedText: string): { starts: number[]; ends: number[] } {
-    const starts: number[] = [];
-    const ends: number[] = [];
-    const length = normalizedText.length;
-    let wordStart = 0;
-    for (let index = 0; index <= length; index++) {
-        if (index === length || normalizedText.charCodeAt(index) === 32) {
-            if (index > wordStart) {
-                starts.push(wordStart);
-                ends.push(index);
-            }
-            wordStart = index + 1;
-        }
-    }
-    return { starts, ends };
-}
-
 const MAX_CAPTURE_DIM = 3072;
 const MAX_CAPTURE_AREA = 8_388_608;
-const ROUNDED_MIN_CAPTURE_SCALE = 2;
-const ROUNDED_MAX_CAPTURE_SCALE = 3;
-const UNROUNDED_MAX_CAPTURE_DIM = 320;
-const UNROUNDED_CAPTURE_SCALE = 0.125;
+const ROUNDED_MIN_CAPTURE_SCALE = 2.5;
+const ROUNDED_MAX_CAPTURE_SCALE = 3.5;
+const UNROUNDED_MAX_CAPTURE_DIM = 256;
+const UNROUNDED_CAPTURE_SCALE = 0.0625;
 
 export interface SceneCaptureQualityOptions {
     pixelRatio?: number;
     radius?: number;
+    sharpness?: number;
 }
 
 export function resolveCaptureDimensions(
@@ -1524,20 +1632,26 @@ export function resolveCaptureDimensions(
     sourceHeight: number,
     requestedPixelRatio?: number,
     radius?: number,
+    sharpness?: number,
 ): { texWidth: number; texHeight: number } {
     const hasExplicitPixelRatio =
         typeof requestedPixelRatio === "number" &&
         Number.isFinite(requestedPixelRatio) &&
         requestedPixelRatio > 0;
+    const safeSharpness =
+        typeof sharpness === "number" && Number.isFinite(sharpness) && sharpness > 0
+            ? Math.min(1, sharpness)
+            : 0;
     const isUnrounded =
         !hasExplicitPixelRatio &&
+        safeSharpness <= 0 &&
         typeof radius === "number" &&
         Number.isFinite(radius) &&
         radius <= 0;
 
     if (isUnrounded) {
-        const desiredW = Math.max(64, Math.round(sourceWidth * UNROUNDED_CAPTURE_SCALE));
-        const desiredH = Math.max(64, Math.round(sourceHeight * UNROUNDED_CAPTURE_SCALE));
+        const desiredW = Math.max(32, Math.round(sourceWidth * UNROUNDED_CAPTURE_SCALE));
+        const desiredH = Math.max(32, Math.round(sourceHeight * UNROUNDED_CAPTURE_SCALE));
         const dimScale = UNROUNDED_MAX_CAPTURE_DIM / Math.max(desiredW, desiredH);
         const fitScale = Math.min(1, dimScale);
         return {
@@ -1546,12 +1660,29 @@ export function resolveCaptureDimensions(
         };
     }
 
+    const autoDpr = automaticRoundedPixelRatio(ROUNDED_MIN_CAPTURE_SCALE, ROUNDED_MAX_CAPTURE_SCALE);
     const dprScale = hasExplicitPixelRatio
         ? Math.min(4, Math.max(0.5, requestedPixelRatio!))
-        : automaticRoundedPixelRatio(ROUNDED_MIN_CAPTURE_SCALE, ROUNDED_MAX_CAPTURE_SCALE);
+        : safeSharpness > 0
+          ? resolveSharpnessPixelRatio(safeSharpness, autoDpr)
+          : autoDpr;
     const smallMemory = useSmallMemoryBudget();
-    const maxDim = smallMemory ? SMALL_SCENE_DIMENSION : hasExplicitPixelRatio ? 4096 : MAX_CAPTURE_DIM;
-    const maxArea = hasExplicitPixelRatio ? 16_000_000 : MAX_CAPTURE_AREA;
+    const maxDim =
+        safeSharpness > 0
+            ? smallMemory
+                ? Math.round(SMALL_SCENE_DIMENSION + (4096 - SMALL_SCENE_DIMENSION) * safeSharpness)
+                : 4096
+            : smallMemory
+              ? SMALL_SCENE_DIMENSION
+              : hasExplicitPixelRatio
+                ? 4096
+                : MAX_CAPTURE_DIM;
+    const maxArea =
+        safeSharpness > 0
+            ? Math.round(MAX_CAPTURE_AREA + (16_000_000 - MAX_CAPTURE_AREA) * safeSharpness)
+            : hasExplicitPixelRatio
+              ? 16_000_000
+              : MAX_CAPTURE_AREA;
     const desiredW = Math.max(2, Math.round(sourceWidth * dprScale));
     const desiredH = Math.max(2, Math.round(sourceHeight * dprScale));
     const dimScale = maxDim / Math.max(desiredW, desiredH);
@@ -1565,17 +1696,7 @@ export function resolveCaptureDimensions(
 
 function isOpaqueBackground(color: string | undefined): boolean {
     if (!color || color === "rgba(0, 0, 0, 0)" || color === "transparent") return false;
-    const trimmed = color.trim().toLowerCase();
-    if (!trimmed || trimmed === "transparent") return false;
-    const parsed = parseCssColorToRgbaReadonly(trimmed);
-    if (parsed) {
-        return parsed[3] >= 0.99;
-    }
-    const rgbaMatch = trimmed.match(
-        /^rgba\(\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*,\s*([\d.]+)\s*\)$/,
-    );
-    if (rgbaMatch && Number.parseFloat(rgbaMatch[1]) < 0.99) return false;
-    return true;
+    return parseCssColorToRgbaReadonly(color)?.[3] === 1;
 }
 
 function getCssColorLuminance(color: string | undefined): number | null {
@@ -1597,9 +1718,11 @@ function isDarkColorScheme(source: HTMLElement, rootStyle: CSSStyleDeclaration):
     const scheme = (rootStyle.colorScheme || "").toLowerCase();
     if (scheme.includes("dark") && !scheme.startsWith("light")) return true;
     if (scheme.startsWith("light") && !scheme.includes("dark")) return false;
-    if (source.classList.contains("dark") || source.getAttribute("data-theme") === "dark") {
-        return true;
-    }
+    const ancestorTheme = source.closest?.("[data-theme]")?.getAttribute("data-theme")?.trim().toLowerCase();
+    if (ancestorTheme === "dark") return true;
+    if (ancestorTheme === "light") return false;
+    if (source.classList.contains("dark")) return true;
+    if (source.classList.contains("light")) return false;
     if (typeof document !== "undefined") {
         const docEl = document.documentElement;
         const docScheme = (window.getComputedStyle(docEl).colorScheme || "").toLowerCase();
@@ -1612,6 +1735,14 @@ function isDarkColorScheme(source: HTMLElement, rootStyle: CSSStyleDeclaration):
             document.body?.getAttribute("data-theme") === "dark"
         ) {
             return true;
+        }
+        if (
+            docEl.classList.contains("light") ||
+            docEl.getAttribute("data-theme") === "light" ||
+            document.body?.classList.contains("light") ||
+            document.body?.getAttribute("data-theme") === "light"
+        ) {
+            return false;
         }
     }
     const inkLuma = getCssColorLuminance(rootStyle.color);
@@ -1638,6 +1769,7 @@ export function captureDomToCanvas(
     radius?: number,
     backdropOverride?: CaptureBackdropSource | null,
     onAsyncAssetReady?: () => void,
+    sharpness?: number,
 ): boolean {
     const sourceRect = source.getBoundingClientRect();
     if (sourceRect.width < 2 || sourceRect.height < 2) return false;
@@ -1647,6 +1779,7 @@ export function captureDomToCanvas(
         sourceRect.height,
         pixelRatio,
         radius,
+        sharpness,
     );
     resizeCanvas(canvas, texWidth, texHeight);
 
@@ -1719,7 +1852,7 @@ export function captureDomToCanvas(
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         const overrideCanvas = backdropOverride.canvas;
         const overrideElement = backdropOverride.element;
-        if (overrideElement && overrideElement.isConnected) {
+        if (overrideElement?.isConnected) {
             const overrideRect = overrideElement.getBoundingClientRect();
             if (overrideRect.width >= 2 && overrideRect.height >= 2) {
                 const overlapLeft = Math.max(sourceRect.left, overrideRect.left);
@@ -1742,7 +1875,7 @@ export function captureDomToCanvas(
                     ctx.drawImage(overrideCanvas, srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH);
                 }
             }
-        } else {
+        } else if (!overrideElement) {
             ctx.drawImage(overrideCanvas, 0, 0, texWidth, texHeight);
         }
         ctx.setTransform(scaleX, 0, 0, scaleY, 0, 0);
@@ -1752,25 +1885,26 @@ export function captureDomToCanvas(
     let clipMinY = 0;
     let clipMaxX = sourceRect.width;
     let clipMaxY = sourceRect.height;
+    let currentOpacity = 1;
+    let textLayouts: SceneTextLayouts | null | undefined;
 
-    const stack: Array<
-        | Element
-        | {
-              readonly popClip: true;
-              readonly prevMinX: number;
-              readonly prevMinY: number;
-              readonly prevMaxX: number;
-              readonly prevMaxY: number;
-          }
-    > = [source];
+    const POP_CLIP_SENTINEL = 0 as const;
+    const POP_OPACITY_SENTINEL = 1 as const;
+    const stack: Array<Element | typeof POP_CLIP_SENTINEL | typeof POP_OPACITY_SENTINEL> = [source];
+    const clipRestoreBounds: number[] = [];
+    const opacityRestoreStack: number[] = [];
     while (stack.length > 0) {
         const entry = stack.pop()!;
-        if ("popClip" in entry) {
+        if (entry === POP_CLIP_SENTINEL) {
             ctx.restore();
-            clipMinX = entry.prevMinX;
-            clipMinY = entry.prevMinY;
-            clipMaxX = entry.prevMaxX;
-            clipMaxY = entry.prevMaxY;
+            clipMaxY = clipRestoreBounds.pop()!;
+            clipMaxX = clipRestoreBounds.pop()!;
+            clipMinY = clipRestoreBounds.pop()!;
+            clipMinX = clipRestoreBounds.pop()!;
+            continue;
+        }
+        if (entry === POP_OPACITY_SENTINEL) {
+            currentOpacity = opacityRestoreStack.pop()!;
             continue;
         }
         const element = entry;
@@ -1793,7 +1927,9 @@ export function captureDomToCanvas(
 
         const style = element === source ? rootStyle : window.getComputedStyle(element);
         if (style.display === "none") continue;
-        const opacity = element === source ? 1 : Number.parseFloat(style.opacity || "1");
+        const rawOwnOpacity = element === source ? 1 : Number.parseFloat(style.opacity || "1");
+        const ownOpacity = Number.isFinite(rawOwnOpacity) ? Math.min(1, Math.max(0, rawOwnOpacity)) : 1;
+        const opacity = currentOpacity * ownOpacity;
         if (element !== source && (style.visibility === "hidden" || !(opacity > 0.01))) continue;
 
         let elementRect = element === source ? sourceRect : undefined;
@@ -1822,16 +1958,16 @@ export function captureDomToCanvas(
             }
 
             const parsedShadows =
-                boxShadowRaw && boxShadowRaw !== "none" ? parseCssBoxShadows(boxShadowRaw) : [];
+                boxShadowRaw && boxShadowRaw !== "none" ? parseCssBoxShadows(boxShadowRaw) : EMPTY_BOX_SHADOWS;
             const btW = style.borderTopWidth;
             const brW = style.borderRightWidth;
             const bbW = style.borderBottomWidth;
             const blW = style.borderLeftWidth;
             const hasBorder =
-                (btW !== "0px" && btW !== "" && btW !== "0" && style.borderTopStyle !== "none" && (Number.parseFloat(btW) || 0) > 0) ||
-                (brW !== "0px" && brW !== "" && brW !== "0" && style.borderRightStyle !== "none" && (Number.parseFloat(brW) || 0) > 0) ||
-                (bbW !== "0px" && bbW !== "" && bbW !== "0" && style.borderBottomStyle !== "none" && (Number.parseFloat(bbW) || 0) > 0) ||
-                (blW !== "0px" && blW !== "" && blW !== "0" && style.borderLeftStyle !== "none" && (Number.parseFloat(blW) || 0) > 0);
+                (btW !== "0px" && btW !== "" && btW !== "0" && style.borderTopStyle !== "none" && style.borderTopStyle !== "hidden" && (Number.parseFloat(btW) || 0) > 0) ||
+                (brW !== "0px" && brW !== "" && brW !== "0" && style.borderRightStyle !== "none" && style.borderRightStyle !== "hidden" && (Number.parseFloat(brW) || 0) > 0) ||
+                (bbW !== "0px" && bbW !== "" && bbW !== "0" && style.borderBottomStyle !== "none" && style.borderBottomStyle !== "hidden" && (Number.parseFloat(bbW) || 0) > 0) ||
+                (blW !== "0px" && blW !== "" && blW !== "0" && style.borderLeftStyle !== "none" && style.borderLeftStyle !== "hidden" && (Number.parseFloat(blW) || 0) > 0);
 
             if (hasSolidBg || hasGradientBg || parsedShadows.length > 0 || hasBorder) {
                 const bgRect = elementRect ??= element.getBoundingClientRect();
@@ -1902,13 +2038,13 @@ export function captureDomToCanvas(
             }
         }
 
-        const isOverflowClipped = (value: string): boolean =>
-            value === "hidden" || value === "clip" || value === "auto" || value === "scroll";
-        const clipsOverflow =
-            element !== source &&
-            (isOverflowClipped(style.overflow) ||
-                isOverflowClipped(style.overflowX) ||
-                isOverflowClipped(style.overflowY));
+        const overflow = style.overflow || "";
+        const overflowSeparator = overflow.indexOf(" ");
+        const clipsX = element !== source && isOverflowClipped(style.overflowX ||
+            (overflowSeparator < 0 ? overflow : overflow.slice(0, overflowSeparator)));
+        const clipsY = element !== source && isOverflowClipped(style.overflowY ||
+            (overflowSeparator < 0 ? overflow : overflow.slice(overflowSeparator + 1)));
+        const clipsOverflow = clipsX || clipsY;
         let clippedNextMinX = clipMinX;
         let clippedNextMinY = clipMinY;
         let clippedNextMaxX = clipMaxX;
@@ -1917,25 +2053,29 @@ export function captureDomToCanvas(
             const clipRect = elementRect ??= element.getBoundingClientRect();
             const clipLeft = clipRect.left - sourceRect.left;
             const clipTop = clipRect.top - sourceRect.top;
-            clippedNextMinX = clipLeft > clipMinX ? clipLeft : clipMinX;
-            clippedNextMinY = clipTop > clipMinY ? clipTop : clipMinY;
-            const clipRight = clipLeft + clipRect.width;
-            const clipBottom = clipTop + clipRect.height;
-            clippedNextMaxX = clipRight < clipMaxX ? clipRight : clipMaxX;
-            clippedNextMaxY = clipBottom < clipMaxY ? clipBottom : clipMaxY;
+            if (clipsX) {
+                clippedNextMinX = Math.max(clipMinX, clipLeft);
+                clippedNextMaxX = Math.min(clipMaxX, clipLeft + clipRect.width);
+            }
+            if (clipsY) {
+                clippedNextMinY = Math.max(clipMinY, clipTop);
+                clippedNextMaxY = Math.min(clipMaxY, clipTop + clipRect.height);
+            }
             if (clippedNextMaxX <= clippedNextMinX || clippedNextMaxY <= clippedNextMinY) {
                 continue;
             }
         }
 
+        const isInlineSvg = typeof SVGSVGElement !== "undefined" && element instanceof SVGSVGElement;
+        const isCanvasEl = typeof HTMLCanvasElement !== "undefined" && element instanceof HTMLCanvasElement;
+        const isVideoEl = typeof HTMLVideoElement !== "undefined" && element instanceof HTMLVideoElement;
         const readyImg =
             element instanceof HTMLImageElement && element.complete && element.naturalWidth > 0
                 ? element
                 : null;
         const readyVideo =
             !readyImg &&
-            typeof HTMLVideoElement !== "undefined" &&
-            element instanceof HTMLVideoElement &&
+            isVideoEl &&
             element.readyState >= 2 &&
             element.videoWidth > 0 &&
             element.videoHeight > 0
@@ -2008,10 +2148,13 @@ export function captureDomToCanvas(
                 ) {
                     ctx.clip();
                 }
-                drawMediaElementFitted(ctx, element as HTMLImageElement | HTMLVideoElement, natW, natH, style, baseW, baseH);
+                try {
+                    drawMediaElementFitted(ctx, element as HTMLImageElement | HTMLVideoElement, natW, natH, style, baseW, baseH);
+                } catch {
+                }
                 ctx.restore();
             }
-        } else if (typeof SVGSVGElement !== "undefined" && element instanceof SVGSVGElement) {
+        } else if (isInlineSvg) {
             const svgRect = elementRect ??= element.getBoundingClientRect();
             const svgLeft = svgRect.left - sourceRect.left;
             const svgTop = svgRect.top - sourceRect.top;
@@ -2041,12 +2184,13 @@ export function captureDomToCanvas(
                 );
                 ctx.restore();
             }
-        } else if (
-            typeof HTMLCanvasElement !== "undefined" &&
-            element instanceof HTMLCanvasElement &&
-            !element.classList.contains("lg-webgl-canvas")
-        ) {
-            if (element.width > 0 && element.height > 0) {
+        } else if (isCanvasEl) {
+            if (
+                element !== canvas &&
+                !element.classList.contains("lg-webgl-canvas") &&
+                element.width > 0 &&
+                element.height > 0
+            ) {
                 const canvasRect = elementRect ??= element.getBoundingClientRect();
                 const canvasLeft = canvasRect.left - sourceRect.left;
                 const canvasTop = canvasRect.top - sourceRect.top;
@@ -2064,426 +2208,184 @@ export function captureDomToCanvas(
                 ) {
                     ctx.save();
                     ctx.globalAlpha = opacity;
-                    ctx.drawImage(
-                        element,
-                        canvasLeft,
-                        canvasTop,
+                    const canvasCornerRadii = parseElementCornerRadii(
+                        style,
                         canvasRect.width,
                         canvasRect.height,
                     );
+                    if (
+                        typeof ctx.clip === "function" &&
+                        traceRoundedOrRectPath(
+                            ctx,
+                            canvasLeft,
+                            canvasTop,
+                            canvasRect.width,
+                            canvasRect.height,
+                            canvasCornerRadii,
+                        )
+                    ) {
+                        ctx.clip();
+                    }
+                    try {
+                        ctx.drawImage(
+                            element,
+                            canvasLeft,
+                            canvasTop,
+                            canvasRect.width,
+                            canvasRect.height,
+                        );
+                    } catch {
+                    }
                     ctx.restore();
                 }
             }
-        } else {
+        } else if (!isVideoEl) {
             if (clipsOverflow && element.firstChild !== null) {
-                const clipRect = elementRect ?? element.getBoundingClientRect();
-                const clipLeft = clipRect.left - sourceRect.left;
-                const clipTop = clipRect.top - sourceRect.top;
+                const clipRect = elementRect!;
                 if (
                     typeof ctx.save === "function" &&
                     typeof ctx.restore === "function" &&
                     typeof ctx.clip === "function"
                 ) {
-                    const clipRadii = parseElementCornerRadii(style, clipRect.width, clipRect.height);
                     ctx.save();
-                    if (
-                        !traceRoundedOrRectPath(
-                            ctx,
-                            clipLeft,
-                            clipTop,
-                            clipRect.width,
-                            clipRect.height,
-                            clipRadii,
-                        )
-                    ) {
-                        if (typeof ctx.beginPath === "function" && typeof ctx.rect === "function") {
-                            ctx.beginPath();
-                            ctx.rect(clipLeft, clipTop, clipRect.width, clipRect.height);
-                        }
+                    const traced = clipsX && clipsY && traceRoundedOrRectPath(
+                        ctx,
+                        clipRect.left - sourceRect.left,
+                        clipRect.top - sourceRect.top,
+                        clipRect.width,
+                        clipRect.height,
+                        parseElementCornerRadii(style, clipRect.width, clipRect.height),
+                    );
+                    if (!traced && typeof ctx.beginPath === "function" && typeof ctx.rect === "function") {
+                        ctx.beginPath();
+                        ctx.rect(
+                            clippedNextMinX, clippedNextMinY,
+                            clippedNextMaxX - clippedNextMinX, clippedNextMaxY - clippedNextMinY,
+                        );
                     }
                     ctx.clip();
-                    stack.push({
-                        popClip: true,
-                        prevMinX: clipMinX,
-                        prevMinY: clipMinY,
-                        prevMaxX: clipMaxX,
-                        prevMaxY: clipMaxY,
-                    });
+                    clipRestoreBounds.push(clipMinX, clipMinY, clipMaxX, clipMaxY);
+                    stack.push(POP_CLIP_SENTINEL);
                     clipMinX = clippedNextMinX;
                     clipMinY = clippedNextMinY;
                     clipMaxX = clippedNextMaxX;
                     clipMaxY = clippedNextMaxY;
                 }
             }
-            let node = element.firstChild;
-            while (node) {
-                if (node.nodeType === Node.TEXT_NODE) {
-                    const rawText = node.textContent;
-                    if (rawText) {
-                        const rawLen = rawText.length;
-                        let startOffset = 0;
-                        while (startOffset < rawLen && rawText.charCodeAt(startOffset) <= 32) {
-                            startOffset++;
-                        }
-                        if (startOffset < rawLen) {
-                            let endOffset = rawLen;
-                            while (endOffset > startOffset && rawText.charCodeAt(endOffset - 1) <= 32) {
-                                endOffset--;
-                            }
-                            const trimmed =
-                                startOffset === 0 && endOffset === rawLen
-                                    ? rawText
-                                    : rawText.slice(startOffset, endOffset);
-                            range.setStart(node, startOffset);
-                            range.setEnd(node, endOffset);
-                        const rects =
-                            typeof range.getClientRects === "function" ? range.getClientRects() : null;
-                        let textRect: DOMRect;
-                        if (rects) {
-                            if (rects.length === 0) {
-                                node = node.nextSibling;
-                                continue;
-                            }
-                            if (rects.length === 1) {
-                                textRect = rects[0]!;
-                            } else {
-                                let minL = rects[0]!.left;
-                                let minT = rects[0]!.top;
-                                let maxR = rects[0]!.right;
-                                let maxB = rects[0]!.bottom;
-                                for (let rIdx = 1; rIdx < rects.length; rIdx++) {
-                                    const line = rects[rIdx]!;
-                                    if (line.left < minL) minL = line.left;
-                                    if (line.top < minT) minT = line.top;
-                                    if (line.right > maxR) maxR = line.right;
-                                    if (line.bottom > maxB) maxB = line.bottom;
-                                }
-                                textRect = {
-                                    left: minL,
-                                    top: minT,
-                                    right: maxR,
-                                    bottom: maxB,
-                                    width: maxR - minL,
-                                    height: maxB - minT,
-                                    x: minL,
-                                    y: minT,
-                                    toJSON() {
-                                        return this;
-                                    },
-                                };
-                            }
-                        } else if (typeof range.getBoundingClientRect === "function") {
-                            textRect = range.getBoundingClientRect();
-                        } else {
-                            node = node.nextSibling;
-                            continue;
-                        }
-                        if (
-                            intersectsClipBounds(
-                                textRect.left - sourceRect.left,
-                                textRect.top - sourceRect.top,
-                                textRect.width,
-                                textRect.height,
-                                clipMinX,
-                                clipMinY,
-                                clipMaxX,
-                                clipMaxY,
-                            )
-                        ) {
-                            let content = trimmed;
-                            if (style.textTransform === "uppercase") {
-                                content = trimmed.toUpperCase();
-                            } else if (style.textTransform === "lowercase") {
-                                content = trimmed.toLowerCase();
-                            } else if (style.textTransform === "capitalize") {
-                                content = trimmed.replace(/\b\w/g, (ch) => ch.toUpperCase());
-                            }
-                            ctx.save();
-                            ctx.globalAlpha = opacity;
-                            ctx.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
-                            applyLetterSpacing(ctx, style.letterSpacing);
-                            ctx.fillStyle = resolveTextFill(ctx, style, textRect, sourceRect);
-                            ctx.textBaseline = "middle";
-                            ctx.textAlign = "left";
-                            if (!rects || rects.length <= 1) {
-                                ctx.fillText(
-                                    content,
-                                    textRect.left - sourceRect.left,
-                                    textRect.top - sourceRect.top + textRect.height * 0.5,
-                                );
-                            } else {
-                                const whiteSpace = style.whiteSpace;
-                                const preservesNewlines =
-                                    whiteSpace === "pre" ||
-                                    whiteSpace === "pre-wrap" ||
-                                    whiteSpace === "pre-line" ||
-                                    whiteSpace === "break-spaces";
-                                const preservesSpaces =
-                                    whiteSpace === "pre" ||
-                                    whiteSpace === "pre-wrap" ||
-                                    whiteSpace === "break-spaces";
-                                const segments =
-                                    preservesNewlines && content.includes("\n")
-                                        ? content.split(/\r?\n/)
-                                        : [content];
-                                let lineIdx = 0;
-                                for (let segIdx = 0; segIdx < segments.length && lineIdx < rects.length; segIdx++) {
-                                    const rawSegment = segments[segIdx]!;
-                                    const normalizedText = preservesSpaces
-                                        ? rawSegment
-                                        : rawSegment.replace(/\s+/g, " ").trim();
-                                    const isLastSegment = segIdx === segments.length - 1;
-                                    if (normalizedText.length === 0) {
-                                        if (rects[lineIdx] && rects[lineIdx]!.width <= 1) {
-                                            lineIdx++;
-                                        }
-                                        continue;
-                                    }
-                                    if (whiteSpace === "pre") {
-                                        const lineRect = rects[lineIdx]!;
-                                        ctx.fillText(
-                                            normalizedText,
-                                            lineRect.left - sourceRect.left,
-                                            lineRect.top - sourceRect.top + lineRect.height * 0.5,
-                                        );
-                                        lineIdx++;
-                                        continue;
-                                    }
-                                    const { starts: wordStarts, ends: wordEnds } =
-                                        extractWordOffsets(normalizedText);
-                                    const wordCount = wordStarts.length;
-                                    const totalMeasuredWidth = ctx.measureText(normalizedText).width;
-                                    let charDensity =
-                                        totalMeasuredWidth > 0 && normalizedText.length > 0
-                                            ? totalMeasuredWidth / normalizedText.length
-                                            : 8;
-                                    let charCursor = 0;
-                                    let wordIdx = 0;
-                                    while (lineIdx < rects.length && charCursor < normalizedText.length) {
-                                        if (!preservesSpaces || charCursor > 0) {
-                                            while (
-                                                charCursor < normalizedText.length &&
-                                                normalizedText.charCodeAt(charCursor) === 32
-                                            ) {
-                                                charCursor++;
-                                            }
-                                        }
-                                        if (charCursor >= normalizedText.length) break;
-                                        const lineRect = rects[lineIdx]!;
-                                        if (isLastSegment && lineIdx === rects.length - 1) {
-                                            ctx.fillText(
-                                                normalizedText.slice(charCursor),
-                                                lineRect.left - sourceRect.left,
-                                                lineRect.top - sourceRect.top + lineRect.height * 0.5,
-                                            );
-                                            lineIdx++;
-                                            break;
-                                        }
-                                        while (wordIdx < wordCount && wordEnds[wordIdx]! <= charCursor) {
-                                            wordIdx++;
-                                        }
-                                        const maxLineWidth = lineRect.width + 4;
-                                        const lineCharStart = charCursor;
-                                        if (wordIdx >= wordCount) {
-                                            ctx.fillText(
-                                                normalizedText.slice(lineCharStart),
-                                                lineRect.left - sourceRect.left,
-                                                lineRect.top - sourceRect.top + lineRect.height * 0.5,
-                                            );
-                                            lineIdx++;
-                                            break;
-                                        }
-                                        const nextWordEnd = wordEnds[wordIdx]!;
-                                        const firstTokenWidth = ctx.measureText(
-                                            normalizedText.slice(lineCharStart, nextWordEnd),
-                                        ).width;
-                                        if (firstTokenWidth > maxLineWidth && nextWordEnd - lineCharStart > 1) {
-                                            let charLow = lineCharStart + 1;
-                                            let charHigh = nextWordEnd;
-                                            const guessEnd = Math.min(
-                                                charHigh,
-                                                Math.max(
-                                                    charLow,
-                                                    lineCharStart + Math.max(1, Math.floor(maxLineWidth / charDensity)),
-                                                ),
-                                            );
-                                            const guessWidth = ctx.measureText(
-                                                normalizedText.slice(lineCharStart, guessEnd),
-                                            ).width;
-                                            const guessLen = guessEnd - lineCharStart;
-                                            if (guessWidth > 0 && guessLen > 0) {
-                                                charDensity = guessWidth / guessLen;
-                                            }
-                                            if (guessWidth <= maxLineWidth) {
-                                                charLow = guessEnd;
-                                                let step = 1;
-                                                while (
-                                                    charLow + step <= charHigh &&
-                                                    ctx.measureText(
-                                                        normalizedText.slice(lineCharStart, charLow + step),
-                                                    ).width <= maxLineWidth
-                                                ) {
-                                                    charLow += step;
-                                                    step <<= 1;
-                                                }
-                                                charHigh = Math.min(charHigh, charLow + step - 1);
-                                            } else {
-                                                charHigh = Math.max(charLow, guessEnd - 1);
-                                                let step = 1;
-                                                while (charHigh - step >= charLow) {
-                                                    if (
-                                                        ctx.measureText(
-                                                            normalizedText.slice(lineCharStart, charHigh - step),
-                                                        ).width > maxLineWidth
-                                                    ) {
-                                                        charHigh -= step;
-                                                        step <<= 1;
-                                                    } else {
-                                                        charLow = charHigh - step;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            while (charLow < charHigh) {
-                                                const mid = (charLow + charHigh + 1) >> 1;
-                                                if (ctx.measureText(normalizedText.slice(lineCharStart, mid)).width <= maxLineWidth) {
-                                                    charLow = mid;
-                                                } else {
-                                                    charHigh = mid - 1;
-                                                }
-                                            }
-                                            const lineText = normalizedText.slice(lineCharStart, charLow);
-                                            charCursor = charLow;
-                                            ctx.fillText(
-                                                lineText,
-                                                lineRect.left - sourceRect.left,
-                                                lineRect.top - sourceRect.top + lineRect.height * 0.5,
-                                            );
-                                            lineIdx++;
-                                            continue;
-                                        }
-                                        let low = wordIdx;
-                                        let high = wordCount - 1;
-                                        if (low < high) {
-                                            const targetEndChar =
-                                                lineCharStart +
-                                                Math.max(1, Math.floor(maxLineWidth / charDensity));
-                                            let searchLow = low;
-                                            let searchHigh = high;
-                                            while (searchLow < searchHigh) {
-                                                const mid = (searchLow + searchHigh + 1) >> 1;
-                                                if (wordEnds[mid] <= targetEndChar) {
-                                                    searchLow = mid;
-                                                } else {
-                                                    searchHigh = mid - 1;
-                                                }
-                                            }
-                                            const guessIdx = searchLow;
-                                            const guessSlice = normalizedText.slice(
-                                                lineCharStart,
-                                                wordEnds[guessIdx],
-                                            );
-                                            const guessWidth = ctx.measureText(guessSlice).width;
-                                            if (guessWidth > 0 && guessSlice.length > 0) {
-                                                charDensity = guessWidth / guessSlice.length;
-                                            }
-                                            if (guessWidth <= maxLineWidth) {
-                                                low = guessIdx;
-                                                let step = 1;
-                                                while (
-                                                    low + step <= high &&
-                                                    ctx.measureText(
-                                                        normalizedText.slice(
-                                                            lineCharStart,
-                                                            wordEnds[low + step],
-                                                        ),
-                                                    ).width <= maxLineWidth
-                                                ) {
-                                                    low += step;
-                                                    step <<= 1;
-                                                }
-                                                high = Math.min(high, low + step - 1);
-                                            } else {
-                                                high = guessIdx - 1;
-                                                let step = 1;
-                                                while (high - step >= low) {
-                                                    if (
-                                                        ctx.measureText(
-                                                            normalizedText.slice(
-                                                                lineCharStart,
-                                                                wordEnds[high - step],
-                                                            ),
-                                                        ).width > maxLineWidth
-                                                    ) {
-                                                        high -= step;
-                                                        step <<= 1;
-                                                    } else {
-                                                        low = high - step;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            while (low < high) {
-                                                const mid = (low + high + 1) >> 1;
-                                                if (
-                                                    ctx.measureText(
-                                                        normalizedText.slice(lineCharStart, wordEnds[mid]),
-                                                    ).width <= maxLineWidth
-                                                ) {
-                                                    low = mid;
-                                                } else {
-                                                    high = mid - 1;
-                                                }
-                                            }
-                                        }
-                                        const lineText = normalizedText.slice(lineCharStart, wordEnds[low]);
-                                        charCursor = wordEnds[low]!;
-                                        wordIdx = low + 1;
-                                        ctx.fillText(
-                                            lineText,
-                                            lineRect.left - sourceRect.left,
-                                            lineRect.top - sourceRect.top + lineRect.height * 0.5,
-                                        );
-                                        lineIdx++;
-                                    }
-                                }
-                            }
-                            ctx.restore();
-                            }
+            for (let node = element.firstChild; node; node = node.nextSibling) {
+                if (node.nodeType !== Node.TEXT_NODE || !node.textContent) continue;
+                const rawText = node.textContent;
+                let start = 0;
+                let end = rawText.length;
+                while (start < end && rawText.charCodeAt(start) <= 32) start++;
+                if (start === end) continue;
+                while (end > start && rawText.charCodeAt(end - 1) <= 32) end--;
+
+                range.setStart(node, start);
+                range.setEnd(node, end);
+                const rects = range.getClientRects?.();
+                const textRect = rects ? getTextBounds(rects) : range.getBoundingClientRect?.();
+                if (!textRect) continue;
+                const textLeft = textRect.left - sourceRect.left;
+                const textTop = textRect.top - sourceRect.top;
+                if (!intersectsClipBounds(
+                    textLeft, textTop, textRect.width, textRect.height,
+                    clipMinX, clipMinY, clipMaxX, clipMaxY,
+                )) continue;
+
+                let content = start === 0 && end === rawText.length ? rawText : rawText.slice(start, end);
+                if (style.textTransform === "uppercase") {
+                    content = content.toUpperCase();
+                } else if (style.textTransform === "lowercase") {
+                    content = content.toLowerCase();
+                } else if (style.textTransform === "capitalize") {
+                    content = content.replace(/\b\w/g, (ch) => ch.toUpperCase());
+                }
+
+                ctx.save();
+                ctx.globalAlpha = opacity;
+                ctx.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+                applyLetterSpacing(ctx, style.letterSpacing);
+                ctx.fillStyle = resolveTextFill(ctx, style, textRect, sourceRect);
+                ctx.textBaseline = "middle";
+                ctx.textAlign = "left";
+                if (!rects || rects.length === 1) {
+                    ctx.fillText(content, textLeft, textTop + textRect.height * 0.5);
+                } else {
+                    if (textLayouts === undefined) textLayouts = prepareSceneTextLayouts(canvas, ctx);
+                    const lines = resolveWrappedTextLines(textLayouts, ctx, node, content, style.whiteSpace, rects);
+                    const allLinesVisible = textLeft >= clipMinX && textTop >= clipMinY &&
+                        textLeft + textRect.width <= clipMaxX && textTop + textRect.height <= clipMaxY;
+                    for (let index = 0; index < lines.length; index++) {
+                        const text = lines[index];
+                        if (text === undefined) continue;
+                        const line = rects[index]!;
+                        const left = line.left - sourceRect.left;
+                        const top = line.top - sourceRect.top;
+                        // Allow for glyphs that overhang the measured line box.
+                        if (allLinesVisible || intersectsClipBounds(
+                            left, top, line.width, line.height,
+                            clipMinX, clipMinY, clipMaxX, clipMaxY, line.height,
+                        )) {
+                            ctx.fillText(text, left, top + line.height * 0.5);
                         }
                     }
                 }
-                node = node.nextSibling;
+                ctx.restore();
             }
         }
 
-        const isInlineSvg =
-            typeof SVGSVGElement !== "undefined" && element instanceof SVGSVGElement;
-        if (isInlineSvg) {
+        if (isInlineSvg || isCanvasEl || isVideoEl) {
             continue;
         }
 
         let child = element.lastElementChild;
-        while (child) {
-            stack.push(child as HTMLElement);
-            child = child.previousElementSibling;
+        if (child) {
+            if (opacity !== currentOpacity) {
+                opacityRestoreStack.push(currentOpacity);
+                stack.push(POP_OPACITY_SENTINEL);
+                currentOpacity = opacity;
+            }
+            while (child) {
+                stack.push(child as HTMLElement);
+                child = child.previousElementSibling;
+            }
         }
     }
 
     return true;
 }
 
+function isSvgFilterContainer(node: Node): boolean {
+    if (node.nodeType !== 1) return false;
+    const element = node as Element;
+    return element.id === "svg-defs" ||
+        (element.localName === "svg" && element.childElementCount === 1 && element.firstElementChild?.id === "svg-defs");
+}
+
+type SceneCaptureListener = (canvas: HTMLCanvasElement, source: HTMLElement) => void;
+const sceneCanvasListeners = new WeakMap<HTMLCanvasElement, Set<SceneCaptureListener>>();
+
+// A capture reuses its canvas. Consumers of those pixels can listen without replacing the canvas.
+export function subscribeSceneCanvas(
+    canvas: HTMLCanvasElement,
+    listener: SceneCaptureListener,
+): (() => void) | null {
+    const listeners = sceneCanvasListeners.get(canvas);
+    if (!listeners) return null;
+    listeners.add(listener);
+    return () => { listeners.delete(listener); };
+}
+
 export function createSceneCaptureController(
     sourceElement: HTMLElement,
     getQualityOptions?: () => number | SceneCaptureQualityOptions | undefined,
 ): SceneCaptureController {
-    const listeners = new Set<(canvas: HTMLCanvasElement, source: HTMLElement) => void>();
-    let captureCanvas: HTMLCanvasElement | null =
-        typeof document !== "undefined" ? document.createElement("canvas") : null;
-    if (captureCanvas) {
-        captureCanvas.width = 0;
-        captureCanvas.height = 0;
-    }
+    const listeners = new Set<SceneCaptureListener>();
+    const doc = sourceElement.ownerDocument;
+    let captureCanvas: HTMLCanvasElement | null = doc.createElement("canvas");
+    resizeCanvas(captureCanvas, 0, 0);
+    sceneCanvasListeners.set(captureCanvas, listeners);
     const minObserverDelayMs = 100;
     const maxObserverDelayMs = 500;
     let observerDelayMs = minObserverDelayMs;
@@ -2496,7 +2398,7 @@ export function createSceneCaptureController(
     let pendingWhileInactive = false;
     let disposed = false;
 
-    const range = typeof document !== "undefined" ? document.createRange() : null;
+    const range = doc.createRange();
 
     const clearPendingSchedule = () => {
         if (captureFrame !== null && typeof cancelAnimationFrame === "function") {
@@ -2511,8 +2413,9 @@ export function createSceneCaptureController(
 
     const performCapture = () => {
         captureFrame = null;
-        if (disposed || !captureCanvas || !range || !sourceElement.isConnected) return;
-        if (!isActive || (typeof document !== "undefined" && document.hidden)) {
+        const canvas = captureCanvas;
+        if (disposed || !canvas) return;
+        if (!isActive || doc.hidden) {
             pendingWhileInactive = true;
             return;
         }
@@ -2520,31 +2423,36 @@ export function createSceneCaptureController(
         const resolved = getQualityOptions?.();
         const pixelRatio = typeof resolved === "number" ? resolved : resolved?.pixelRatio;
         const radius = typeof resolved === "number" ? undefined : resolved?.radius;
-        if (
-            captureDomToCanvas(
+        const sharpness = typeof resolved === "number" ? undefined : resolved?.sharpness;
+        const captured =
+            sourceElement.isConnected && captureDomToCanvas(
                 sourceElement,
-                captureCanvas,
+                canvas,
                 range,
                 pixelRatio,
                 radius,
                 null,
-                scheduleCapture,
-            )
-        ) {
-            hasCaptured = true;
+                scheduleObserverCapture,
+                sharpness,
+            );
+        if (captured) {
             lastCaptureAt = now();
             observerDelayMs = Math.min(maxObserverDelayMs, Math.max(
                 minObserverDelayMs, (lastCaptureAt - startedAt) * 9, observerDelayMs * 0.5,
             ));
-            for (const listener of listeners) {
-                listener(captureCanvas, sourceElement);
-            }
+        } else {
+            resizeCanvas(canvas, 0, 0);
+            if (!hasCaptured) return;
+        }
+        hasCaptured = captured;
+        for (const listener of listeners) {
+            listener(canvas, sourceElement);
         }
     };
 
     const scheduleCapture = () => {
         if (disposed) return;
-        if (!isActive || (typeof document !== "undefined" && document.hidden)) {
+        if (!isActive || doc.hidden) {
             pendingWhileInactive = true;
             return;
         }
@@ -2558,7 +2466,7 @@ export function createSceneCaptureController(
 
     const scheduleObserverCapture = () => {
         if (disposed) return;
-        if (!isActive || (typeof document !== "undefined" && document.hidden)) {
+        if (!isActive || doc.hidden) {
             pendingWhileInactive = true;
             return;
         }
@@ -2579,8 +2487,8 @@ export function createSceneCaptureController(
     };
 
     const handleVisibilityChange = () => {
-        if (disposed || typeof document === "undefined") return;
-        if (document.hidden) {
+        if (disposed) return;
+        if (doc.hidden) {
             if (captureFrame !== null || recaptureTimer !== null) {
                 clearPendingSchedule();
                 pendingWhileInactive = true;
@@ -2610,39 +2518,35 @@ export function createSceneCaptureController(
     };
 
     let mutationObserver: MutationObserver | null = null;
-    let themeObserver: MutationObserver | null = null;
     if (typeof MutationObserver === "function") {
         mutationObserver = new MutationObserver((records) => {
             const isSliderRoot = sourceElement.classList.contains("lg-slider");
+            const excludedSelector = isSliderRoot ? "[data-lg-surface]" : "[data-lg-surface], .lg-slider";
+            let hasSceneMutation = false;
+            let hasImmediateThemeMutation = false;
             for (let index = 0; index < records.length; index++) {
                 const record = records[index]!;
-                const target = record.target as HTMLElement | Node;
-                const parentEl =
-                    target instanceof HTMLElement ? target : target.parentElement;
-                if (
-                    parentEl &&
-                    (parentEl.closest("#svg-defs") ||
-                        (parentEl !== sourceElement &&
-                            parentEl.closest(isSliderRoot ? "[data-lg-surface]" : "[data-lg-surface], .lg-slider")))
-                ) {
+                const target = record.target;
+                // A newly marked glass surface needs to be removed from the existing snapshot.
+                const element = target.nodeType === 1 && record.attributeName !== "data-lg-surface"
+                    ? target as Element
+                    : target.parentElement;
+                const excluded = element?.closest(excludedSelector);
+                if (element?.closest("#svg-defs") ||
+                    (excluded && excluded !== sourceElement && sourceElement.contains(excluded))) {
                     continue;
                 }
                 if (
                     record.type === "childList" &&
+                    record.removedNodes.length === 0 &&
                     record.addedNodes.length > 0 &&
-                    Array.prototype.every.call(
-                        record.addedNodes,
-                        (node: Node) =>
-                            typeof Element !== "undefined" &&
-                            node instanceof Element &&
-                            Boolean(node.id === "svg-defs" || node.querySelector?.("#svg-defs")),
-                    )
+                    Array.prototype.every.call(record.addedNodes, isSvgFilterContainer)
                 ) {
                     continue;
                 }
                 if (
-                    parentEl === sourceElement &&
-                    record.type === "attributes" &&
+                    target === sourceElement &&
+                    (record.attributeName === "style" || record.attributeName === "class") &&
                     sourceElement.classList.contains("lg-switch") &&
                     (sourceElement.classList.contains("is-dragging") ||
                         sourceElement.classList.contains("is-animating") ||
@@ -2650,8 +2554,20 @@ export function createSceneCaptureController(
                 ) {
                     continue;
                 }
+                hasSceneMutation = true;
+                if (
+                    record.type === "attributes" &&
+                    (record.attributeName === "data-theme" ||
+                        record.attributeName === "data-color-scheme")
+                ) {
+                    hasImmediateThemeMutation = true;
+                    break;
+                }
+            }
+            if (hasImmediateThemeMutation) {
+                scheduleCapture();
+            } else if (hasSceneMutation) {
                 scheduleObserverCapture();
-                break;
             }
         });
         mutationObserver.observe(sourceElement, {
@@ -2659,51 +2575,29 @@ export function createSceneCaptureController(
             childList: true,
             characterData: true,
             attributes: true,
-            attributeFilter: ["class", "style", "data-theme", "data-color-scheme"],
         });
+    }
 
-        if (typeof document !== "undefined") {
-            themeObserver = new MutationObserver(scheduleCapture);
-            if (document.documentElement !== sourceElement) {
-                themeObserver.observe(document.documentElement, {
-                    attributes: true,
-                    attributeFilter: ["class", "style", "data-theme", "data-color-scheme"],
-                });
-            }
-            if (document.body && document.body !== sourceElement) {
-                themeObserver.observe(document.body, {
-                    attributes: true,
-                    attributeFilter: ["class", "style", "data-theme", "data-color-scheme"],
-                });
-            }
+    const unobserveResize = observeSharedElementResize(sourceElement, scheduleObserverCapture);
+
+    const handleSceneContentEvent = (event: Event) => {
+        const target = event.target as Element | null;
+        if (target?.nodeType === 1 && target !== sourceElement) {
+            const glassSurface = target.closest("[data-lg-surface]");
+            if (glassSurface && glassSurface !== sourceElement && sourceElement.contains(glassSurface)) return;
         }
-    }
-
-    let colorSchemeQuery: MediaQueryList | null = null;
-    if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
-        colorSchemeQuery = window.matchMedia("(prefers-color-scheme: dark)");
-        colorSchemeQuery?.addEventListener?.("change", scheduleCapture);
-    }
-
-    let resizeObserver: ResizeObserver | null = null;
-    if (typeof ResizeObserver === "function") {
-        resizeObserver = new ResizeObserver(scheduleObserverCapture);
-        resizeObserver.observe(sourceElement);
-    }
-
-    sourceElement.addEventListener("load", scheduleObserverCapture, true);
-    sourceElement.addEventListener("scroll", scheduleObserverCapture, { capture: true, passive: true });
-    if (typeof window !== "undefined") {
-        window.addEventListener("resize", scheduleObserverCapture, { passive: true });
-    }
-    if (typeof document !== "undefined") {
-        document.addEventListener("visibilitychange", handleVisibilityChange, { passive: true });
-    }
-    if (typeof document !== "undefined" && "fonts" in document && document.fonts?.ready) {
-        void document.fonts.ready.then(() => {
-            if (!disposed) scheduleCapture();
-        });
-    }
+        scheduleObserverCapture();
+    };
+    sourceElement.addEventListener("load", handleSceneContentEvent, true);
+    sourceElement.addEventListener("loadeddata", handleSceneContentEvent, true);
+    sourceElement.addEventListener("seeked", handleSceneContentEvent, true);
+    sourceElement.addEventListener("scroll", handleSceneContentEvent, { capture: true, passive: true });
+    const unsubscribeDocumentSignals = subscribeSceneCaptureSignals({
+        source: sourceElement,
+        scheduleCapture,
+        scheduleObserverCapture,
+        handleVisibilityChange,
+    });
 
     scheduleCapture();
 
@@ -2731,20 +2625,16 @@ export function createSceneCaptureController(
             disposed = true;
             listeners.clear();
             mutationObserver?.disconnect();
-            themeObserver?.disconnect();
-            colorSchemeQuery?.removeEventListener?.("change", scheduleCapture);
-            resizeObserver?.disconnect();
-            sourceElement.removeEventListener("load", scheduleObserverCapture, true);
-            sourceElement.removeEventListener("scroll", scheduleObserverCapture, true);
-            if (typeof window !== "undefined") {
-                window.removeEventListener("resize", scheduleObserverCapture);
-            }
-            if (typeof document !== "undefined") {
-                document.removeEventListener("visibilitychange", handleVisibilityChange);
-            }
+            unobserveResize();
+            unsubscribeDocumentSignals();
+            sourceElement.removeEventListener("load", handleSceneContentEvent, true);
+            sourceElement.removeEventListener("loadeddata", handleSceneContentEvent, true);
+            sourceElement.removeEventListener("seeked", handleSceneContentEvent, true);
+            sourceElement.removeEventListener("scroll", handleSceneContentEvent, true);
             clearPendingSchedule();
-            range?.collapse(true);
+            range.collapse(true);
             if (captureCanvas) {
+                sceneCanvasListeners.delete(captureCanvas);
                 captureCanvas.width = 0;
                 captureCanvas.height = 0;
                 captureCanvas = null;
@@ -2753,80 +2643,133 @@ export function createSceneCaptureController(
     };
 }
 
+interface SharedCaptureSubscription {
+    listener: SceneCaptureListener;
+    deliveredRevision: number;
+}
+
 interface SharedCaptureLease {
-    getQuality?: () => number | undefined | { pixelRatio?: number; radius?: number };
+    getQuality?: () => number | undefined | SceneCaptureQualityOptions;
     active: boolean;
 }
 
 interface SharedSceneCaptureEntry {
     controller: SceneCaptureController;
-    leases: Map<symbol, SharedCaptureLease>;
+    leases: Set<SharedCaptureLease>;
+    activeSubscriptions: Set<SharedCaptureSubscription>;
+    revision: number;
+    latestCanvas: HTMLCanvasElement | null;
     lastMaxPixelRatio: number;
     lastHasRounded: boolean;
+    lastMaxSharpness: number;
 }
 
 const sharedSceneCaptures = new WeakMap<HTMLElement, SharedSceneCaptureEntry>();
 
-function evaluateLeaseQuality(lease: SharedCaptureLease): { pixelRatio?: number; radius: number } {
+function evaluateLeaseQuality(lease: SharedCaptureLease): { pixelRatio?: number; radius: number; sharpness: number } {
     const raw = lease.getQuality?.();
-    if (typeof raw === "number") {
-        return { pixelRatio: raw, radius: 9999 };
-    }
+    const pixelRatio = typeof raw === "number" ? raw : raw?.pixelRatio;
+    const radius = typeof raw === "number" ? undefined : raw?.radius;
+    const sharpness = typeof raw === "number" ? undefined : raw?.sharpness;
     return {
-        pixelRatio: raw?.pixelRatio,
-        radius: raw?.radius ?? 9999,
+        pixelRatio: pixelRatio !== undefined && Number.isFinite(pixelRatio) && pixelRatio > 0
+            ? Math.min(4, Math.max(0.5, pixelRatio))
+            : undefined,
+        radius: radius !== undefined && Number.isFinite(radius) ? Math.max(0, radius) : 9999,
+        sharpness: sharpness !== undefined && Number.isFinite(sharpness) && sharpness > 0
+            ? Math.min(1, sharpness)
+            : 0,
     };
 }
 
-function activeCaptureQuality(leases: Map<symbol, SharedCaptureLease>): SceneCaptureQualityOptions | undefined {
+function activeCaptureQuality(leases: Set<SharedCaptureLease>): SceneCaptureQualityOptions | undefined {
     let radius = 0;
     let pixelRatio: number | undefined;
+    let sharpness = 0;
     let active = false;
-    for (const lease of leases.values()) {
+    let automaticRounded = false;
+    for (const lease of leases) {
         if (!lease.active) continue;
         active = true;
         const quality = evaluateLeaseQuality(lease);
         radius = Math.max(radius, quality.radius);
+        sharpness = Math.max(sharpness, quality.sharpness);
         if (quality.pixelRatio !== undefined) pixelRatio = Math.max(pixelRatio ?? 0, quality.pixelRatio);
+        else automaticRounded ||= quality.radius > 0;
     }
-    return active ? { radius, pixelRatio } : undefined;
+    if (automaticRounded && pixelRatio !== undefined &&
+        automaticRoundedPixelRatio(ROUNDED_MIN_CAPTURE_SCALE, ROUNDED_MAX_CAPTURE_SCALE) > pixelRatio) {
+        pixelRatio = undefined;
+    }
+    return active ? { radius, pixelRatio, sharpness } : undefined;
+}
+
+function deliverSharedCapture(
+    subscription: SharedCaptureSubscription,
+    revision: number,
+    canvas: HTMLCanvasElement,
+    source: HTMLElement,
+): void {
+    if (subscription.deliveredRevision >= revision) return;
+    subscription.deliveredRevision = revision;
+    subscription.listener(canvas, source);
 }
 
 export function acquireSharedSceneCapture(
     sourceElement: HTMLElement,
-    getQualityOptions?: () => number | undefined | { pixelRatio?: number; radius?: number },
+    getQualityOptions?: () => number | undefined | SceneCaptureQualityOptions,
 ): SceneCaptureController {
     let entry = sharedSceneCaptures.get(sourceElement);
-    const leaseToken = Symbol("lg-scene-lease");
     const lease: SharedCaptureLease = {
         getQuality: getQualityOptions,
         active: true,
     };
 
     if (!entry) {
-        const leases = new Map<symbol, SharedCaptureLease>();
-        leases.set(leaseToken, lease);
+        const leases = new Set([lease]);
         const newEntry: SharedSceneCaptureEntry = {
             controller: null as unknown as SceneCaptureController,
             leases,
+            activeSubscriptions: new Set(),
+            revision: 0,
+            latestCanvas: null,
             lastMaxPixelRatio: 0,
             lastHasRounded: false,
+            lastMaxSharpness: 0,
         };
         newEntry.controller = createSceneCaptureController(sourceElement, () => {
             const quality = activeCaptureQuality(leases);
             newEntry.lastMaxPixelRatio = quality?.pixelRatio ?? 0;
             newEntry.lastHasRounded = (quality?.radius ?? 0) > 0;
+            newEntry.lastMaxSharpness = quality?.sharpness ?? 0;
             return quality;
+        });
+        newEntry.controller.subscribe((canvas, source) => {
+            newEntry.latestCanvas = canvas;
+            const revision = ++newEntry.revision;
+            for (const subscription of newEntry.activeSubscriptions) {
+                deliverSharedCapture(subscription, revision, canvas, source);
+            }
         });
         sharedSceneCaptures.set(sourceElement, newEntry);
         entry = newEntry;
     } else {
-        entry.leases.set(leaseToken, lease);
+        entry.leases.add(lease);
         entry.controller.setActive?.(true);
         const newQuality = evaluateLeaseQuality(lease);
+        const autoRoundedScale = automaticRoundedPixelRatio(ROUNDED_MIN_CAPTURE_SCALE, ROUNDED_MAX_CAPTURE_SCALE);
+        const effectivePrevScale =
+            entry.lastMaxPixelRatio > 0
+                ? entry.lastMaxPixelRatio
+                : entry.lastHasRounded
+                  ? autoRoundedScale
+                  : 0;
         const needsUpgrade =
             (newQuality.radius > 0 && !entry.lastHasRounded) ||
-            (newQuality.pixelRatio !== undefined && newQuality.pixelRatio > entry.lastMaxPixelRatio);
+            newQuality.sharpness > entry.lastMaxSharpness ||
+            (newQuality.pixelRatio !== undefined && newQuality.pixelRatio > effectivePrevScale) ||
+            (newQuality.pixelRatio === undefined && newQuality.radius > 0 && entry.lastMaxPixelRatio > 0 &&
+                autoRoundedScale > entry.lastMaxPixelRatio);
         if (needsUpgrade) {
             entry.controller.scheduleCapture();
         }
@@ -2834,13 +2777,14 @@ export function acquireSharedSceneCapture(
 
     const currentEntry = entry;
     let leaseDestroyed = false;
-    const leaseUnsubscribes = new Set<() => void>();
+    const subscriptions = new Set<SharedCaptureSubscription>();
 
     const syncSharedActiveState = () => {
         const quality = activeCaptureQuality(currentEntry.leases);
         currentEntry.controller.setActive?.(quality !== undefined);
         if (quality && ((quality.pixelRatio ?? 0) !== currentEntry.lastMaxPixelRatio ||
-            ((quality.radius ?? 0) > 0) !== currentEntry.lastHasRounded)) {
+            ((quality.radius ?? 0) > 0) !== currentEntry.lastHasRounded ||
+            (quality.sharpness ?? 0) !== currentEntry.lastMaxSharpness)) {
             currentEntry.controller.scheduleCapture();
         }
     };
@@ -2854,20 +2798,19 @@ export function acquireSharedSceneCapture(
         },
         subscribe(listener) {
             if (leaseDestroyed) return () => {};
-            const innerUnsub = currentEntry.controller.subscribe((canvas, source) => {
-                if (!leaseDestroyed) listener(canvas, source);
-            });
-            if (leaseDestroyed) {
-                innerUnsub();
-                return () => {};
-            }
-            const scopedUnsub = () => {
-                if (leaseUnsubscribes.delete(scopedUnsub)) {
-                    innerUnsub();
+            const subscription: SharedCaptureSubscription = { listener, deliveredRevision: 0 };
+            subscriptions.add(subscription);
+            if (lease.active) {
+                currentEntry.activeSubscriptions.add(subscription);
+                const canvas = currentEntry.controller.canvas;
+                if (canvas && canvas.width > 0 && sourceElement.isConnected) {
+                    deliverSharedCapture(subscription, currentEntry.revision, canvas, sourceElement);
                 }
+            }
+            return () => {
+                subscriptions.delete(subscription);
+                currentEntry.activeSubscriptions.delete(subscription);
             };
-            leaseUnsubscribes.add(scopedUnsub);
-            return scopedUnsub;
         },
         scheduleCapture() {
             if (leaseDestroyed) return;
@@ -2876,16 +2819,32 @@ export function acquireSharedSceneCapture(
         setActive(active: boolean) {
             if (leaseDestroyed || lease.active === active) return;
             lease.active = active;
+            for (const subscription of subscriptions) {
+                if (active) {
+                    currentEntry.activeSubscriptions.add(subscription);
+                } else {
+                    currentEntry.activeSubscriptions.delete(subscription);
+                }
+            }
             syncSharedActiveState();
+            const canvas = currentEntry.latestCanvas;
+            if (active && canvas) {
+                for (const subscription of subscriptions) {
+                    if (!lease.active) break;
+                    if (subscription.deliveredRevision > 0 || (canvas.width > 0 && sourceElement.isConnected)) {
+                        deliverSharedCapture(subscription, currentEntry.revision, canvas, sourceElement);
+                    }
+                }
+            }
         },
         destroy() {
             if (leaseDestroyed) return;
             leaseDestroyed = true;
-            for (const unsub of [...leaseUnsubscribes]) {
-                unsub();
+            for (const subscription of subscriptions) {
+                currentEntry.activeSubscriptions.delete(subscription);
             }
-            leaseUnsubscribes.clear();
-            currentEntry.leases.delete(leaseToken);
+            subscriptions.clear();
+            currentEntry.leases.delete(lease);
             if (currentEntry.leases.size === 0) {
                 sharedSceneCaptures.delete(sourceElement);
                 currentEntry.controller.destroy();

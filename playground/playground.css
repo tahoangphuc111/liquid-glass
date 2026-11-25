@@ -14,12 +14,12 @@
 
 html.dark {
     color-scheme: dark;
-    --page-bg: #0b0f19;
-    --page-ink: #f8fafc;
-    --muted-ink: #94a3b8;
-    --tile-bg: rgba(30, 41, 59, 0.72);
-    --lg-switch-ink: rgba(255, 255, 255, 0.78);
-    --lg-switch-active-ink: #38bdf8;
+    --page-bg: #101012;
+    --page-ink: #f5f5f7;
+    --muted-ink: #b0b0b8;
+    --tile-bg: rgba(37, 37, 40, 0.79);
+    --lg-switch-ink: #f5f5f7;
+    --lg-switch-active-ink: #409cff;
 }
 
 body {
@@ -38,11 +38,38 @@ body {
     background: var(--page-bg);
 }
 
+@media (min-width: 960px) {
+    .scene {
+        padding-right: 308px;
+    }
+}
+
 .scene-backdrop {
     position: absolute;
     inset: 0;
     overflow: hidden;
     pointer-events: none;
+}
+
+.preview-link {
+    display: inline-flex;
+    align-items: center;
+    min-height: 36px;
+    padding: 0.35rem 0.85rem;
+    margin-bottom: 14px;
+    gap: .4rem;
+    border-radius: 999px;
+    border: 1px solid rgba(148, 163, 184, 0.35);
+    background: var(--tile-bg);
+    color: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    text-decoration: none;
+    transition: background-color 140ms ease, border-color 140ms ease;
+}
+
+.preview-link:hover {
+    border-color: rgba(148, 163, 184, 0.6);
 }
 
 .orb {

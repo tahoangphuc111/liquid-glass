@@ -1,5 +1,6 @@
 import { useSmallMemoryBudget } from "./renderBudget.js";
 import { resolveCornerStyle, resolveSurfaceId } from "./config.js";
+import type { GlassMediumCoefficients } from "./optics.js";
 import type { GlassFrameParams } from "./webglRenderer.js";
 
 function getMaxTransferCacheBytes(): number {
@@ -10,25 +11,28 @@ const BYTES_PER_PIXEL = 24;
 
 let totalAllocatedBytes = 0;
 
+export function canAllocateOpticalTransfer(width: number, height: number, maxTextureSize: number, replacingBytes = 0): boolean {
+    const pixelCount = width * height;
+    return width > 0 && height > 0 && width <= maxTextureSize && height <= maxTextureSize &&
+        pixelCount <= MAX_CACHE_PIXELS &&
+        totalAllocatedBytes - replacingBytes + pixelCount * BYTES_PER_PIXEL <= getMaxTransferCacheBytes();
+}
+
 type SampleVariantKey =
     | "NO_SCENE"
     | "NO_SCENE_FULL"
     | "CLEAR"
     | "CLEAR_CLAMP"
     | "CLEAR_FULL"
-    | "CLEAR_CLAMP_FULL"
     | "CLEAR_CHROMA"
     | "CLEAR_CHROMA_CLAMP"
     | "CLEAR_CHROMA_FULL"
-    | "CLEAR_CHROMA_CLAMP_FULL"
     | "BLUR"
     | "BLUR_CLAMP"
     | "BLUR_FULL"
-    | "BLUR_CLAMP_FULL"
     | "BLUR_CHROMA"
     | "BLUR_CHROMA_CLAMP"
-    | "BLUR_CHROMA_FULL"
-    | "BLUR_CHROMA_CLAMP_FULL";
+    | "BLUR_CHROMA_FULL";
 
 interface SampleProgramEntry {
     readonly program: WebGLProgram;
@@ -36,11 +40,16 @@ interface SampleProgramEntry {
     readonly uGeomLoc: WebGLUniformLocation | null;
     readonly uOpticalLoc: WebGLUniformLocation | null;
     readonly uTintLoc: WebGLUniformLocation | null;
+    readonly uMediumLoc: WebGLUniformLocation | null;
+    lastMedium: GlassMediumCoefficients | null;
     readonly uSaturationLoc: WebGLUniformLocation | null;
     lastSaturation: number;
+    readonly uSharpnessLoc: WebGLUniformLocation | null;
+    lastSharpness: number;
     readonly uHighlightLoc: WebGLUniformLocation | null;
     readonly uSceneRectLoc: WebGLUniformLocation | null;
     readonly uDprLoc: WebGLUniformLocation | null;
+    readonly uPixelSizeLoc: WebGLUniformLocation | null;
     readonly uInteriorMarginLoc: WebGLUniformLocation | null;
     readonly uBlurOffset1Loc: WebGLUniformLocation | null;
     readonly uBlurOffset2Loc: WebGLUniformLocation | null;
@@ -68,6 +77,8 @@ interface SampleProgramEntry {
     lastRelW: number;
     lastRelH: number;
     lastDpr: number;
+    lastPixelSizeX: number;
+    lastPixelSizeY: number;
     lastInteriorMargin: number;
     lastBlurOffset1X: number;
     lastBlurOffset1Y: number;
@@ -86,6 +97,7 @@ interface BuildProgramEntry {
     readonly uOpticalLoc: WebGLUniformLocation | null;
     readonly uRefractionLoc: WebGLUniformLocation | null;
     readonly uDprLoc: WebGLUniformLocation | null;
+    readonly uPixelSizeLoc: WebGLUniformLocation | null;
     readonly uInteriorMarginLoc: WebGLUniformLocation | null;
     readonly uLutScaleLoc: WebGLUniformLocation | null;
     readonly uSquircleLoc: WebGLUniformLocation | null;
@@ -98,13 +110,6 @@ const VARIANT_DEFINES: Record<SampleVariantKey, readonly string[]> = {
     CLEAR: ["LG_TRANSFER_SAMPLE", "LG_SPECIALIZED", "LG_SAMPLE_CLEAR"],
     CLEAR_CLAMP: ["LG_TRANSFER_SAMPLE", "LG_SPECIALIZED", "LG_SAMPLE_CLEAR", "LG_SAMPLE_CLAMP"],
     CLEAR_FULL: ["LG_TRANSFER_SAMPLE", "LG_SPECIALIZED", "LG_SAMPLE_CLEAR", "LG_NO_INTERIOR_FASTPATH"],
-    CLEAR_CLAMP_FULL: [
-        "LG_TRANSFER_SAMPLE",
-        "LG_SPECIALIZED",
-        "LG_SAMPLE_CLEAR",
-        "LG_SAMPLE_CLAMP",
-        "LG_NO_INTERIOR_FASTPATH",
-    ],
     CLEAR_CHROMA: ["LG_TRANSFER_SAMPLE", "LG_SPECIALIZED", "LG_SAMPLE_CLEAR", "LG_SAMPLE_CHROMA"],
     CLEAR_CHROMA_CLAMP: [
         "LG_TRANSFER_SAMPLE",
@@ -120,24 +125,9 @@ const VARIANT_DEFINES: Record<SampleVariantKey, readonly string[]> = {
         "LG_SAMPLE_CHROMA",
         "LG_NO_INTERIOR_FASTPATH",
     ],
-    CLEAR_CHROMA_CLAMP_FULL: [
-        "LG_TRANSFER_SAMPLE",
-        "LG_SPECIALIZED",
-        "LG_SAMPLE_CLEAR",
-        "LG_SAMPLE_CHROMA",
-        "LG_SAMPLE_CLAMP",
-        "LG_NO_INTERIOR_FASTPATH",
-    ],
     BLUR: ["LG_TRANSFER_SAMPLE", "LG_SPECIALIZED", "LG_SAMPLE_BLUR"],
     BLUR_CLAMP: ["LG_TRANSFER_SAMPLE", "LG_SPECIALIZED", "LG_SAMPLE_BLUR", "LG_SAMPLE_CLAMP"],
     BLUR_FULL: ["LG_TRANSFER_SAMPLE", "LG_SPECIALIZED", "LG_SAMPLE_BLUR", "LG_NO_INTERIOR_FASTPATH"],
-    BLUR_CLAMP_FULL: [
-        "LG_TRANSFER_SAMPLE",
-        "LG_SPECIALIZED",
-        "LG_SAMPLE_BLUR",
-        "LG_SAMPLE_CLAMP",
-        "LG_NO_INTERIOR_FASTPATH",
-    ],
     BLUR_CHROMA: ["LG_TRANSFER_SAMPLE", "LG_SPECIALIZED", "LG_SAMPLE_BLUR", "LG_SAMPLE_CHROMA"],
     BLUR_CHROMA_CLAMP: [
         "LG_TRANSFER_SAMPLE",
@@ -153,23 +143,16 @@ const VARIANT_DEFINES: Record<SampleVariantKey, readonly string[]> = {
         "LG_SAMPLE_CHROMA",
         "LG_NO_INTERIOR_FASTPATH",
     ],
-    BLUR_CHROMA_CLAMP_FULL: [
-        "LG_TRANSFER_SAMPLE",
-        "LG_SPECIALIZED",
-        "LG_SAMPLE_BLUR",
-        "LG_SAMPLE_CHROMA",
-        "LG_SAMPLE_CLAMP",
-        "LG_NO_INTERIOR_FASTPATH",
-    ],
 };
 
-function buildWebgl2Sources(
+export function buildWebgl2Sources(
     vertexSource: string,
     fragmentSource: string,
     defines: readonly string[],
     isBuildPass: boolean,
 ): { vertex: string; fragment: string } {
-    const defineBlock = defines.map((name) => `#define ${name}\n`).join("");
+    const allDefines = defines.includes("LG_WEBGL2") ? defines : ["LG_WEBGL2", ...defines];
+    const defineBlock = allDefines.map((name) => `#define ${name}\n`).join("");
     const webgl2Vertex = `#version 300 es\n${defineBlock}${vertexSource
         .replace(/\battribute\b/g, "in")
         .replace(/\bvarying\b/g, "out")}`;
@@ -253,11 +236,16 @@ function createSampleEntry(gl: WebGL2RenderingContext, program: WebGLProgram): S
         uGeomLoc: gl.getUniformLocation(program, "uGeom"),
         uOpticalLoc: gl.getUniformLocation(program, "uOptical"),
         uTintLoc: gl.getUniformLocation(program, "uTint"),
+        uMediumLoc: gl.getUniformLocation(program, "uMedium"),
+        lastMedium: null,
         uSaturationLoc: gl.getUniformLocation(program, "uSaturation"),
         lastSaturation: -2,
+        uSharpnessLoc: gl.getUniformLocation(program, "uSharpness"),
+        lastSharpness: -1,
         uHighlightLoc: gl.getUniformLocation(program, "uHighlight"),
         uSceneRectLoc: gl.getUniformLocation(program, "uSceneRect"),
         uDprLoc: gl.getUniformLocation(program, "uDpr"),
+        uPixelSizeLoc: gl.getUniformLocation(program, "uPixelSize"),
         uInteriorMarginLoc: gl.getUniformLocation(program, "uInteriorMargin"),
         uBlurOffset1Loc: gl.getUniformLocation(program, "uBlurOffset1"),
         uBlurOffset2Loc: gl.getUniformLocation(program, "uBlurOffset2"),
@@ -285,6 +273,8 @@ function createSampleEntry(gl: WebGL2RenderingContext, program: WebGLProgram): S
         lastRelW: -1,
         lastRelH: -1,
         lastDpr: -1,
+        lastPixelSizeX: -1,
+        lastPixelSizeY: -1,
         lastInteriorMargin: -1,
         lastBlurOffset1X: Number.NaN,
         lastBlurOffset1Y: Number.NaN,
@@ -401,6 +391,7 @@ export class OpticalTransferCache {
             uOpticalLoc: gl.getUniformLocation(buildProgram, "uOptical"),
             uRefractionLoc: gl.getUniformLocation(buildProgram, "uRefraction"),
             uDprLoc: gl.getUniformLocation(buildProgram, "uDpr"),
+            uPixelSizeLoc: gl.getUniformLocation(buildProgram, "uPixelSize"),
             uInteriorMarginLoc: gl.getUniformLocation(buildProgram, "uInteriorMargin"),
             uLutScaleLoc: gl.getUniformLocation(buildProgram, "uLutScale"),
             uSquircleLoc: gl.getUniformLocation(buildProgram, "uSquircle"),
@@ -478,22 +469,11 @@ export class OpticalTransferCache {
         }
         if (!this.framebuffer) return false;
 
-        const maxCacheBytes = getMaxTransferCacheBytes();
-        const pixelCount = targetWidth * targetHeight;
-        const requiredBytes = pixelCount * BYTES_PER_PIXEL;
-        const projectedBytes = totalAllocatedBytes - this.allocatedBytes + requiredBytes;
-        if (
-            targetWidth <= 0 ||
-            targetHeight <= 0 ||
-            targetWidth > this.maxTextureSize ||
-            targetHeight > this.maxTextureSize ||
-            pixelCount > MAX_CACHE_PIXELS ||
-            requiredBytes > maxCacheBytes ||
-            projectedBytes > maxCacheBytes
-        ) {
+        if (!canAllocateOpticalTransfer(targetWidth, targetHeight, this.maxTextureSize, this.allocatedBytes)) {
             this.releaseStorage();
             return false;
         }
+        const requiredBytes = targetWidth * targetHeight * BYTES_PER_PIXEL;
 
         const { gl } = this;
         const hasGetError = typeof gl.getError === "function";
@@ -548,7 +528,7 @@ export class OpticalTransferCache {
             return false;
         }
 
-        totalAllocatedBytes = projectedBytes;
+        totalAllocatedBytes += requiredBytes - this.allocatedBytes;
         this.allocatedBytes = requiredBytes;
         this.width = targetWidth;
         this.height = targetHeight;
@@ -571,6 +551,8 @@ export class OpticalTransferCache {
         blurRadiusPx: number,
         chromaStrength: number,
         saturation: number,
+        sharpness: number,
+        medium: GlassMediumCoefficients | null,
         useInteriorTex = false,
     ): boolean {
         if (this.disposed) return false;
@@ -588,7 +570,9 @@ export class OpticalTransferCache {
         let blurOffset2Y = 0;
         let clampNeeded = false;
 
-        if (useScene && frame.sceneRect) {
+        // The border sampler already clamps its taps. Only the interior fast path
+        // needs a different program when its taps extend beyond the scene.
+        if (useInteriorBranch && useScene && frame.sceneRect) {
             const { relX, relY, relW, relH } = frame.sceneRect;
             const blurUvX = blurRadiusPx > 0 ? (relW / Math.max(1.0, frame.width)) * blurRadiusPx : 0;
             const blurUvY = blurRadiusPx > 0 ? (relH / Math.max(1.0, frame.height)) * blurRadiusPx : 0;
@@ -663,6 +647,9 @@ export class OpticalTransferCache {
             }
             if (buildEntry.uRefractionLoc) gl.uniform2f(buildEntry.uRefractionLoc, direction, edgeFade);
             if (buildEntry.uDprLoc) gl.uniform1f(buildEntry.uDprLoc, dpr);
+            if (buildEntry.uPixelSizeLoc) {
+                gl.uniform2f(buildEntry.uPixelSizeLoc, frame.width / targetWidth, frame.height / targetHeight);
+            }
             if (buildEntry.uInteriorMarginLoc) gl.uniform1f(buildEntry.uInteriorMarginLoc, interiorMargin);
             if (buildEntry.uSquircleLoc) gl.uniform1f(buildEntry.uSquircleLoc, squircleFlag);
             gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -697,6 +684,16 @@ export class OpticalTransferCache {
         if (sampleEntry.uDprLoc && dpr !== sampleEntry.lastDpr) {
             sampleEntry.lastDpr = dpr;
             gl.uniform1f(sampleEntry.uDprLoc, dpr);
+        }
+        const pixelSizeX = frame.width / targetWidth;
+        const pixelSizeY = frame.height / targetHeight;
+        if (
+            sampleEntry.uPixelSizeLoc &&
+            (pixelSizeX !== sampleEntry.lastPixelSizeX || pixelSizeY !== sampleEntry.lastPixelSizeY)
+        ) {
+            sampleEntry.lastPixelSizeX = pixelSizeX;
+            sampleEntry.lastPixelSizeY = pixelSizeY;
+            gl.uniform2f(sampleEntry.uPixelSizeLoc, pixelSizeX, pixelSizeY);
         }
         if (sampleEntry.uInteriorMarginLoc && interiorMargin !== sampleEntry.lastInteriorMargin) {
             sampleEntry.lastInteriorMargin = interiorMargin;
@@ -759,6 +756,14 @@ export class OpticalTransferCache {
         if (sampleEntry.uSaturationLoc && saturation !== sampleEntry.lastSaturation) {
             sampleEntry.lastSaturation = saturation;
             gl.uniform1f(sampleEntry.uSaturationLoc, saturation);
+        }
+        if (sampleEntry.uSharpnessLoc && sharpness !== sampleEntry.lastSharpness) {
+            sampleEntry.lastSharpness = sharpness;
+            gl.uniform1f(sampleEntry.uSharpnessLoc, sharpness);
+        }
+        if (sampleEntry.uMediumLoc && medium && medium !== sampleEntry.lastMedium) {
+            sampleEntry.lastMedium = medium;
+            gl.uniform4f(sampleEntry.uMediumLoc, ...medium);
         }
         const darkRimScale = frame.darkRimScale ?? 1;
         if (

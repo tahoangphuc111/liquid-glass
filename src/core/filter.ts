@@ -7,7 +7,9 @@ import {
     SVG_NS,
     USE_CSS_SATURATION,
     pickMapScale,
-    resolveChromaticAberration,
+    resolveChromaticChannelScales,
+    resolveEffectiveChromaticAberration,
+    resolveGlassSharpness,
 } from "./config.js";
 import { getRefractionSpan, resolveRefractionBezel, resolveRefractionTravel } from "./refractionBounds.js";
 import type { GlassConfig, GlassSurface } from "./types.js";
@@ -26,7 +28,7 @@ export interface FilterArchetype {
     clampedBezel: number;
     blob: Blob;
     blobUrl: string | null;
-    scale: number;
+    maxDisplacement: number;
     needsSeparateT1Filter: boolean;
     filterX: string;
     filterY: string;
@@ -42,6 +44,7 @@ export interface FilterArchetype {
 
 export interface PooledFilterElement extends SVGFilterElement {
     _isStd?: boolean;
+    _isChroma?: boolean;
     _hasMatrix?: boolean;
     _lastX?: string;
     _lastY?: string;
@@ -49,6 +52,8 @@ export interface PooledFilterElement extends SVGFilterElement {
     _lastH?: string;
     _feImage?: PooledFeImageElement;
     _feDisp?: PooledFeDisplacementElement;
+    _feDispWarm?: PooledFeDisplacementElement;
+    _feDispCool?: PooledFeDisplacementElement;
 }
 
 interface PooledFeImageElement extends SVGFEImageElement {
@@ -63,6 +68,7 @@ interface PooledFeDisplacementElement extends SVGFEDisplacementMapElement {
 
 export interface SharedFilterRecord {
     key: string;
+    baseKey?: string;
     filterId: string;
     filterIdT1: string;
     node: PooledFilterElement | null;
@@ -86,6 +92,7 @@ export interface SharedFilterRecord {
 
 export interface AcquireFilterOptions {
     sharedKey: string;
+    baseKey?: string;
     config: GlassConfig;
     w: number;
     h: number;
@@ -111,15 +118,22 @@ const MAX_LRU_FILTERS = 2;
 const LRU_IDLE_EVICT_MS = 5000;
 const MAX_FILTER_ARCHETYPES = 16;
 const MAX_POOLED_STD_FILTERS = 16;
+const MAX_POOLED_CHROMA_FILTERS = 16;
 const MAX_POOLED_PRELOAD_IMAGES = 8;
+const MIN_CHROMATIC_SCALE_DELTA = 0.6;
 const RESOLVED_VOID_PROMISE = Promise.resolve();
-const SVG_BLUE_SHIFT = 1.35 * 1.28;
+
+function formatBoundedDisplacementScale(scale: number): string {
+    return String(Math.floor(Math.max(0, scale) * 1000 + 1e-9) / 1000);
+}
 
 const freeStdFilterPool: PooledFilterElement[] = [];
+const freeChromaFilterPool: PooledFilterElement[] = [];
 const freePreloadImages: HTMLImageElement[] = [];
 
 export function clearFilterElementPools(): void {
     freeStdFilterPool.length = 0;
+    freeChromaFilterPool.length = 0;
     freePreloadImages.length = 0;
 }
 
@@ -240,21 +254,26 @@ export function buildFilterElement(
     dispSmooth = 0,
     chromaticAberration?: boolean | number,
     abbeNumber?: number,
+    ior?: number,
 ): { filterNode: PooledFilterElement; feImage: PooledFeImageElement } {
     const numericBlur = typeof blurAmt === "string" ? parseFloat(blurAmt) : blurAmt;
-    const chromaAmount = resolveChromaticAberration(chromaticAberration, abbeNumber);
+    const effectiveChroma = resolveEffectiveChromaticAberration(chromaticAberration, abbeNumber, ior);
     const numericScale = parseFloat(scale) || 0;
-    const chromaShift = chromaAmount * 1.35;
-    const scaleMinus = Math.max(0, numericScale * (1 - chromaShift * 0.72));
-    const scalePlus = numericScale * (1 + chromaAmount * SVG_BLUE_SHIFT);
-    const useChromatic = chromaAmount > 0 && scalePlus - scaleMinus >= 0.25;
+    const { redScale: scaleMinus, blueScale: scalePlus } = resolveChromaticChannelScales(
+        numericScale,
+        effectiveChroma,
+    );
+    const useChromatic = effectiveChroma > 0 && scalePlus - scaleMinus >= MIN_CHROMATIC_SCALE_DELTA;
+    const warmScaleStr = scaleMinus.toFixed(2);
+    const coolScaleStr = formatBoundedDisplacementScale(scalePlus);
 
-    const isStandard =
-        !useChromatic &&
+    const isPoolableShape =
         !(PREBLUR_MODE === "svg" && numericBlur > 0) &&
         !isT1 &&
         dispSmooth <= 0 &&
         (colorMatrix === GLASS_COLOR_MATRIX || !colorMatrix || USE_CSS_SATURATION);
+    const isStandard = !useChromatic && isPoolableShape;
+    const isChromaticStandard = useChromatic && isPoolableShape;
     const hasMatrix = !USE_CSS_SATURATION && Boolean(colorMatrix);
 
     if (isStandard && !hasMatrix && freeStdFilterPool.length > 0) {
@@ -294,6 +313,53 @@ export function buildFilterElement(
             if (pooledFeDisp._lastScale !== scale) {
                 pooledFeDisp.setAttribute("scale", scale);
                 pooledFeDisp._lastScale = scale;
+            }
+            return { filterNode: pooledFilter, feImage: pooledFeImage };
+        }
+    }
+
+    if (isChromaticStandard && !hasMatrix && freeChromaFilterPool.length > 0) {
+        const pooledFilter = freeChromaFilterPool.pop()!;
+        const pooledFeImage = pooledFilter._feImage;
+        const pooledFeDispWarm = pooledFilter._feDispWarm;
+        const pooledFeDispCool = pooledFilter._feDispCool;
+        if (pooledFeImage && pooledFeDispWarm && pooledFeDispCool) {
+            pooledFilter.id = id;
+            if (pooledFilter._lastX !== filterX) {
+                pooledFilter.setAttribute("x", filterX);
+                pooledFilter._lastX = filterX;
+            }
+            if (pooledFilter._lastY !== filterY) {
+                pooledFilter.setAttribute("y", filterY);
+                pooledFilter._lastY = filterY;
+            }
+            if (pooledFilter._lastW !== filterW) {
+                pooledFilter.setAttribute("width", filterW);
+                pooledFilter._lastW = filterW;
+            }
+            if (pooledFilter._lastH !== filterH) {
+                pooledFilter.setAttribute("height", filterH);
+                pooledFilter._lastH = filterH;
+            }
+            if (pooledFeImage._lastHref !== combinedUrl) {
+                pooledFeImage.setAttribute("href", combinedUrl);
+                pooledFeImage._lastHref = combinedUrl;
+            }
+            if (pooledFeImage._lastW !== width) {
+                pooledFeImage.setAttribute("width", String(width));
+                pooledFeImage._lastW = width;
+            }
+            if (pooledFeImage._lastH !== height) {
+                pooledFeImage.setAttribute("height", String(height));
+                pooledFeImage._lastH = height;
+            }
+            if (pooledFeDispWarm._lastScale !== warmScaleStr) {
+                pooledFeDispWarm.setAttribute("scale", warmScaleStr);
+                pooledFeDispWarm._lastScale = warmScaleStr;
+            }
+            if (pooledFeDispCool._lastScale !== coolScaleStr) {
+                pooledFeDispCool.setAttribute("scale", coolScaleStr);
+                pooledFeDispCool._lastScale = coolScaleStr;
             }
             return { filterNode: pooledFilter, feImage: pooledFeImage };
         }
@@ -346,6 +412,8 @@ export function buildFilterElement(
 
     const dispResult = isT1 ? "displaced_t1" : "displaced";
     let feDisp: PooledFeDisplacementElement | undefined;
+    let feDispWarm: PooledFeDisplacementElement | undefined;
+    let feDispCool: PooledFeDisplacementElement | undefined;
 
     if (useChromatic) {
         const suffix = isT1 ? "_t1" : "";
@@ -354,12 +422,10 @@ export function buildFilterElement(
         const warmMixId = `warm_mix${suffix}`;
         const coolMixId = `cool_mix${suffix}`;
 
-        filterNode.appendChild(
-            createDisplacementNode(dispMapIn, dispMapSource, scaleMinus.toFixed(2), warmDispId),
-        );
-        filterNode.appendChild(
-            createDisplacementNode(dispMapIn, dispMapSource, scalePlus.toFixed(2), coolDispId),
-        );
+        feDispWarm = createDisplacementNode(dispMapIn, dispMapSource, warmScaleStr, warmDispId);
+        feDispCool = createDisplacementNode(dispMapIn, dispMapSource, coolScaleStr, coolDispId);
+        filterNode.appendChild(feDispWarm);
+        filterNode.appendChild(feDispCool);
         filterNode.appendChild(
             createChannelMatrixNode(
                 warmDispId,
@@ -411,6 +477,21 @@ export function buildFilterElement(
         feImage._lastW = width;
         feImage._lastH = height;
         feDisp._lastScale = scale;
+    } else if (isChromaticStandard && feDispWarm && feDispCool) {
+        filterNode._isChroma = true;
+        filterNode._hasMatrix = hasMatrix;
+        filterNode._lastX = filterX;
+        filterNode._lastY = filterY;
+        filterNode._lastW = filterW;
+        filterNode._lastH = filterH;
+        filterNode._feImage = feImage;
+        filterNode._feDispWarm = feDispWarm;
+        filterNode._feDispCool = feDispCool;
+        feImage._lastHref = combinedUrl;
+        feImage._lastW = width;
+        feImage._lastH = height;
+        feDispWarm._lastScale = warmScaleStr;
+        feDispCool._lastScale = coolScaleStr;
     }
 
     return { filterNode, feImage };
@@ -481,12 +562,126 @@ export function startMapPreload(
     return preloadPromise;
 }
 
+export interface ResolvedSvgFilterScales {
+    scaleValue: string;
+    warmScale: string;
+    coolScale: string;
+    useChromatic: boolean;
+}
+
+export function resolveSvgFilterScales(
+    archetype: FilterArchetype,
+    config: GlassConfig,
+    actualW: number,
+    actualH: number,
+    tier: number,
+): ResolvedSvgFilterScales {
+    const effectiveChroma =
+        tier >= 2
+            ? 0
+            : resolveEffectiveChromaticAberration(
+                  config.chromaticAberration,
+                  config.abbeNumber,
+                  config.ior,
+              );
+    const span = getRefractionSpan(
+        actualW,
+        actualH,
+        config.axis === "x" ? "horizontal" : config.refractionDirection,
+    );
+    const adaptiveTravel =
+        config.adaptiveRefraction === true
+            ? resolveRefractionTravel(span, archetype.clampedBezel)
+            : Infinity;
+    const maxDisplacementScale = Math.min(
+        2 * adaptiveTravel,
+        2 * (config.maxRefractionPx ?? Infinity),
+        config.maxScaleMultiplier * archetype.clampedBezel,
+    );
+    const { blueMultiplier } = resolveChromaticChannelScales(1, effectiveChroma);
+    const scale = Math.max(
+        0,
+        Math.min(
+            archetype.maxDisplacement * config.scaleRatio,
+            maxDisplacementScale / blueMultiplier,
+        ),
+    );
+    const scaleValue = (Math.floor(scale * 100) / 100).toFixed(2);
+    const numericScale = parseFloat(scaleValue) || 0;
+    const { redScale, blueScale } = resolveChromaticChannelScales(numericScale, effectiveChroma);
+    const useChromatic = effectiveChroma > 0 && blueScale - redScale >= MIN_CHROMATIC_SCALE_DELTA;
+    return {
+        scaleValue,
+        warmScale: redScale.toFixed(2),
+        coolScale: formatBoundedDisplacementScale(blueScale),
+        useChromatic,
+    };
+}
+
+export function tryUpdateFilterScalesInPlace(
+    oldKey: string,
+    newKey: string,
+    baseKey: string,
+    config: GlassConfig,
+    actualW: number,
+    actualH: number,
+    tier: number,
+): SharedFilterRecord | null {
+    if (oldKey === newKey || sharedFilters.has(newKey)) return null;
+    const record = sharedFilters.get(oldKey);
+    if (
+        !record ||
+        !record.ready ||
+        record.refCount !== 1 ||
+        record.baseKey !== baseKey ||
+        record.actualW !== actualW ||
+        record.actualH !== actualH ||
+        !record.archetype ||
+        !record.node?.isConnected ||
+        record.nodeT1 !== null
+    ) {
+        return null;
+    }
+
+    const filterNode = record.node;
+    const resolved = resolveSvgFilterScales(record.archetype, config, actualW, actualH, tier);
+    if (resolved.useChromatic) {
+        if (!filterNode._isChroma || !filterNode._feDispWarm || !filterNode._feDispCool) {
+            return null;
+        }
+        if (filterNode._feDispWarm._lastScale !== resolved.warmScale) {
+            filterNode._feDispWarm.setAttribute("scale", resolved.warmScale);
+            filterNode._feDispWarm._lastScale = resolved.warmScale;
+        }
+        if (filterNode._feDispCool._lastScale !== resolved.coolScale) {
+            filterNode._feDispCool.setAttribute("scale", resolved.coolScale);
+            filterNode._feDispCool._lastScale = resolved.coolScale;
+        }
+    } else {
+        if (!filterNode._isStd || !filterNode._feDisp) {
+            return null;
+        }
+        if (filterNode._feDisp._lastScale !== resolved.scaleValue) {
+            filterNode._feDisp.setAttribute("scale", resolved.scaleValue);
+            filterNode._feDisp._lastScale = resolved.scaleValue;
+        }
+    }
+
+    sharedFilters.delete(oldKey);
+    lruUnusedFilterKeys.delete(oldKey);
+    record.key = newKey;
+    record.lastUsed = getNowMs();
+    sharedFilters.set(newKey, record);
+    return record;
+}
+
 export function acquireSharedFilter(
     options: AcquireFilterOptions,
     tier = 0,
 ): SharedFilterRecord | null {
     const {
         sharedKey,
+        baseKey,
         config,
         w,
         h,
@@ -500,21 +695,23 @@ export function acquireSharedFilter(
 
     const now = getNowMs();
 
-    const existingRecord = sharedFilters.get(sharedKey);
-    if (existingRecord !== undefined) {
+    let resolvedSharedKey = sharedKey;
+    while (true) {
+        const existingRecord = sharedFilters.get(resolvedSharedKey);
+        if (existingRecord === undefined) {
+            break;
+        }
         if (
             existingRecord.actualW !== actualW || existingRecord.actualH !== actualH
         ) {
-            const exactKey = `${sharedKey}_${actualW}x${actualH}`;
-            return acquireSharedFilter(
-                {
-                    ...options,
-                    sharedKey: exactKey,
-                },
-                tier,
-            );
+            const exactKey = `${resolvedSharedKey}_${actualW}x${actualH}`;
+            if (exactKey === resolvedSharedKey) {
+                break;
+            }
+            resolvedSharedKey = exactKey;
+            continue;
         }
-        lruUnusedFilterKeys.delete(sharedKey);
+        lruUnusedFilterKeys.delete(resolvedSharedKey);
         existingRecord.refCount++;
         existingRecord.lastUsed = now;
         if (existingRecord.node && !existingRecord.node.parentNode && svgDefs) {
@@ -529,8 +726,13 @@ export function acquireSharedFilter(
     const blurAmt = config.blur;
     const ior = config.ior;
     const cornerStyle = config.cornerStyle === "squircle" ? "squircle" : "circular";
-    const chromaAmount = resolveChromaticAberration(config.chromaticAberration, config.abbeNumber);
-    const effectiveArchTier = tier === 1 && chromaAmount > 0 ? 3 : tier;
+    const effectiveChroma = resolveEffectiveChromaticAberration(
+        config.chromaticAberration,
+        config.abbeNumber,
+        ior,
+    );
+    const sharpnessAmount = resolveGlassSharpness(config.sharpness, blurAmt);
+    const effectiveArchTier = tier === 1 && effectiveChroma > 0 && sharpnessAmount <= 0 ? 3 : tier;
     let archetype: FilterArchetype | null = null;
     if (
         lastArchVal1 &&
@@ -563,9 +765,8 @@ export function acquireSharedFilter(
         const bezelSpan = isAxisX ? w : Math.min(w, h);
         const clampedBezel = resolveRefractionBezel(bezelSpan, config.bezel, config.adaptiveRefraction === true);
         const glassThickness = config.thickness;
-        const scaleRatio = config.scaleRatio;
 
-        const archetypeKey = `${w}|${h}|${radius}|${clampedBezel}|${glassThickness}|${scaleRatio}|${config.maxScaleMultiplier}|${Math.fround(ior)}|${surface}|${cornerStyle}|${config.pill ? 1 : 0}|${isAxisX ? 1 : 0}|${config.refractionDirection}|${config.refractionEdgeFade}|${blurAmt}|${rasterScale}|${effectiveArchTier}`;
+        const archetypeKey = `${w}|${h}|${radius}|${clampedBezel}|${glassThickness}|${Math.fround(ior)}|${surface}|${cornerStyle}|${config.pill ? 1 : 0}|${isAxisX ? 1 : 0}|${config.refractionDirection}|${config.refractionEdgeFade}|${blurAmt}|${rasterScale}|${effectiveArchTier}`;
         archetype = filterArchetypeCache.get(archetypeKey) ?? null;
         if (archetype) {
             filterArchetypeCache.delete(archetypeKey);
@@ -574,17 +775,20 @@ export function acquireSharedFilter(
 
         if (!archetype) {
             const baseScale = pickMapScale(w, h, clampedBezel, radius, blurAmt, isAxisX);
-            const hidpiFitScale =
-                !isAxisX && radius > 0 && tier === 0
-                    ? Math.min(
-                          rasterScale,
-                          Math.sqrt(MAX_DISPLACEMENT_TEXELS / Math.max(1, w * h)),
-                      )
-                    : baseScale;
+            const useHighResMap =
+                !isAxisX &&
+                radius > 0 &&
+                (tier === 0 || (tier === 1 && sharpnessAmount > 0));
+            const hidpiFitScale = useHighResMap
+                ? Math.min(
+                      rasterScale,
+                      Math.sqrt(MAX_DISPLACEMENT_TEXELS / Math.max(1, w * h)),
+                  )
+                : baseScale;
             const activeScale =
                 radius <= 0
                     ? baseScale
-                    : tier === 2 || (tier === 1 && chromaAmount > 0)
+                    : tier === 2 || (tier === 1 && effectiveChroma > 0 && sharpnessAmount <= 0)
                       ? baseScale * 0.5 > MAP_MIN_SCALE
                           ? baseScale * 0.5
                           : MAP_MIN_SCALE
@@ -638,11 +842,6 @@ export function acquireSharedFilter(
                 activeBlobUrlCount++;
             }
 
-            const scale = Math.max(0, Math.min(
-                wasmRes.maxDisplacement * scaleRatio,
-                config.maxScaleMultiplier * clampedBezel,
-            ));
-
             const needsSeparateT1Filter = PREBLUR_MODE === "svg" && blurAmt > 0;
             const padPx = needsSeparateT1Filter ? Math.ceil(3 * blurAmt) : 0;
             const filterX = padPx === 0 ? "0%" : `-${((padPx / w) * 100).toFixed(2)}%`;
@@ -657,7 +856,7 @@ export function acquireSharedFilter(
                 clampedBezel,
                 blob: wasmRes.blob,
                 blobUrl,
-                scale,
+                maxDisplacement: wasmRes.maxDisplacement,
                 needsSeparateT1Filter,
                 filterX,
                 filterY,
@@ -725,12 +924,10 @@ export function acquireSharedFilter(
 
     archetype.refCount++;
     const combinedUrl = archetype.blobUrl ?? "";
-    let scale = archetype.scale;
-    const span = getRefractionSpan(actualW, actualH, config.axis === "x" ? "horizontal" : config.refractionDirection);
-    const adaptiveTravel = config.adaptiveRefraction === true ? resolveRefractionTravel(span, archetype.clampedBezel) : Infinity;
-    const travel = Math.min(adaptiveTravel, config.maxRefractionPx ?? Infinity);
-    scale = Math.min(scale, 2 * travel / (1 + chromaAmount * SVG_BLUE_SHIFT));
-    const scaleValue = (Math.floor(scale * 100) / 100).toFixed(2);
+    const resolvedScales = resolveSvgFilterScales(archetype, config, actualW, actualH, tier);
+    const scaleValue = resolvedScales.scaleValue;
+    const filterChromaticAberration = tier >= 2 ? false : config.chromaticAberration;
+    const filterAbbeNumber = tier >= 2 ? undefined : config.abbeNumber;
     filterIdCounter++;
     const filterId = `lg-${filterIdCounter}`;
     const needsSeparateT1Filter = archetype.needsSeparateT1Filter;
@@ -750,7 +947,9 @@ export function acquireSharedFilter(
         blurAmt,
         false,
         0,
-        chromaAmount,
+        filterChromaticAberration,
+        filterAbbeNumber,
+        ior,
     );
     svgDefs.appendChild(filterNode);
 
@@ -777,7 +976,9 @@ export function acquireSharedFilter(
             blurAmtT1,
             true,
             0,
-            chromaAmount,
+            filterChromaticAberration,
+            filterAbbeNumber,
+            ior,
         );
         filterNodeT1 = t1Result.filterNode;
         feImageT1 = t1Result.feImage;
@@ -786,7 +987,8 @@ export function acquireSharedFilter(
 
     const isReady = archetype.decoded;
     const newRecord: SharedFilterRecord = {
-        key: sharedKey,
+        key: resolvedSharedKey,
+        baseKey,
         filterId,
         filterIdT1,
         node: filterNode,
@@ -809,7 +1011,7 @@ export function acquireSharedFilter(
     if (!isReady) {
         startMapPreload(newRecord, archetype);
     }
-    sharedFilters.set(sharedKey, newRecord);
+    sharedFilters.set(resolvedSharedKey, newRecord);
     return newRecord;
 }
 
@@ -838,6 +1040,16 @@ export function disposeSharedFilter(key: string, immediate = false): void {
             freeStdFilterPool.length < MAX_POOLED_STD_FILTERS
         ) {
             freeStdFilterPool.push(node);
+        } else if (
+            !immediate &&
+            node._isChroma &&
+            !node._hasMatrix &&
+            node._feImage &&
+            node._feDispWarm &&
+            node._feDispCool &&
+            freeChromaFilterPool.length < MAX_POOLED_CHROMA_FILTERS
+        ) {
+            freeChromaFilterPool.push(node);
         }
     }
     if (record.nodeT1 && record.nodeT1.parentNode) {

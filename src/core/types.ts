@@ -59,6 +59,7 @@ export interface GlassConfig {
     scaleRatio: number;
     maxScaleMultiplier: number;
     blur: number;
+    sharpness?: number;
     saturation?: number;
     ior: number;
     colorMatrix?: string;
@@ -80,7 +81,7 @@ export interface LiquidGlassOptions {
     engine?: GlassEngineMode;
     thickness?: number;
     bezel?: number;
-    /** Fit the bezel and displacement to the measured surface. Defaults to true. */
+    /** Fit the bezel and displacement to the measured surface. Defaults to false (true on switches). */
     adaptiveRefraction?: boolean;
     refractionDirection?: GlassRefractionDirection;
     refractionEdgeFade?: number;
@@ -88,6 +89,8 @@ export interface LiquidGlassOptions {
     scaleRatio?: number;
     maxScaleMultiplier?: number;
     blur?: number;
+    /** Backdrop sharpness from 0 (none) to 1 (maximum crispness). Automatically increases when blur is 0. */
+    sharpness?: number;
     /** Backdrop saturation from 0 (grayscale) to 4. Omit for the renderer default. */
     saturation?: number;
     ior?: number;
@@ -176,6 +179,7 @@ export interface LiquidGlassStats {
 export interface SceneCaptureController {
     readonly canvas: HTMLCanvasElement | null;
     readonly source: HTMLElement | null;
+    /** An empty canvas signals that the current source could no longer be captured. */
     subscribe(listener: (canvas: HTMLCanvasElement, source: HTMLElement) => void): () => void;
     scheduleCapture(): void;
     setActive?(active: boolean): void;

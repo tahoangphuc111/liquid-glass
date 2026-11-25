@@ -101,7 +101,7 @@ export function initLoafTelemetry(): void {
                 if (typeof document !== "undefined" && document.hidden) return;
                 for (const entry of list.getEntries()) {
                     const loaf = entry as PerformanceEntry & { blockingDuration?: number };
-                    if (loaf.duration > 50 && (loaf.blockingDuration ?? 0) > 0) {
+                    if (loaf.duration > 50 && ((loaf.blockingDuration ?? 0) > 0 || loaf.duration > 85)) {
                         recordJankFrame(loaf.startTime + loaf.duration);
                     }
                 }

@@ -1,6 +1,40 @@
+import {
+    CHROMATIC_BLUE_SHIFT_RATIO,
+    CHROMATIC_RED_SHIFT_RATIO,
+    DEFAULT_ABBE_NUMBER,
+    MAX_ABBE_NUMBER,
+    MIN_ABBE_NUMBER,
+} from "./config.js";
 import type { GlassSurface } from "./types.js";
 
 export const OPTICAL_LUT_SIZE = 1024;
+
+export type GlassMediumCoefficients = readonly [number, number, number, number];
+
+export function resolveGlassMedium(
+    red: number,
+    green: number,
+    blue: number,
+    opacity: number,
+    thickness: number,
+): GlassMediumCoefficients {
+    const alpha = Math.min(0.85, Math.max(0, opacity));
+    if (alpha === 0) return [1, 1, 1, 0];
+    const chroma = Math.max(red, green, blue) - Math.min(red, green, blue);
+    const absorptionWeight = Math.min(0.85, chroma * 1.1);
+    // For a fixed material, tint and absorption are affine in the scene color.
+    const frostedGain = (1 - alpha) * (1 - absorptionWeight);
+    const tintWeight = alpha * (1 - absorptionWeight);
+    if (absorptionWeight === 0) return [frostedGain, frostedGain, frostedGain, tintWeight];
+
+    const opticalDepth = -alpha * (0.75 + Math.min(160, Math.max(0, thickness)) * 0.014);
+    return [
+        frostedGain + absorptionWeight * Math.exp(opticalDepth * (1 - red)),
+        frostedGain + absorptionWeight * Math.exp(opticalDepth * (1 - green)),
+        frostedGain + absorptionWeight * Math.exp(opticalDepth * (1 - blue)),
+        tintWeight,
+    ];
+}
 
 interface SurfaceGeometryBasis {
     readonly sinI: Float32Array;
@@ -60,11 +94,136 @@ function encodeSignedUnit16(value: number): number {
 
 const FRAUNHOFER_C_NM = 656.2725;
 const FRAUNHOFER_D_NM = 587.5618;
+const FRAUNHOFER_E_NM = 546.074;
 const FRAUNHOFER_F_NM = 486.1327;
+const SRGB_BLUE_NM = 460.0;
 const INV_LAMBDA_C_SQ = 1 / (FRAUNHOFER_C_NM * FRAUNHOFER_C_NM);
 const INV_LAMBDA_D_SQ = 1 / (FRAUNHOFER_D_NM * FRAUNHOFER_D_NM);
 const INV_LAMBDA_F_SQ = 1 / (FRAUNHOFER_F_NM * FRAUNHOFER_F_NM);
 const CAUCHY_INV_DELTA = 1 / (INV_LAMBDA_F_SQ - INV_LAMBDA_C_SQ);
+
+export interface ThinFilmInterferenceSample {
+    readonly redReflectance: number;
+    readonly greenReflectance: number;
+    readonly blueReflectance: number;
+    readonly opticalPathDifferenceNm: number;
+    readonly transmittanceRgb: readonly [number, number, number];
+}
+
+function evalAiryPolarizedReflectance(r01: number, r12: number, cosPhase: number): number {
+    const r01Sq = r01 * r01;
+    const r12Sq = r12 * r12;
+    const cross = 2 * r01 * r12 * cosPhase;
+    const denom = 1 + r01Sq * r12Sq + cross;
+    if (denom <= 1e-12) return 1;
+    return Math.min(1, Math.max(0, (r01Sq + r12Sq + cross) / denom));
+}
+
+/**
+ * Exact Airy / Fabry-Perot multiple-beam thin-film interference for an unpolarized
+ * wave across ambient (n0) -> dielectric film (n1, thickness d) -> substrate (n2).
+ * Captures Stokes phase shifts, quarter-wave AR minima, and half-wave absentee layers.
+ */
+export function evaluateThinFilmInterference(
+    filmThicknessNm: number,
+    cosIncidence: number,
+    filmIor: number,
+    substrateIor: number,
+    ambientIor = 1.0,
+): ThinFilmInterferenceSample {
+    const dNm = Number.isFinite(filmThicknessNm) ? Math.max(0, filmThicknessNm) : 0;
+    const n0 = Number.isFinite(ambientIor) ? Math.max(1.0, ambientIor) : 1.0;
+    const n1 = Number.isFinite(filmIor) ? Math.max(1.0, filmIor) : 1.38;
+    const n2 = Number.isFinite(substrateIor) ? Math.max(1.0, substrateIor) : 1.52;
+    const cos0 = Number.isFinite(cosIncidence) ? Math.min(1, Math.max(0, Math.abs(cosIncidence))) : 1;
+    const sin0Sq = Math.max(0, 1 - cos0 * cos0);
+
+    const sin1Sq = (n0 / n1) * (n0 / n1) * sin0Sq;
+    if (sin1Sq >= 1) {
+        return {
+            redReflectance: 1,
+            greenReflectance: 1,
+            blueReflectance: 1,
+            opticalPathDifferenceNm: 0,
+            transmittanceRgb: [0, 0, 0],
+        };
+    }
+    const cos1 = Math.sqrt(Math.max(0, 1 - sin1Sq));
+    const opdNm = 2 * n1 * dNm * cos1;
+
+    const sin2Sq = (n0 / n2) * (n0 / n2) * sin0Sq;
+    if (sin2Sq >= 1) {
+        return {
+            redReflectance: 1,
+            greenReflectance: 1,
+            blueReflectance: 1,
+            opticalPathDifferenceNm: opdNm,
+            transmittanceRgb: [0, 0, 0],
+        };
+    }
+    const cos2 = Math.sqrt(Math.max(0, 1 - sin2Sq));
+
+    const rs01 = (n0 * cos0 - n1 * cos1) / Math.max(1e-12, n0 * cos0 + n1 * cos1);
+    const rp01 = (n1 * cos0 - n0 * cos1) / Math.max(1e-12, n1 * cos0 + n0 * cos1);
+    const rs12 = (n1 * cos1 - n2 * cos2) / Math.max(1e-12, n1 * cos1 + n2 * cos2);
+    const rp12 = (n2 * cos1 - n1 * cos2) / Math.max(1e-12, n2 * cos1 + n1 * cos2);
+
+    const evalChannel = (wavelengthNm: number): number => {
+        const phase = (2 * Math.PI * opdNm) / wavelengthNm;
+        const cosPhase = Math.cos(phase);
+        const rS = evalAiryPolarizedReflectance(rs01, rs12, cosPhase);
+        const rP = evalAiryPolarizedReflectance(rp01, rp12, cosPhase);
+        return 0.5 * (rS + rP);
+    };
+
+    const redReflectance = evalChannel(FRAUNHOFER_C_NM);
+    const greenReflectance = evalChannel(FRAUNHOFER_E_NM);
+    const blueReflectance = evalChannel(SRGB_BLUE_NM);
+    return {
+        redReflectance,
+        greenReflectance,
+        blueReflectance,
+        opticalPathDifferenceNm: opdNm,
+        transmittanceRgb: [1 - redReflectance, 1 - greenReflectance, 1 - blueReflectance],
+    };
+}
+
+/**
+ * Derjaguin harmonic effective curvature radius R_eff = 2*R1*R2 / (R1 + R2)
+ * governing capillary bridge geometry between two unequal menisci.
+ */
+export function evaluateDerjaguinEffectiveRadius(radiusA: number, radiusB: number): number {
+    if (!Number.isFinite(radiusA) || !Number.isFinite(radiusB) || radiusA <= 0 || radiusB <= 0) {
+        return 0;
+    }
+    return (2 * radiusA * radiusB) / (radiusA + radiusB);
+}
+
+/**
+ * Young-Laplace capillary pressure jump DeltaP = gamma * (1/R1 + 1/R2) across
+ * a curved liquid interface with principal radii of curvature R1, R2 (signed;
+ * Infinity denotes a flat principal direction).
+ */
+export function evaluateYoungLaplacePressure(
+    principalRadius1: number,
+    principalRadius2: number,
+    surfaceTension = 0.0728,
+): number {
+    if (!Number.isFinite(surfaceTension) || surfaceTension < 0) return 0;
+    const invR1 =
+        Number.isNaN(principalRadius1) || principalRadius1 === 0
+            ? 0
+            : Number.isFinite(principalRadius1)
+              ? 1 / principalRadius1
+              : 0;
+    const invR2 =
+        Number.isNaN(principalRadius2) || principalRadius2 === 0
+            ? 0
+            : Number.isFinite(principalRadius2)
+              ? 1 / principalRadius2
+              : 0;
+    return surfaceTension * (invR1 + invR2);
+}
 
 export interface FresnelReflectanceSample {
     readonly reflectanceS: number;
@@ -133,13 +292,93 @@ export function evaluateCriticalAngle(ior: number): number {
     return Math.asin(1 / safeIor);
 }
 
+export interface SellmeierCoefficients {
+    readonly b1: number;
+    readonly b2: number;
+    readonly b3: number;
+    readonly c1: number;
+    readonly c2: number;
+    readonly c3: number;
+}
+
+/** Standard Schott N-BK7 borosilicate crown glass Sellmeier coefficients (C_i in um^2). */
+export const SCHOTT_BK7_SELLMEIER: SellmeierCoefficients = Object.freeze({
+    b1: 1.03961212,
+    b2: 0.231792344,
+    b3: 1.01046945,
+    c1: 0.00600069867,
+    c2: 0.0200179144,
+    c3: 103.560653,
+});
+
+/** Standard Schott SF11 high-dispersion dense flint glass Sellmeier coefficients (C_i in um^2). */
+export const SCHOTT_SF11_SELLMEIER: SellmeierCoefficients = Object.freeze({
+    b1: 1.73759695,
+    b2: 0.313747346,
+    b3: 1.89878101,
+    c1: 0.013188707,
+    c2: 0.0623068142,
+    c3: 155.23629,
+});
+
+/**
+ * 3-term Sellmeier dispersion equation:
+ * n^2(lambda) = 1 + sum_i (B_i * lambda^2) / (lambda^2 - C_i), with lambda in micrometers.
+ */
+export function evaluateSellmeierIndex(
+    wavelengthNm: number,
+    coefficients: SellmeierCoefficients = SCHOTT_BK7_SELLMEIER,
+): number {
+    const safeLambdaUm =
+        (Number.isFinite(wavelengthNm) ? Math.min(2500, Math.max(200, wavelengthNm)) : FRAUNHOFER_D_NM) *
+        0.001;
+    const lambdaSq = safeLambdaUm * safeLambdaUm;
+    const d1 = lambdaSq - coefficients.c1;
+    const d2 = lambdaSq - coefficients.c2;
+    const d3 = lambdaSq - coefficients.c3;
+    const term1 = Math.abs(d1) < 1e-9 ? 0 : (coefficients.b1 * lambdaSq) / d1;
+    const term2 = Math.abs(d2) < 1e-9 ? 0 : (coefficients.b2 * lambdaSq) / d2;
+    const term3 = Math.abs(d3) < 1e-9 ? 0 : (coefficients.b3 * lambdaSq) / d3;
+    return Math.sqrt(Math.max(1.0002, 1 + term1 + term2 + term3));
+}
+
+/**
+ * Bouguer-Beer-Lambert volumetric transmittance along the Snell-refracted
+ * optical path L(theta_t) = thickness / cos(theta_t):
+ * T_c = exp(-absorption_c * L(theta_t)).
+ */
+export function evaluateBeerLambertTransmittance(
+    absorptionRgb: readonly [number, number, number],
+    thickness: number,
+    cosIncidence = 1.0,
+    ior = 1.52,
+): readonly [number, number, number] {
+    const safeThickness = Number.isFinite(thickness) ? Math.max(0, thickness) : 0;
+    if (safeThickness === 0) return [1, 1, 1];
+    const safeIor = Number.isFinite(ior) ? Math.max(1.0001, ior) : 1.52;
+    const cosI = Number.isFinite(cosIncidence) ? Math.min(1, Math.max(0, Math.abs(cosIncidence))) : 1;
+    const sinTSq = Math.max(0, 1 - cosI * cosI) / (safeIor * safeIor);
+    const cosT = Math.sqrt(Math.max(1e-6, 1 - sinTSq));
+    const opticalPathLength = safeThickness / cosT;
+    const sigmaR = Number.isFinite(absorptionRgb[0]) ? Math.max(0, absorptionRgb[0]) : 0;
+    const sigmaG = Number.isFinite(absorptionRgb[1]) ? Math.max(0, absorptionRgb[1]) : 0;
+    const sigmaB = Number.isFinite(absorptionRgb[2]) ? Math.max(0, absorptionRgb[2]) : 0;
+    return [
+        Math.exp(-sigmaR * opticalPathLength),
+        Math.exp(-sigmaG * opticalPathLength),
+        Math.exp(-sigmaB * opticalPathLength),
+    ];
+}
+
 export function evaluateCauchyIndex(
     wavelengthNm: number,
     ior: number,
-    abbeNumber = 58.5,
+    abbeNumber = DEFAULT_ABBE_NUMBER,
 ): number {
     const safeIor = Number.isFinite(ior) ? Math.max(1.0001, ior) : 1.49;
-    const safeAbbe = Number.isFinite(abbeNumber) ? Math.min(120, Math.max(10, abbeNumber)) : 58.5;
+    const safeAbbe = Number.isFinite(abbeNumber)
+        ? Math.min(MAX_ABBE_NUMBER, Math.max(MIN_ABBE_NUMBER, abbeNumber))
+        : DEFAULT_ABBE_NUMBER;
     const safeWavelength = Number.isFinite(wavelengthNm) ? Math.min(2000, Math.max(200, wavelengthNm)) : FRAUNHOFER_D_NM;
     const cauchyB = ((safeIor - 1) / safeAbbe) * CAUCHY_INV_DELTA;
     const cauchyA = safeIor - cauchyB * INV_LAMBDA_D_SQ;
@@ -251,7 +490,7 @@ export function evaluateSpectralRefraction(
     depth: number,
     surface: GlassSurface,
     ior: number,
-    abbeNumber = 58.5,
+    abbeNumber = DEFAULT_ABBE_NUMBER,
 ): SpectralRefractionSample {
     const { sinI, cosI, tilt, xy } = evaluateSurfaceSample(depth, surface);
     const safeIor = Number.isFinite(ior) ? Math.max(1.01, ior) : 1.49;
@@ -309,24 +548,20 @@ export interface ChromaticDispersionSample {
 export function evaluateOpticalProfile(depth: number, surface: GlassSurface, ior: number): [number, number] {
     const { sinI, cosI, tilt, xy } = evaluateSurfaceSample(depth, surface);
     const safeIor = Number.isFinite(ior) ? Math.max(1.01, ior) : 1.49;
-    const eta = 1 / safeIor;
-    const sinT = Math.min(0.999, Math.max(-0.999, eta * sinI));
-    const cosT = Math.sqrt(Math.max(1e-6, 1 - sinT * sinT));
-    const sinDelta = sinI * cosT - cosI * sinT;
-    const cosDelta = Math.max(0.55, cosI * cosT + sinI * sinT);
-    const displacement = Math.min(1, Math.max(-1, tilt * (sinDelta / cosDelta) * 0.52));
-    return [xy, displacement];
+    return [xy, evaluateRefractedDisplacement(sinI, cosI, tilt * 0.52, safeIor)];
 }
 
 export function evaluateChromaticDispersion(
     depth: number,
     surface: GlassSurface,
     ior: number,
-    abbeNumber = 58.5,
+    abbeNumber = DEFAULT_ABBE_NUMBER,
 ): ChromaticDispersionSample {
     const { sinI, cosI, tilt } = evaluateSurfaceSample(depth, surface);
     const safeIor = Number.isFinite(ior) ? Math.max(1.01, ior) : 1.49;
-    const safeAbbe = Number.isFinite(abbeNumber) ? Math.min(120, Math.max(10, abbeNumber)) : 58.5;
+    const safeAbbe = Number.isFinite(abbeNumber)
+        ? Math.min(MAX_ABBE_NUMBER, Math.max(MIN_ABBE_NUMBER, abbeNumber))
+        : DEFAULT_ABBE_NUMBER;
     const eta = 1 / safeIor;
     const sinT = Math.min(0.999, Math.max(-0.999, eta * sinI));
     const cosT = Math.sqrt(Math.max(1e-6, 1 - sinT * sinT));
@@ -346,8 +581,8 @@ export function evaluateChromaticDispersion(
     return {
         displacement,
         lateralSpread,
-        redShift: Math.min(1, Math.max(-1, displacement - 0.36 * lateralSpread)),
-        blueShift: Math.min(1, Math.max(-1, displacement + 0.64 * lateralSpread)),
+        redShift: Math.min(1, Math.max(-1, displacement - CHROMATIC_RED_SHIFT_RATIO * 0.5 * lateralSpread)),
+        blueShift: Math.min(1, Math.max(-1, displacement + CHROMATIC_BLUE_SHIFT_RATIO * 0.5 * lateralSpread)),
     };
 }
 
